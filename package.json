@@ -5,7 +5,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/index.ts",
-    "smoke": "node src/smoke.ts"
+    "smoke": "node src/smoke.ts",
+    "web": "node src/server.ts"
   },
   "repository": {
     "type": "git",

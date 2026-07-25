@@ -68,6 +68,13 @@ export class Voice {
     }
   }
 
+  // 1 文を WAV に合成して返す(ブラウザ再生用)。読み上げるものが無ければ null。
+  async synthesizeWav(text: string): Promise<Buffer | null> {
+    const speakable = stripForSpeech(text);
+    if (!speakable) return null;
+    return this.#synthesize(speakable);
+  }
+
   // 文をキューに積む。合成は即座に始まり、再生はキュー順。途中で stop() されたら破棄。
   enqueue(sentence: string): void {
     const gen = this.#generation;

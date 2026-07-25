@@ -17,9 +17,13 @@
 
 ```sh
 npm install
-npm start        # 会話 CLI 起動。テキストで話しかけるとクロエがアニメ声で返す
-npm run smoke    # 非対話スモーク(疎通 → 1往復 → 音声再生)
+npm run web      # ブラウザ UI (http://localhost:3300)。🎤 でハンズフリー音声会話(Chrome 推奨)
+npm start        # テキスト入力の会話 CLI
+npm run smoke    # 非対話スモーク(疎通 → 2往復 → 音声再生)
 ```
+
+ブラウザ UI は Web Speech API で音声認識するので Chrome を推奨。
+返答は文単位でストリーム再生され、待ち時間には相槌が入る。
 
 `exit` または Ctrl+C で終了。
 
@@ -31,7 +35,7 @@ npm run smoke    # 非対話スモーク(疎通 → 1往復 → 音声再生)
 ## ロードマップ
 
 1. ~~Wave 1: テキスト入力 → アニメ声返答の会話 CLI~~
-2. Wave 2: ブラウザ UI + Web Speech API で音声入力(ハンズフリー会話)
+2. ~~Wave 2: ブラウザ UI + Web Speech API で音声入力(ハンズフリー会話)~~
 3. Wave 3: coding agent 統合(声で指示 → 実コード編集、進捗を声で実況)
 4. Wave 4: 記憶・キャラ設定拡充・アバター
 

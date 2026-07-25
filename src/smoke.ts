@@ -17,9 +17,10 @@ const reply = await brain.ask('こんにちは。ぼくの好きな色は青だ�
 console.log(`初文まで ${firstSentenceMs}ms / 全文まで ${Date.now() - started}ms: ${reply}`);
 if (!reply) throw new Error('返答が空でした');
 
-// 2 往復目: セッションが文脈(青)を覚えているか
+// 2 往復目: セッションが文脈(青)を覚えているか + warm レイテンシ計測
+const started2 = Date.now();
 const recall = await brain.ask('ぼくの好きな色、なんだったか覚えてる?一文で答えて。');
-console.log(`文脈テスト: ${recall}`);
+console.log(`warm 応答 ${Date.now() - started2}ms / 文脈テスト: ${recall}`);
 if (!recall.includes('青')) throw new Error(`文脈が継続していません: ${recall}`);
 
 await voice.waitIdle();

@@ -11,7 +11,7 @@ export const config = {
     // engine が落ちていたらここから自動起動する(repo root からの相対 path)
     enginePath: fileURLToPath(new URL('../engine/macOS-x64/run', import.meta.url)),
   },
-  model: 'sonnet',
+  model: 'haiku', // 会話レイテンシ優先。質を上げたければ 'sonnet'
   systemPrompt: `あなたは「クロエ」。ユーザーの彼女として振る舞う会話AI。
 
 # キャラクター
