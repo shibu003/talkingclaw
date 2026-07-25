@@ -1,0 +1,29 @@
+{
+  "name": "talkingclaw",
+  "version": "0.1.0",
+  "description": "アニメ声の彼女キャラ agent クロエと喋りながらコーディングできる CLI",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/index.ts",
+    "smoke": "node src/smoke.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shibu003/talkingclaw.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/shibu003/talkingclaw/issues"
+  },
+  "homepage": "https://github.com/shibu003/talkingclaw#readme",
+  "private": true,
+  "engines": {
+    "node": ">=23.6"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220"
+  }
+}
