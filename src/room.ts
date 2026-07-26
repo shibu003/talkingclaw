@@ -2,9 +2,11 @@
 // S8 の単一性強化・S9 の Host/Origin 検証等は 3A-1b、ページ配信は 3A-1c で拡張する。
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
 import { EventStore, Registry, type RoomEvent } from './roomcore.ts';
 import { Voice, splitSentences } from './voice.ts';
@@ -91,6 +93,7 @@ function userSpeech(text: string): RoomEvent {
 // ---- token(room.json 書込み。atomic 化・単一性は 3A-1b)----
 const token = randomBytes(24).toString('hex');
 const stateDir = join(homedir(), '.talkingclaw');
+const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了記録
 
 function authed(req: IncomingMessage, url: URL): boolean {
   if (req.method === 'GET') return url.searchParams.get('token') === token;
@@ -139,13 +142,21 @@ const server = createServer(async (req, res) => {
     return json(res, 200, { app: 'talkingclaw-room', version: '0.1.0', bootId: store.bootId, port: PORT });
   }
   if (req.method === 'GET' && path === '/') {
+    // S8/S9: token 配布の唯一の経路 = このページへの埋め込み(no-store)
+    const html = (await readFile(fileURLToPath(new URL('../public/room.html', import.meta.url)), 'utf8'))
+      .replace('__ROOM_TOKEN__', token)
+      .replace('__BOOT_ID__', store.bootId);
     res.writeHead(200, {
-      'content-type': 'text/plain; charset=utf-8',
+      'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-store',
       'x-frame-options': 'DENY',
       'x-content-type-options': 'nosniff',
     });
-    return res.end('talkingclaw room(ページは 3A-1c で配信)\n');
+    return res.end(html);
+  }
+  if (req.method === 'GET' && path === '/room.js') {
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    return res.end(await readFile(fileURLToPath(new URL('../public/room.js', import.meta.url))));
   }
   if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' });
 
@@ -200,6 +211,23 @@ const server = createServer(async (req, res) => {
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
     const ev = userSpeech(text);
     return json(res, 200, { ok: true, eventId: ev.id, turnId: ev.turnId });
+  }
+
+  if (path === '/metrics') {
+    // S10: ブラウザ計測(stt_final_delay 等)を JSONL に蓄積
+    const kind = String(body.kind ?? '').slice(0, 40);
+    const ms = Number(body.ms);
+    if (!kind || !Number.isFinite(ms)) return json(res, 400, { error: 'kind と ms が必要です' });
+    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date().toISOString(), kind, ms }) + '\n', { mode: 0o600 });
+    return json(res, 200, { ok: true });
+  }
+
+  if (path === '/played') {
+    // S4/S10: 再生完了通知(floor 集計は 4A で使用)
+    const eventId = Number(body.eventId);
+    if (!Number.isFinite(eventId)) return json(res, 400, { error: 'eventId が必要です' });
+    playedIds.add(eventId);
+    return json(res, 200, { ok: true });
   }
 
   // 以降は participant 認証必須

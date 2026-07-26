@@ -1,0 +1,227 @@
+// 声の部屋のブラウザ端末。描画は textContent のみ(S9 XSS 規律 — innerHTML 禁止)。
+const TOKEN = document.querySelector('meta[name="room-token"]').content;
+const BOOT = document.querySelector('meta[name="room-boot"]').content;
+const log = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const noticeEl = document.getElementById('notice');
+const micBtn = document.getElementById('mic');
+const textInput = document.getElementById('text');
+
+let lastEventId = 0;
+let replayBoundary = 0;   // hello の lastId 以前は replay(S1: 音声 enqueue しない)
+let handsfree = false;
+let listening = false;
+let playing = false;
+const audioQueue = [];    // { url, bubble, eventId }
+const bubbles = new Map(); // 連続する同一発話者の文を 1 吹き出しにまとめる: key=from
+
+function setStatus(t) { statusEl.textContent = t; }
+function notice(t) { noticeEl.style.display = 'block'; noticeEl.textContent = t; }
+
+function addBubble(cls, text, who) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  if (who) {
+    const label = document.createElement('span');
+    label.className = 'who';
+    label.textContent = who;
+    div.appendChild(label);
+  }
+  const body = document.createElement('span');
+  body.textContent = text;
+  div.appendChild(body);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return { div, body };
+}
+
+function addSys(text) {
+  const div = document.createElement('div');
+  div.className = 'sys';
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function agentBubble(from, name, text) {
+  const prev = bubbles.get('last');
+  if (prev && prev.from === from) {
+    prev.body.textContent += ' ' + text;
+    log.scrollTop = log.scrollHeight;
+    return prev;
+  }
+  const b = addBubble('agent', text, name || from);
+  const entry = { from, div: b.div, body: b.body };
+  bubbles.set('last', entry);
+  return entry;
+}
+
+// ---- 再生(audio 要素 = AEC 維持)----
+function post(path, body) {
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-room-token': TOKEN },
+    body: JSON.stringify(body),
+  });
+}
+
+function playNext() {
+  const next = audioQueue.shift();
+  if (!next) {
+    playing = false;
+    document.querySelectorAll('.agent.speaking').forEach((el) => el.classList.remove('speaking'));
+    resumeMic();
+    return;
+  }
+  playing = true;
+  pauseMic();
+  next.bubble.classList.add('speaking');
+  const audio = new Audio(next.url + '?token=' + TOKEN); // S1: token 付与はブラウザ側
+  let advanced = false;
+  const advance = () => {
+    if (advanced) return;
+    advanced = true;
+    next.bubble.classList.remove('speaking');
+    if (next.eventId) void post('/played', { eventId: next.eventId }); // S10/S4 計測・floor 用
+    playNext();
+  };
+  audio.onended = audio.onerror = advance;
+  audio.play().catch(advance);
+}
+
+function enqueueAudio(url, bubble, eventId) {
+  audioQueue.push({ url, bubble, eventId });
+  if (!playing) playNext();
+}
+
+// ---- SSE ----
+let es = null;
+function connect() {
+  es = new EventSource('/events?token=' + TOKEN + '&after=' + lastEventId);
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'hello') {
+      if (ev.bootId !== BOOT) return restartDetected();
+      if (replayBoundary === 0) replayBoundary = ev.lastId;
+      setStatus(handsfree ? '聞いてるよ' : '🎤 でハンズフリー開始');
+      return;
+    }
+    if (ev.id <= lastEventId) return;
+    lastEventId = ev.id;
+    render(ev);
+  };
+  es.onerror = () => {
+    setStatus('再接続中…');
+    void checkRestart();
+  };
+}
+
+function render(ev) {
+  const isReplay = ev.id <= replayBoundary;
+  if (ev.type === 'user_speech') {
+    addBubble('user', ev.text ?? '');
+    bubbles.delete('last');
+  } else if (ev.type === 'agent_speech') {
+    const b = agentBubble(ev.from, ev.name, ev.text ?? '');
+    if (ev.audio && !isReplay) enqueueAudio(ev.audio, b.div, ev.id);
+  } else if (ev.type === 'system' || ev.type === 'presence') {
+    addSys((ev.name ? ev.name + ': ' : '') + (ev.text ?? ev.type));
+    bubbles.delete('last');
+  }
+}
+
+// ---- daemon 再起動検出(S8: EventSource は 401 を読めない → 無認証 /health を poll)----
+let restartPolling = false;
+async function checkRestart() {
+  if (restartPolling) return;
+  restartPolling = true;
+  try {
+    for (let i = 0; i < 60; i++) {
+      try {
+        const r = await fetch('/health');
+        const h = await r.json();
+        if (h.bootId && h.bootId !== BOOT) return restartDetected();
+        break; // 同一 bootId = 一時切断 → EventSource の自動再接続に任せる
+      } catch { /* daemon down 中は待つ */ }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  } finally { restartPolling = false; }
+}
+
+function restartDetected() {
+  notice('部屋が再起動したよ。読み込み直すね…');
+  setTimeout(() => location.reload(), 800); // reload で新 token を再取得(S8)
+}
+
+// ---- 発話送信 ----
+async function send(text) {
+  text = text.trim();
+  if (!text) return;
+  setStatus('届けたよ');
+  try {
+    const res = await post('/chat', { text });
+    if (res.status === 401) return void checkRestart();
+    if (!res.ok) addSys('送信エラー: ' + res.status);
+  } catch { addSys('サーバに繋がらないみたい'); }
+}
+textInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) { void send(textInput.value); textInput.value = ''; }
+});
+
+// ---- 音声認識 + STT 計測(S10 gate ①: speechend→final Δt)----
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let interimEl = null;
+let speechEndAt = 0;
+
+if (!SR) {
+  notice('このブラウザは音声認識に未対応。Chrome を使うか、テキスト入力してね。');
+  micBtn.disabled = true;
+} else {
+  recognition = new SR();
+  recognition.lang = 'ja-JP';
+  recognition.interimResults = true;
+  recognition.continuous = false;
+  recognition.onstart = () => { listening = true; micBtn.classList.add('listening'); setStatus('聞いてるよ'); };
+  recognition.onspeechend = () => { speechEndAt = performance.now(); };
+  recognition.onend = () => {
+    listening = false;
+    micBtn.classList.remove('listening');
+    interimEl?.remove(); interimEl = null;
+    if (handsfree && !playing) setTimeout(() => { if (handsfree && !playing && !listening) startMic(); }, 300);
+  };
+  recognition.onerror = (e) => {
+    if (e.error === 'not-allowed') { handsfree = false; micBtn.classList.remove('on'); setStatus('マイクが許可されていないよ'); }
+  };
+  recognition.onresult = (e) => {
+    let finalText = '', interim = '';
+    for (const r of e.results) (r.isFinal ? (finalText += r[0].transcript) : (interim += r[0].transcript));
+    if (interim) {
+      if (!interimEl) { interimEl = document.createElement('div'); interimEl.className = 'interim'; }
+      interimEl.textContent = interim + '…';
+      log.appendChild(interimEl);
+      log.scrollTop = log.scrollHeight;
+    }
+    if (finalText) {
+      if (speechEndAt > 0) { // gate ① 計測
+        void post('/metrics', { kind: 'stt_final_delay', ms: Math.round(performance.now() - speechEndAt) });
+        speechEndAt = 0;
+      }
+      interimEl?.remove(); interimEl = null;
+      void send(finalText);
+    }
+  };
+}
+
+function startMic() { try { recognition.start(); } catch { /* already */ } }
+function pauseMic() { if (recognition && listening) recognition.abort(); }
+function resumeMic() { if (handsfree && !listening) startMic(); setStatus(handsfree ? '聞いてるよ' : '🎤 でハンズフリー開始'); }
+
+micBtn.addEventListener('click', () => {
+  handsfree = !handsfree;
+  micBtn.classList.toggle('on', handsfree);
+  if (handsfree) startMic();
+  else { pauseMic(); setStatus('🎤 でハンズフリー開始'); }
+});
+
+connect();
