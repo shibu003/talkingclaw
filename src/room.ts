@@ -20,36 +20,225 @@ const store = new EventStore();
 const registry = new Registry();
 const voice = new Voice(config.tts);
 
-// ---- inline TTS(3A-1a-i 版: 単一チェーンで合成→event 発行。scheduler は 3A-2)----
+// ---- audio 置き場(相槌プールは evict 対象外)----
 const audioStore = new Map<number, Buffer>();
+const protectedAudio = new Set<number>();
 let audioSeq = 0;
-let synthChain: Promise<void> = Promise.resolve();
-let engineReady = false;
-void voice.ensureEngine().then(
-  (v) => { engineReady = true; console.error(`AivisSpeech ready (${v})`); },
-  (e) => console.error(`AivisSpeech 起動失敗: ${(e as Error).message}(text-only で継続)`),
-);
+
+function putAudio(wav: Buffer, isProtected = false): string {
+  const id = ++audioSeq;
+  audioStore.set(id, wav);
+  if (isProtected) protectedAudio.add(id);
+  if (audioStore.size > 100) {
+    for (const key of audioStore.keys()) {
+      if (protectedAudio.has(key)) continue;
+      audioStore.delete(key);
+      break;
+    }
+  }
+  return `/audio/${id}`;
+}
+
+// ---- EngineManager(S5): daemon が engine を保有・監視。kill は自分の子(handle 基準)のみ ----
+import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+
+let engineState: 'starting' | 'ready' | 'down' = 'starting';
+let engineChild: ChildProcess | null = null;
+let engineSpawnedAt = 0;
+const engineSpawnLog: number[] = [];
+let synthFailStreak = 0;
+
+async function engineAlive(): Promise<boolean> {
+  try {
+    const r = await fetch(`${config.tts.url}/version`, { signal: AbortSignal.timeout(2000) });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+function spawnEngine(): void {
+  const now = Date.now();
+  while (engineSpawnLog.length > 0 && now - engineSpawnLog[0] > 3600_000) engineSpawnLog.shift();
+  if (engineSpawnLog.length >= 3) {
+    store.append({ type: 'system', from: 'room', text: '音声エンジンの再起動が続いてる。手動で確認してあげて(engine/macOS-x64/run)' });
+    return;
+  }
+  if (!existsSync(config.tts.enginePath)) return;
+  engineSpawnLog.push(now);
+  engineSpawnedAt = now;
+  engineChild = spawn(config.tts.enginePath, [], {
+    cwd: config.tts.enginePath.replace(/\/run$/, ''),
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, HF_HUB_DISABLE_IMPLICIT_TOKEN: '1', HF_TOKEN: '' },
+  });
+  engineChild.unref();
+  console.error('AivisSpeech engine を起動中…');
+}
+
+async function engineLoop(): Promise<void> {
+  for (;;) {
+    const alive = await engineAlive();
+    if (alive) {
+      if (engineState !== 'ready') {
+        engineState = 'ready';
+        synthFailStreak = 0;
+        console.error('AivisSpeech ready');
+        store.append({ type: 'system', from: 'room', text: '声の準備ができたよ' });
+        await onEngineReady();
+      }
+    } else if (engineState === 'ready') {
+      engineState = 'down';
+      store.append({ type: 'system', from: 'room', text: '音声エンジンが落ちたみたい。しばらく文字だけで続けるね' });
+      spawnEngine(); // 消滅検出 → rate-limit 付き再 spawn(S5)
+    } else {
+      const grace = Date.now() - engineSpawnedAt < 150_000; // SP5 実測 ×1.5
+      if (!grace) {
+        // wedged: 自分の子(handle 基準)のみ SIGTERM → 再 spawn。他所有 engine は触らない
+        if (engineChild && engineChild.exitCode === null) {
+          engineChild.kill('SIGTERM');
+          engineChild = null;
+        }
+        if (engineState === 'down' || engineState === 'starting') spawnEngine();
+      }
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+void engineLoop();
+
+// ---- voice 解決(S3/S7: engineReady で未解決 participant を再解決)----
+async function resolveVoice(requested: string): Promise<number | null> {
+  try {
+    const r = await fetch(`${config.tts.url}/speakers`, { signal: AbortSignal.timeout(3000) });
+    const speakers = (await r.json()) as { name: string; styles: { name: string; id: number }[] }[];
+    if (!requested) return config.tts.speaker;
+    const [model, style] = requested.split('/');
+    const sp = speakers.find((s) => s.name === model);
+    const st = sp?.styles.find((x) => x.name === (style ?? 'ノーマル')) ?? sp?.styles[0];
+    return st?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function onEngineReady(): Promise<void> {
+  for (const p of registry.all()) {
+    if (p.voice.status === 'ready') continue;
+    const speaker = await resolveVoice(p.voice.requested);
+    p.voice.resolvedSpeaker = speaker;
+    p.voice.status = speaker === null ? 'voice_unavailable' : 'ready';
+    store.append({ type: 'presence', from: p.participantId, name: p.assignedName, text: `voice:${p.voice.status}` });
+    if (speaker !== null) buildAckPool(p.participantId, speaker);
+  }
+}
+
+// ---- FillerEngine(S6): 相槌は事前合成プールのみ。動的合成は本応答だけ ----
+const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
+const ackPools = new Map<string, string[]>();
+let ackRotate = 0;
+
+function buildAckPool(pid: string, speaker: number): void {
+  if (ackPools.has(pid)) return;
+  ackPools.set(pid, []);
+  for (const text of ACK_TEXTS) {
+    enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker });
+  }
+}
+
+function fireAck(target: string, turnId: string | undefined): void {
+  const p = registry.get(target);
+  const pool = ackPools.get(target) ?? [];
+  if (!p || p.voice.status !== 'ready' || pool.length === 0 || engineState !== 'ready') return;
+  const text = ACK_TEXTS[ackRotate % ACK_TEXTS.length];
+  const audio = pool[ackRotate % pool.length];
+  ackRotate++;
+  store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId });
+}
+
+// ---- TtsScheduler(S5): participant 内 FIFO、participant 間は (priority, round-robin) ----
+type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string };
+const jobQueues = new Map<string, SynthJob[]>();
+const rrOrder: string[] = [];
+let pumping = false;
+
+function enqueueJob(job: SynthJob): void {
+  const q = jobQueues.get(job.pid) ?? [];
+  if (job.kind === 'speech' && q.filter((j) => j.kind === 'speech').length >= 20) {
+    const p = registry.get(job.pid);
+    store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio: null, turnId: job.turnId });
+    return; // per-participant 上限: 古い順でなく新規を text-only(FIFO 順序を保つ)
+  }
+  q.push(job);
+  jobQueues.set(job.pid, q);
+  if (!rrOrder.includes(job.pid)) rrOrder.push(job.pid);
+  void pump();
+}
+
+function pickNext(): SynthJob | null {
+  let best: { pid: string; prio: number } | null = null;
+  for (const pid of rrOrder) {
+    const head = jobQueues.get(pid)?.[0];
+    if (!head) continue;
+    if (!best || head.priority < best.prio) best = { pid, prio: head.priority };
+  }
+  if (!best) return null;
+  rrOrder.push(...rrOrder.splice(rrOrder.indexOf(best.pid), 1)); // 使った participant を末尾へ(round-robin)
+  return jobQueues.get(best.pid)!.shift()!;
+}
+
+async function runJob(job: SynthJob): Promise<void> {
+  const p = registry.get(job.pid);
+  const speaker = job.speaker ?? p?.voice.resolvedSpeaker ?? null;
+  const emitSpeech = (audio: string | null) => {
+    if (job.kind === 'speech') store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio, turnId: job.turnId });
+  };
+  if (engineState !== 'ready' || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const wav = await voice.synthesizeWav(job.text, speaker);
+      synthFailStreak = 0;
+      if (!wav) return emitSpeech(null);
+      const url = putAudio(wav, job.kind === 'ack-pool');
+      if (job.kind === 'ack-pool') ackPools.get(job.pid)?.push(url);
+      else emitSpeech(url);
+      return;
+    } catch (error) {
+      synthFailStreak++;
+      if (synthFailStreak >= 3 && engineState === 'ready') {
+        engineState = 'down'; // S5 engineDown: fail-fast(15s 連鎖を断つ)
+        store.append({ type: 'system', from: 'room', text: '声がうまく出せない。復旧するまで文字で続けるね' });
+        return emitSpeech(null);
+      }
+      if (attempt === 1) {
+        console.error(`合成失敗(text-only): ${(error as Error).message}`);
+        return emitSpeech(null);
+      }
+    }
+  }
+}
+
+async function pump(): Promise<void> {
+  if (pumping) return;
+  pumping = true;
+  try {
+    for (;;) {
+      const job = pickNext();
+      if (!job) break;
+      await runJob(job);
+    }
+  } finally {
+    pumping = false;
+  }
+}
 
 function speakSentences(from: string, name: string, text: string, turnId: string | undefined): void {
-  for (const sentence of splitSentences(text)) {
-    synthChain = synthChain.then(async () => {
-      let audio: string | null = null;
-      if (engineReady) {
-        try {
-          const wav = await voice.synthesizeWav(sentence);
-          if (wav) {
-            const id = ++audioSeq;
-            audioStore.set(id, wav);
-            if (audioStore.size > 100) audioStore.delete(audioStore.keys().next().value as number);
-            audio = `/audio/${id}`;
-          }
-        } catch (error) {
-          console.error(`合成失敗(text-only 継続): ${(error as Error).message}`);
-        }
-      }
-      store.append({ type: 'agent_speech', from, name, text: sentence, audio, turnId });
-    });
-  }
+  const sentences = splitSentences(text);
+  sentences.forEach((sentence, i) => {
+    enqueueJob({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId });
+  });
 }
 
 // ---- listen waiter(participant 毎 1 つ。新 listen が旧を no_speech 解決)----
@@ -83,11 +272,14 @@ store.onAppend((ev) => {
 // ---- user 発話(3A-1a-i の routing: default = active 全員。名前/floor は 4A)----
 let turnSeq = 0;
 function userSpeech(text: string): RoomEvent {
-  const targets = registry.all().map((p) => p.participantId);
-  return store.append({
+  const targets = registry.all().filter((p) => registry.alive(p)).map((p) => p.participantId);
+  const ev = store.append({
     type: 'user_speech', from: 'user', text,
     turnId: `T${++turnSeq}`, targets, routing: { method: 'default' },
   });
+  // S6: t=0 相槌。複数 target の turn は ack 無効(単独 target のみ)
+  if (targets.length === 1) fireAck(targets[0], ev.turnId);
+  return ev;
 }
 
 // ---- token(room.json 書込み。atomic 化・単一性は 3A-1b)----
@@ -189,6 +381,12 @@ const server = createServer(async (req, res) => {
     const outcome = registry.join(requestedName, String(body.voice ?? ''), store.lastId, store.bootId, resume);
     if ('error' in outcome) return json(res, 400, { error: outcome.error });
     const { participant: p, mode } = outcome;
+    if (engineState === 'ready' && p.voice.status !== 'ready') {
+      const speaker = await resolveVoice(p.voice.requested);
+      p.voice.resolvedSpeaker = speaker;
+      p.voice.status = speaker === null ? 'voice_unavailable' : 'ready';
+      if (speaker !== null) buildAckPool(p.participantId, speaker);
+    }
     if (mode === 'takeover') {
       // S3: 旧 session の pending waiter を即 unknown_participant で解決 + superseded 通知
       const w = waiters.get(p.participantId);
@@ -254,7 +452,7 @@ const server = createServer(async (req, res) => {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
     speakSentences(p.participantId, p.assignedName, text, body.turnId ? String(body.turnId) : undefined);
-    return json(res, 200, { status: engineReady ? 'ok' : 'text_only' });
+    return json(res, 200, { status: engineState === 'ready' && p.voice.status === 'ready' ? 'ok' : 'text_only' });
   }
 
   if (path === '/listen') {

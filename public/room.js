@@ -94,6 +94,24 @@ function enqueueAudio(url, bubble, eventId) {
   if (!playing) playNext();
 }
 
+// 相槌の即時再生(queue を経由しない。終了後に通常 queue を再開)
+function playAckNow(url, bubble, eventId) {
+  playing = true;
+  pauseMic(); // マイク方針は SP3 の実測で確定(現状は保守的に停止)
+  bubble.classList.add('speaking');
+  const audio = new Audio(url + '?token=' + TOKEN);
+  let advanced = false;
+  const advance = () => {
+    if (advanced) return;
+    advanced = true;
+    bubble.classList.remove('speaking');
+    if (eventId) void post('/played', { eventId });
+    playNext(); // 通常 queue の続きへ(空なら resumeMic される)
+  };
+  audio.onended = audio.onerror = advance;
+  audio.play().catch(advance);
+}
+
 // ---- SSE ----
 let es = null;
 function connect() {
@@ -123,7 +141,11 @@ function render(ev) {
     bubbles.delete('last');
   } else if (ev.type === 'agent_speech') {
     const b = agentBubble(ev.from, ev.name, ev.text ?? '');
-    if (ev.audio && !isReplay) enqueueAudio(ev.audio, b.div, ev.id);
+    if (ev.audio && !isReplay) {
+      // S6: 相槌(ack)は FIFO に入れない独立即時スロット — 再生中なら即スキップ
+      if (ev.filler === 'ack') { if (!playing) playAckNow(ev.audio, b.div, ev.id); }
+      else enqueueAudio(ev.audio, b.div, ev.id);
+    }
   } else if (ev.type === 'system' || ev.type === 'presence') {
     addSys((ev.name ? ev.name + ': ' : '') + (ev.text ?? ev.type));
     bubbles.delete('last');
