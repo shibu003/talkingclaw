@@ -37,7 +37,8 @@ export class Voice {
       );
     }
 
-    console.log('AivisSpeech Engine を起動しています…(音声モデルの読み込みに数十秒かかります)');
+    // MCP モードでは stdout が protocol 専用なのでログは stderr へ
+    console.error('AivisSpeech Engine を起動しています…(音声モデルの読み込みに数十秒かかります)');
     spawn(this.#enginePath, [], {
       cwd: dirname(this.#enginePath),
       detached: true,
@@ -69,10 +70,11 @@ export class Voice {
   }
 
   // 1 文を WAV に合成して返す(ブラウザ再生用)。読み上げるものが無ければ null。
-  async synthesizeWav(text: string): Promise<Buffer | null> {
+  // speaker を渡すと既定の声を上書きできる(agent ごとに声を変える用)。
+  async synthesizeWav(text: string, speaker?: number): Promise<Buffer | null> {
     const speakable = stripForSpeech(text);
     if (!speakable) return null;
-    return this.#synthesize(speakable);
+    return this.#synthesize(speakable, speaker);
   }
 
   // 文をキューに積む。合成は即座に始まり、再生はキュー順。途中で stop() されたら破棄。
@@ -121,14 +123,14 @@ export class Voice {
     if (this.#tmpDir) await rm(this.#tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  async #synthesize(text: string): Promise<Buffer> {
-    const params = new URLSearchParams({ text, speaker: String(this.#speaker) });
+  async #synthesize(text: string, speaker = this.#speaker): Promise<Buffer> {
+    const params = new URLSearchParams({ text, speaker: String(speaker) });
     const queryRes = await fetch(`${this.#url}/audio_query?${params}`, { method: 'POST' });
     if (!queryRes.ok) throw new Error(`AivisSpeech audio_query が失敗しました (${queryRes.status})`);
     const audioQuery = (await queryRes.json()) as { speedScale: number };
     audioQuery.speedScale = this.#speedScale;
 
-    const synthRes = await fetch(`${this.#url}/synthesis?speaker=${this.#speaker}`, {
+    const synthRes = await fetch(`${this.#url}/synthesis?speaker=${speaker}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(audioQuery),
@@ -164,7 +166,7 @@ function stripForSpeech(text: string): string {
     .trim();
 }
 
-function splitSentences(text: string): string[] {
+export function splitSentences(text: string): string[] {
   return text
     .split(/(?<=[。．！？!?])|\n+/)
     .map((s) => s.trim())
