@@ -292,6 +292,7 @@ function userSpeech(text: string): RoomEvent {
 const token = randomBytes(24).toString('hex');
 const stateDir = join(homedir(), '.talkingclaw');
 const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了記録
+const seenSpeakSeqs = new Map<string, Set<string>>(); // S2: speak 冪等(participant 毎)
 
 function authed(req: IncomingMessage, url: URL): boolean {
   if (req.method === 'GET') return url.searchParams.get('token') === token;
@@ -457,6 +458,15 @@ const server = createServer(async (req, res) => {
   if (path === '/speak') {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
+    // S2: 冪等 — recovering 後の再試行で二重発話しない
+    const clientSeq = body.clientSeq === undefined ? null : String(body.clientSeq);
+    if (clientSeq !== null) {
+      const seen = seenSpeakSeqs.get(p.participantId) ?? new Set<string>();
+      if (seen.has(clientSeq)) return json(res, 200, { status: 'ok', deduped: true });
+      seen.add(clientSeq);
+      if (seen.size > 200) seen.delete(seen.values().next().value as string);
+      seenSpeakSeqs.set(p.participantId, seen);
+    }
     speakSentences(p.participantId, p.assignedName, text, body.turnId ? String(body.turnId) : undefined);
     return json(res, 200, { status: engineState === 'ready' && p.voice.status === 'ready' ? 'ok' : 'text_only' });
   }
