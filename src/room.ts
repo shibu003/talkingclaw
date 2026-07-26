@@ -2,7 +2,7 @@
 // S8 の単一性強化・S9 の Host/Origin 検証等は 3A-1b、ページ配信は 3A-1c で拡張する。
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { config } from './config.ts';
@@ -97,6 +97,18 @@ function authed(req: IncomingMessage, url: URL): boolean {
   return req.headers['x-room-token'] === token;
 }
 
+// S9: Host = port 除去後の完全一致(欠如は deny — DNS rebinding 対策)。
+// Origin は存在時のみ自 origin 一致(curl / proxy の欠如は許可 — cross-site fetch 対策)。
+function originOk(req: IncomingMessage): boolean {
+  const host = req.headers.host;
+  if (!host) return false;
+  const hostname = host.replace(/:\d+$/, '');
+  if (hostname !== '127.0.0.1' && hostname !== 'localhost') return false;
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== `http://127.0.0.1:${PORT}` && origin !== `http://localhost:${PORT}`) return false;
+  return true;
+}
+
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown> | null> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -109,7 +121,11 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown> |
 }
 
 function json(res: ServerResponse, code: number, body: object): void {
-  res.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.writeHead(code, {
+    'content-type': 'application/json',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  });
   res.end(JSON.stringify(body));
 }
 
@@ -117,11 +133,18 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
   const path = url.pathname;
 
+  if (!originOk(req)) return json(res, 403, { error: 'Host/Origin が不正です' });
+
   if (req.method === 'GET' && path === '/health') {
     return json(res, 200, { app: 'talkingclaw-room', version: '0.1.0', bootId: store.bootId, port: PORT });
   }
   if (req.method === 'GET' && path === '/') {
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.writeHead(200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-frame-options': 'DENY',
+      'x-content-type-options': 'nosniff',
+    });
     return res.end('talkingclaw room(ページは 3A-1c で配信)\n');
   }
   if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' });
@@ -233,11 +256,13 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  // S8: token の書出しは bind 成功後のみ(atomic 化は 3A-1b)
+  // S8: token 生成物の書出しは bind 成功後のみ + tmp→rename の atomic(敗者は一切触れない)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(stateDir, 'room.json'), JSON.stringify({
+  const tmp = join(stateDir, `room.json.tmp-${process.pid}`);
+  writeFileSync(tmp, JSON.stringify({
     port: PORT, token, pid: process.pid, pidStartedAt: Date.now(), bootId: store.bootId,
   }), { mode: 0o600 });
+  renameSync(tmp, join(stateDir, 'room.json'));
   console.error(`talkingclaw room: http://127.0.0.1:${PORT}(bootId ${store.bootId.slice(0, 8)})`);
 });
 server.on('error', (e: NodeJS.ErrnoException) => {
