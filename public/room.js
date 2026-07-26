@@ -137,6 +137,7 @@ function connect() {
 function render(ev) {
   const isReplay = ev.id <= replayBoundary;
   if (ev.type === 'user_speech') {
+    if (!isReplay) audioQueue.length = 0; // stale drop: 自分が話したら溜まった読み上げは捨てる(再生中のみ完了させる)
     addBubble('user', ev.text ?? '');
     bubbles.delete('last');
   } else if (ev.type === 'agent_speech') {

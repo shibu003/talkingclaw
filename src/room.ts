@@ -159,7 +159,10 @@ function fireAck(target: string, turnId: string | undefined): void {
 }
 
 // ---- TtsScheduler(S5): participant 内 FIFO、participant 間は (priority, round-robin) ----
-type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string };
+// stale drop: user 発話ごとに speechEpoch を進め、古い epoch の speech job は合成せず text-only で流す。
+// テキストは transcript に残る(不喪失)が、遅れた読み上げで会話がズレるのを防ぐ。
+let speechEpoch = 0;
+type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string; epoch?: number };
 const jobQueues = new Map<string, SynthJob[]>();
 const rrOrder: string[] = [];
 let pumping = false;
@@ -195,6 +198,7 @@ async function runJob(job: SynthJob): Promise<void> {
   const emitSpeech = (audio: string | null) => {
     if (job.kind === 'speech') store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio, turnId: job.turnId });
   };
+  if (job.kind === 'speech' && job.epoch !== speechEpoch) return emitSpeech(null); // stale drop: 新 user 発話より前の未合成分
   if (engineState !== 'ready' || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -237,7 +241,7 @@ async function pump(): Promise<void> {
 function speakSentences(from: string, name: string, text: string, turnId: string | undefined): void {
   const sentences = splitSentences(text);
   sentences.forEach((sentence, i) => {
-    enqueueJob({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId });
+    enqueueJob({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch });
   });
 }
 
@@ -272,6 +276,7 @@ store.onAppend((ev) => {
 // ---- user 発話(3A-1a-i の routing: default = active 全員。名前/floor は 4A)----
 let turnSeq = 0;
 function userSpeech(text: string): RoomEvent {
+  speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
   // gone 含む全員に配送(inbox に積まれ、復帰後の listen で再配送される — S1 at-least-once)
   const targets = registry.all().map((p) => p.participantId);
   const ev = store.append({
