@@ -70,10 +70,20 @@ export type Participant = {
   sessionId: string;
   requestedName: string;
   assignedName: string;
+  ephemeral: boolean; // suffix 名(『コハク 2』)= 資格ファイル不書込の一時 identity
+  left: boolean;
   voice: { requested: string; resolvedSpeaker: number | null; status: 'ready' | 'warming_up' | 'voice_unavailable' };
   ackedCursor: number;
   lastSeen: number;
 };
+
+export type JoinResume = { bootId: string; participantId: string; sessionId: string };
+export type JoinOutcome = { participant: Participant; mode: 'new' | 'takeover' | 'suffix' } | { error: string };
+
+// S3: alive = listen/heartbeat が ALIVE_MS 以内(既定 2.5 分)。テストは env で短縮可
+const ALIVE_MS = Number(process.env.ALIVE_MS ?? 150_000);
+const EVICT_MS = 24 * 3600 * 1000;
+const MAX_PARTICIPANTS = 16;
 
 function slugify(name: string): string {
   const ascii = name.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -84,22 +94,71 @@ function slugify(name: string): string {
 export class Registry {
   #participants = new Map<string, Participant>();
 
-  // 3A-1a-i は登録のみ(takeover / suffix / presence は 3A-1a-ii)
-  join(requestedName: string, voiceRequested: string, cursor: number): Participant {
+  alive(p: Participant): boolean {
+    return !p.left && Date.now() - p.lastSeen < ALIVE_MS;
+  }
+
+  presence(p: Participant, isListening: boolean): 'listening' | 'active' | 'gone' {
+    if (isListening) return 'listening';
+    return this.alive(p) ? 'active' : 'gone';
+  }
+
+  // S3 join 解決 5 規則: ①resume+gone→takeover ②resume+alive→拒否(fresh へ)
+  // ③fresh+同名 gone→名前ベース takeover ④fresh+同名 alive→suffix ephemeral ⑤新規
+  join(requestedName: string, voiceRequested: string, cursorTail: number,
+       currentBootId: string, resume?: JoinResume): JoinOutcome {
+    this.#evict();
+    if (resume && resume.bootId === currentBootId) {
+      const p = this.#participants.get(resume.participantId);
+      if (p && p.sessionId === resume.sessionId && !this.alive(p)) return this.#takeover(p, voiceRequested);
+      // alive(別の生きた session が保持)/ 不一致 → fresh join へ落ちる
+    }
+    const canonical = [...this.#participants.values()].find(
+      (q) => !q.ephemeral && q.requestedName === requestedName,
+    );
+    if (canonical && !this.alive(canonical)) return this.#takeover(canonical, voiceRequested);
+    if (this.#participants.size >= MAX_PARTICIPANTS) return { error: `部屋が満員です(上限 ${MAX_PARTICIPANTS})` };
+    if (canonical) {
+      let n = 2;
+      let assigned = `${requestedName} ${n}`;
+      while ([...this.#participants.values()].some((q) => q.assignedName === assigned)) assigned = `${requestedName} ${++n}`;
+      return { participant: this.#make(requestedName, assigned, voiceRequested, cursorTail, true), mode: 'suffix' };
+    }
+    return { participant: this.#make(requestedName, requestedName, voiceRequested, cursorTail, false), mode: 'new' };
+  }
+
+  // takeover = participantId 維持 + sessionId ローテーション(targets/floor/ackedCursor が連続する)
+  #takeover(p: Participant, voiceRequested: string): JoinOutcome {
+    p.sessionId = randomUUID();
+    p.lastSeen = Date.now();
+    p.left = false;
+    if (voiceRequested) p.voice.requested = voiceRequested;
+    return { participant: p, mode: 'takeover' };
+  }
+
+  #make(requestedName: string, assignedName: string, voiceRequested: string,
+        cursorTail: number, ephemeral: boolean): Participant {
     const base = slugify(requestedName);
     let participantId = base;
     for (let n = 2; this.#participants.has(participantId); n++) participantId = `${base}-${n}`;
     const p: Participant = {
-      participantId,
-      sessionId: randomUUID(),
-      requestedName,
-      assignedName: requestedName,
+      participantId, sessionId: randomUUID(), requestedName, assignedName, ephemeral, left: false,
       voice: { requested: voiceRequested, resolvedSpeaker: null, status: 'warming_up' },
-      ackedCursor: cursor,
-      lastSeen: Date.now(),
+      ackedCursor: cursorTail, lastSeen: Date.now(),
     };
     this.#participants.set(participantId, p);
     return p;
+  }
+
+  #evict(): void {
+    const now = Date.now();
+    for (const [id, p] of this.#participants) {
+      if (!this.alive(p) && now - p.lastSeen > EVICT_MS) this.#participants.delete(id);
+    }
+  }
+
+  leave(p: Participant): void {
+    p.left = true;
   }
 
   auth(participantId: string, sessionId: string): Participant | null {

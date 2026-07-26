@@ -151,8 +151,21 @@ const server = createServer(async (req, res) => {
   if (path === '/join') {
     const requestedName = String(body.requestedName ?? '').trim().slice(0, 40);
     if (!requestedName) return json(res, 400, { error: 'requestedName が必要です' });
-    const p = registry.join(requestedName, String(body.voice ?? ''), store.lastId);
-    store.append({ type: 'presence', from: p.participantId, name: p.assignedName, text: 'joined' });
+    const resume = body.resume as { bootId: string; participantId: string; sessionId: string } | undefined;
+    const outcome = registry.join(requestedName, String(body.voice ?? ''), store.lastId, store.bootId, resume);
+    if ('error' in outcome) return json(res, 400, { error: outcome.error });
+    const { participant: p, mode } = outcome;
+    if (mode === 'takeover') {
+      // S3: 旧 session の pending waiter を即 unknown_participant で解決 + superseded 通知
+      const w = waiters.get(p.participantId);
+      if (w) {
+        clearTimeout(w.timer);
+        waiters.delete(p.participantId);
+        w.resolve({ status: 'unknown_participant' });
+      }
+      store.append({ type: 'system', from: 'room', name: p.assignedName, text: `${p.assignedName} の接続が切り替わったよ` });
+    }
+    store.append({ type: 'presence', from: p.participantId, name: p.assignedName, text: mode === 'takeover' ? 'rejoined' : 'joined' });
     return json(res, 200, {
       bootId: store.bootId, participantId: p.participantId, sessionId: p.sessionId,
       assignedName: p.assignedName, voice: p.voice, cursor: p.ackedCursor,
@@ -169,6 +182,22 @@ const server = createServer(async (req, res) => {
   // 以降は participant 認証必須
   const p = registry.auth(String(body.participantId ?? ''), String(body.sessionId ?? ''));
   if (!p) return json(res, 200, { status: 'unknown_participant' });
+
+  if (path === '/heartbeat') {
+    return json(res, 200, { ok: true, bootId: store.bootId });
+  }
+
+  if (path === '/leave') {
+    registry.leave(p);
+    const w = waiters.get(p.participantId);
+    if (w) {
+      clearTimeout(w.timer);
+      waiters.delete(p.participantId);
+      w.resolve({ status: 'no_speech', bootId: store.bootId, cursor: p.ackedCursor });
+    }
+    store.append({ type: 'presence', from: p.participantId, name: p.assignedName, text: 'left' });
+    return json(res, 200, { ok: true });
+  }
 
   if (path === '/speak') {
     const text = String(body.text ?? '').trim();
