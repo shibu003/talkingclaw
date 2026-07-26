@@ -182,7 +182,12 @@ if (!SR) {
   recognition.lang = 'ja-JP';
   recognition.interimResults = true;
   recognition.continuous = false;
-  recognition.onstart = () => { listening = true; micBtn.classList.add('listening'); setStatus('聞いてるよ'); };
+  recognition.onstart = () => {
+    listening = true;
+    speechEndAt = 0; // 前セッションの stale 値で計測が汚れないようリセット
+    micBtn.classList.add('listening');
+    setStatus('聞いてるよ');
+  };
   recognition.onspeechend = () => { speechEndAt = performance.now(); };
   recognition.onend = () => {
     listening = false;
@@ -203,8 +208,9 @@ if (!SR) {
       log.scrollTop = log.scrollHeight;
     }
     if (finalText) {
-      if (speechEndAt > 0) { // gate ① 計測
-        void post('/metrics', { kind: 'stt_final_delay', ms: Math.round(performance.now() - speechEndAt) });
+      if (speechEndAt > 0) { // gate ① 計測(15s 超は計測異常として捨てる)
+        const delay = Math.round(performance.now() - speechEndAt);
+        if (delay < 15_000) void post('/metrics', { kind: 'stt_final_delay', ms: delay });
         speechEndAt = 0;
       }
       interimEl?.remove(); interimEl = null;
