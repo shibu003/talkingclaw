@@ -272,7 +272,8 @@ store.onAppend((ev) => {
 // ---- user 発話(3A-1a-i の routing: default = active 全員。名前/floor は 4A)----
 let turnSeq = 0;
 function userSpeech(text: string): RoomEvent {
-  const targets = registry.all().filter((p) => registry.alive(p)).map((p) => p.participantId);
+  // gone 含む全員に配送(inbox に積まれ、復帰後の listen で再配送される — S1 at-least-once)
+  const targets = registry.all().map((p) => p.participantId);
   const ev = store.append({
     type: 'user_speech', from: 'user', text,
     turnId: `T${++turnSeq}`, targets, routing: { method: 'default' },
