@@ -166,7 +166,14 @@ function render(ev) {
   const isReplay = ev.id <= replayBoundary;
   if (ev.type === 'user_speech') {
     if (!isReplay) audioQueue.length = 0; // stale drop: 自分が話したら溜まった読み上げは捨てる(再生中のみ完了させる)
-    addBubble('user', ev.text ?? '');
+    const b = addBubble('user', ev.text ?? '');
+    if (ev.targets && ev.targets.length > 0) {
+      const to = document.createElement('span');
+      to.className = 'to';
+      const names = ev.targets.map((t) => pidNames.get(t) ?? t);
+      to.textContent = '→ ' + (ev.targets.length > 2 ? 'みんな' : names.join('・'));
+      b.div.appendChild(to);
+    }
     bubbles.delete('last');
   } else if (ev.type === 'agent_speech') {
     const b = agentBubble(ev.from, ev.name, ev.text ?? '');
@@ -363,13 +370,24 @@ micBtn.addEventListener('click', () => {
 // ---- 在室リスト + 相手選択(4A-2)----
 const rosterEl = document.getElementById('roster');
 let selectedPid = null;
+const pidNames = new Map();
 async function refreshRoster() {
   try {
     const r = await fetch('/participants?token=' + TOKEN);
     const d = await r.json();
     selectedPid = d.selected;
     rosterEl.replaceChildren();
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = '話す相手:';
+    rosterEl.appendChild(label);
+    const auto = document.createElement('span');
+    auto.className = 'chip active' + (selectedPid === null ? ' selected' : '');
+    auto.textContent = 'みんな(自動)';
+    auto.onclick = async () => { await post('/select', { participantId: null }); void refreshRoster(); };
+    rosterEl.appendChild(auto);
     for (const p of d.participants) {
+      pidNames.set(p.participantId, p.name);
       const chip = document.createElement('span');
       chip.className = 'chip ' + (p.presence === 'gone' ? 'gone' : 'active') + (p.participantId === selectedPid ? ' selected' : '');
       chip.textContent = p.name + (p.voice !== 'ready' ? '(声なし)' : '');
@@ -384,5 +402,53 @@ async function refreshRoster() {
 }
 setInterval(refreshRoster, 5000);
 void refreshRoster();
+
+// ---- W8-3: 作業ボード(誰が何をどこまで)----
+const boardEl = document.getElementById('board');
+let boardOpen = false;
+document.getElementById('boardBtn').onclick = () => {
+  boardOpen = !boardOpen;
+  boardEl.style.display = boardOpen ? 'block' : 'none';
+  if (boardOpen) void refreshBoard();
+};
+document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN);
+async function refreshBoard() {
+  if (!boardOpen) return;
+  try {
+    const r = await post('/tasks', {});
+    const d = await r.json();
+    boardEl.replaceChildren();
+    const rows = [...(d.tasks ?? []), ...(d.open ?? [])];
+    if (rows.length === 0) {
+      const e = document.createElement('div'); e.className = 'tnote'; e.textContent = 'いまは作業なし'; boardEl.appendChild(e);
+    }
+    for (const t of rows) {
+      const div = document.createElement('div');
+      div.className = 'task';
+      const stat = document.createElement('span');
+      stat.className = 'tstat ' + t.status;
+      stat.textContent = { queued: '待機', working: '⚙ 作業中', done: '✔ 完了', failed: '✖ 失敗' }[t.status] ?? t.status;
+      div.appendChild(stat);
+      const req = document.createElement('span');
+      req.textContent = `${t.agentName}: ${(t.request ?? '').slice(0, 60)}`;
+      div.appendChild(req);
+      if (t.notes && t.notes.length > 0) {
+        const note = document.createElement('span');
+        note.className = 'tnote';
+        note.textContent = '実況: ' + t.notes[t.notes.length - 1];
+        div.appendChild(note);
+      }
+      for (const a of t.artifacts ?? []) {
+        const link = document.createElement('a');
+        link.href = '/files/' + encodeURIComponent(a).replace(/%2F/g, '/') + '?token=' + TOKEN;
+        link.target = '_blank';
+        link.textContent = ' 📦 ' + a;
+        div.appendChild(link);
+      }
+      boardEl.appendChild(div);
+    }
+  } catch { /* 次回 */ }
+}
+setInterval(refreshBoard, 5000);
 
 connect();

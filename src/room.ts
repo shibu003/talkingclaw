@@ -2,7 +2,7 @@
 // S8 の単一性強化・S9 の Host/Origin 検証等は 3A-1b、ページ配信は 3A-1c で拡張する。
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -301,6 +301,8 @@ function resolveListen(pid: string, after: number): object | null {
 }
 
 store.onAppend((ev) => {
+  if (ev.type === 'user_speech') transcriptAppend('あなた', ev.text ?? '');
+  else if (ev.type === 'agent_speech' && !ev.filler && ev.text) transcriptAppend(ev.name ?? ev.from, ev.text);
   if (ev.type === 'agent_speech' && !ev.filler && ev.audio === null && ev.from !== 'room') floorAdvance(ev.from); // S4
   if (!ev.targets && !ev.broadcast) return;
   for (const [pid, waiter] of waiters) {
@@ -322,14 +324,14 @@ let selectedPid: string | null = null;
 let floorOwner: string | null = null;
 let lastResponder: string | null = null;
 
-type Turn = { turnId: string; target: string; delivered: boolean; responded: boolean; noticeSent: boolean };
+type Turn = { turnId: string; target: string; text: string; delivered: boolean; responded: boolean; noticeSent: boolean };
 const turns = new Map<string, Turn>();
 
-function trackTurn(turnId: string, target: string): void {
+function trackTurn(turnId: string, target: string, text = ''): void {
   for (const t of turns.values()) {
     if (t.target === target && !t.responded) cancelEscalation(t.turnId); // 新 turn が旧 escalation を supersede
   }
-  turns.set(turnId, { turnId, target, delivered: false, responded: false, noticeSent: false });
+  turns.set(turnId, { turnId, target, text, delivered: false, responded: false, noticeSent: false });
   if (turns.size > 200) turns.delete(turns.keys().next().value as string);
 }
 
@@ -396,7 +398,7 @@ function userSpeech(text: string): RoomEvent {
   const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing });
   metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
-    trackTurn(turnId, targets[0]);
+    trackTurn(turnId, targets[0], text);
     fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
     scheduleEscalation(turnId, targets[0], 1, 3_500); // /played で前倒し、無ければ fallback
     scheduleUndeliveredNotice(turnId, targets[0]);
@@ -479,8 +481,28 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
   timer.unref();
 }
 
+// ---- W8-2/3: office tasks(見る = board の元データ。導出 + 起票の 2 系統)----
+type OfficeTask = {
+  id: number; agent: string; agentName: string; request: string;
+  status: 'queued' | 'working' | 'done' | 'failed'; notes: string[]; artifacts: string[]; at: string;
+};
+const officeTasks: OfficeTask[] = [];
+let taskSeq = 0;
+const agentNotes = new Map<string, string[]>(); // 外部 agent の 'none' 実況(最新 5 件)
+
+store.onAppend((ev) => {
+  if (ev.type === 'agent_speech' && !ev.filler && ev.turnId === 'none' && ev.from !== 'room') {
+    const notes = agentNotes.get(ev.from) ?? [];
+    notes.push(ev.text ?? '');
+    while (notes.length > 5) notes.shift();
+    agentNotes.set(ev.from, notes);
+  }
+});
+
 // ---- 内蔵クロエ(3C): Brain を in-process participant として部屋に接続 ----
 import { Brain } from './brain.ts';
+import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 
 let chloePid: string | null = null;
 const TIMEOUT = Symbol('timeout');
@@ -506,9 +528,110 @@ function startChloe(): void {
     });
   }
 
-  let brain = new Brain({ systemPrompt: config.systemPrompt, model: config.model });
+  // --- W8-2: worker(実作業係)。会話 Brain とは別セッションで並行動作 ---
+  mkdirSync(config.agent.cwd, { recursive: true });
+  let worker: Brain | null = null;
+  let workerBusy = false;
+  const taskQueue: OfficeTask[] = [];
+
+  function delegate(description: string): OfficeTask {
+    const task: OfficeTask = {
+      id: ++taskSeq, agent: chloePid!, agentName: chloe.assignedName, request: description,
+      status: 'queued', notes: [], artifacts: [], at: new Date().toISOString(),
+    };
+    officeTasks.push(task);
+    while (officeTasks.length > 50) officeTasks.shift();
+    taskQueue.push(task);
+    void pumpTasks();
+    return task;
+  }
+
+  async function pumpTasks(): Promise<void> {
+    if (workerBusy) return;
+    workerBusy = true;
+    try {
+      while (taskQueue.length > 0) {
+        const task = taskQueue.shift()!;
+        task.status = 'working';
+        await runTask(task);
+      }
+    } finally {
+      workerBusy = false;
+    }
+  }
+
+  const workerSay = (task: OfficeTask) => (sentence: string): void => {
+    task.notes.push(sentence);
+    while (task.notes.length > 20) task.notes.shift();
+    enqueueJob({ pid: chloePid!, priority: 2, kind: 'speech', text: sentence, turnId: 'none', epoch: speechEpoch });
+  };
+
+  async function runTask(task: OfficeTask): Promise<void> {
+    if (!worker) {
+      worker = new Brain({
+        systemPrompt: config.workerPrompt, model: config.agent.model,
+        allowedTools: config.agent.allowedTools as unknown as string[],
+        cwd: config.agent.cwd, maxTurns: config.agent.maxTurns,
+      });
+    }
+    try {
+      const askP = worker.ask(task.request, workerSay(task));
+      const result = await Promise.race([askP, timeoutMarker(600_000)]);
+      if (result === TIMEOUT) {
+        await worker.interrupt().catch(() => {});
+        const grace = await Promise.race([askP.catch(() => ''), timeoutMarker(15_000)]);
+        if (grace === TIMEOUT) { void worker.close().catch(() => {}); worker = null; }
+        task.status = 'failed';
+        store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業が長引きすぎたから一旦止めたよ。', audio: null, turnId: 'none' });
+        return;
+      }
+      task.status = 'done';
+      const m = String(result).match(/成果物[:：]\s*(\S+)/);
+      if (m) task.artifacts.push(m[1].replace(/[、。]$/, ''));
+    } catch (error) {
+      task.status = 'failed';
+      task.notes.push(`エラー: ${(error as Error).message}`);
+      store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業でエラーが出ちゃった。もう一回頼んでみて。', audio: null, turnId: 'none' });
+    }
+  }
+
+  const officeServer = createSdkMcpServer({
+    name: 'office',
+    version: '1.0.0',
+    tools: [
+      tool(
+        'delegate_task',
+        '開発・作成・修正などの実作業を作業係に任せる。依頼内容を具体的に 1〜2 文で渡す。',
+        { description: z.string() },
+        async ({ description }) => {
+          const task = delegate(description);
+          return { content: [{ type: 'text', text: `作業係に任せた(task ${task.id})。ユーザーには短く「やっとくね」と伝えるだけでいい。` }] };
+        },
+      ),
+    ],
+  });
+  const convBrainOpts = {
+    systemPrompt: config.systemPrompt, model: config.model,
+    mcpServers: { office: officeServer } as Record<string, unknown>,
+    allowedTools: ['mcp__office__delegate_task'], maxTurns: 4,
+    // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
+    canUseTool: async (name: string, input: Record<string, unknown>) => {
+      if (name === 'mcp__office__delegate_task') return { behavior: 'allow' as const, updatedInput: input };
+      return { behavior: 'deny' as const, message: 'あなたは会話係。実作業は delegate_task ツールに依頼内容を渡して任せること' };
+    },
+  };
+
+  let brain = new Brain(convBrainOpts);
   const inbox: RoomEvent[] = [];
   let busy = false;
+  let needsContext = true; // W8-1: boot/再生成後の最初の ask に直近ログを注入
+
+  function contextPrefix(): string {
+    const rows = transcriptTail(30);
+    if (rows.length === 0) return '';
+    const log = rows.map((r) => `${r.who}: ${r.text}`).join('\n');
+    return `(参考: 部屋の直近の会話ログ。文脈の続きとして自然に振る舞って)\n${log}\n---\n`;
+  }
 
   const speakStreamed = (turnId: string | undefined): ((sentence: string) => void) => {
     let first = true;
@@ -522,13 +645,15 @@ function startChloe(): void {
   // ask を 60s で見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
   async function askGuarded(text: string, turnId: string | undefined): Promise<void> {
     const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
+    if (needsContext) { text = contextPrefix() + text; needsContext = false; }
     const ask = hang ? new Promise<string>(() => {}) : brain.ask(text, speakStreamed(turnId));
     if ((await Promise.race([ask, timeoutMarker(60_000)])) !== TIMEOUT) return;
     console.error('クロエの応答が 60s 超過 → interrupt');
     if (!hang) await brain.interrupt().catch(() => {});
     if ((await Promise.race([ask.catch(() => ''), timeoutMarker(10_000)])) !== TIMEOUT) return;
     void brain.close().catch(() => {});
-    brain = new Brain({ systemPrompt: config.systemPrompt, model: config.model });
+    brain = new Brain(convBrainOpts);
+    needsContext = true; // 再生成 = 文脈喪失 → 次の ask でログ注入
     store.append({ type: 'system', from: 'room', text: 'クロエの接続を作り直したよ。少し前の話は忘れちゃったかも' });
     store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId });
   }
@@ -567,6 +692,22 @@ if (process.env.NO_CHLOE !== '1') startChloe();
 const token = randomBytes(24).toString('hex');
 const stateDir = join(homedir(), '.talkingclaw');
 const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了記録
+
+// W8-1: 会話ログの永続化(共有記憶の正)。user 発話 + 非 filler 本応答を追記
+const TRANSCRIPT = join(homedir(), '.talkingclaw', 'transcript.jsonl');
+function transcriptAppend(who: string, text: string): void {
+  try {
+    appendFileSync(TRANSCRIPT, JSON.stringify({ at: new Date().toISOString(), who, text }) + '\n', { mode: 0o600 });
+  } catch { /* ログ欠落は本流を止めない */ }
+}
+function transcriptTail(lines: number): { at: string; who: string; text: string }[] {
+  try {
+    const all = readFileSync(TRANSCRIPT, 'utf8').trim().split('\n');
+    return all.slice(-lines).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
 
 // 6A: 計測(S10)。サーバ受信時刻で metrics.jsonl に統一記録
 function metric(kind: string, extra: Record<string, unknown> = {}): void {
@@ -649,6 +790,44 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && (path === '/files' || path.startsWith('/files/'))) {
+    if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' }); // 無認証ゾーンより前に置かれているため明示検証
+    const { resolve, sep } = await import('node:path');
+    const root = resolve(config.agent.cwd);
+    const rel = decodeURIComponent(path.slice('/files'.length)).replace(/^\/+/, '');
+    const target = resolve(root, rel);
+    if (target !== root && !target.startsWith(root + sep)) return json(res, 404, { error: 'not found' }); // traversal 拒否
+    try {
+      const { statSync, readdirSync } = await import('node:fs');
+      const st = statSync(target);
+      if (st.isDirectory()) {
+        const esc = (t: string): string => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const items = readdirSync(target).filter((n) => !n.startsWith('.'));
+        const base = path.replace(/\/$/, '');
+        const links = items.map((n) => `<li><a href="${esc(`${base}/${encodeURIComponent(n)}`)}?token=${token}">${esc(n)}</a></li>`).join('');
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+        return res.end(`<!doctype html><meta charset="utf-8"><title>成果物</title><h3>${esc('/' + rel)}</h3><ul>${links}</ul>`);
+      }
+      const types: Record<string, string> = {
+        '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.wav': 'audio/wav', '.md': 'text/plain; charset=utf-8',
+      };
+      const ext = target.slice(target.lastIndexOf('.'));
+      res.writeHead(200, { 'content-type': types[ext] ?? 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      return res.end(await readFile(target));
+    } catch {
+      return json(res, 404, { error: 'not found' });
+    }
+  }
+
+  if (req.method === 'GET' && path === '/transcript.md') {
+    if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' }); // 会話ログは秘匿
+    const rows = transcriptTail(Math.min(Number(url.searchParams.get('lines') ?? 500) || 500, 2000));
+    const md = '# 声の部屋 会話ログ\n\n' + rows.map((r) => `- ${r.at.slice(0, 16).replace('T', ' ')} **${r.who}**: ${r.text}`).join('\n') + '\n';
+    res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    return res.end(md);
+  }
+
   if (req.method === 'GET' && path === '/room.js') {
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     return res.end(await readFile(fileURLToPath(new URL('../public/room.js', import.meta.url))));
@@ -724,6 +903,23 @@ const server = createServer(async (req, res) => {
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
     const ev = userSpeech(text);
     return json(res, 200, { ok: true, eventId: ev.id, turnId: ev.turnId });
+  }
+
+  if (path === '/tasks') {
+    const open = [...turns.values()]
+      .filter((t) => !t.responded && !t.noticeSent && t.target !== chloePid)
+      .slice(-10)
+      .map((t) => ({
+        agent: t.target, agentName: registry.get(t.target)?.assignedName ?? t.target,
+        request: t.text, status: t.delivered ? 'working' : 'queued',
+        notes: agentNotes.get(t.target) ?? [], artifacts: [],
+      }));
+    return json(res, 200, { tasks: [...officeTasks].reverse().slice(0, 20), open });
+  }
+
+  if (path === '/transcript') {
+    const lines = Math.min(Number(body.lines ?? 40) || 40, 200);
+    return json(res, 200, { lines: transcriptTail(lines) });
   }
 
   if (path === '/metrics') {

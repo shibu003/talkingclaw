@@ -10,14 +10,26 @@ export class Brain {
   #streamBuffer = '';
   #onSentence: ((sentence: string) => void) | null = null;
 
-  constructor(opts: { systemPrompt: string; model: string }) {
+  constructor(opts: {
+    systemPrompt: string; model: string;
+    allowedTools?: string[]; cwd?: string; maxTurns?: number;
+    mcpServers?: Record<string, unknown>;
+    canUseTool?: (name: string, input: Record<string, unknown>) => Promise<
+      { behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }
+    >;
+  }) {
     this.#query = query({
       prompt: this.#input,
       options: {
         systemPrompt: opts.systemPrompt,
         model: opts.model,
-        allowedTools: [],
-        maxTurns: 1,
+        // allowedTools に載せたツールだけ承認なしで使える(未記載は不可のまま)。
+        // 危険寄りの操作(削除・push 等)は persona の口頭確認ルールで抑止する
+        allowedTools: opts.allowedTools ?? [],
+        cwd: opts.cwd,
+        maxTurns: opts.maxTurns ?? 1,
+        ...(opts.mcpServers ? { mcpServers: opts.mcpServers as never } : {}),
+        ...(opts.canUseTool ? { canUseTool: opts.canUseTool as never } : {}),
         includePartialMessages: true,
       },
     });

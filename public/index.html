@@ -31,7 +31,16 @@
   @keyframes pulse { 50% { transform: scale(1.08); } }
   #text { flex: 1; padding: 12px 16px; border-radius: 24px; border: 1px solid #3d3356; background: #241d33; color: #eae6f2; font-size: 15px; outline: none; }
   #notice { padding: 8px 18px; color: #e75480; font-size: 13px; display: none; }
-  #roster { display: flex; gap: 8px; padding: 0 18px 6px; flex-wrap: wrap; }
+  .hbtn { background: #241d33; border: 1px solid #3d3356; color: #eae6f2; border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+  #roster { display: flex; gap: 8px; padding: 0 18px 6px; flex-wrap: wrap; align-items: center; }
+  #roster .label { font-size: 12px; color: #9a8fb8; }
+  #board { display: none; margin: 0 18px 8px; padding: 10px 12px; background: #1d1729; border: 1px solid #3d3356; border-radius: 12px; max-height: 32dvh; overflow-y: auto; }
+  .task { padding: 6px 0; border-bottom: 1px solid #241d33; font-size: 13px; }
+  .task .tstat { font-size: 11px; padding: 1px 8px; border-radius: 8px; background: #3d3356; margin-right: 6px; }
+  .task .tstat.done { background: #2e5d3a; } .task .tstat.failed { background: #6b2f3d; }
+  .task .tnote { color: #9a8fb8; font-size: 12px; display: block; }
+  .task a { color: #b48ef7; }
+  .user .to { display: block; font-size: 10px; color: #9a8fb8; text-align: right; margin-top: 2px; }
   .chip { padding: 4px 12px; border-radius: 14px; background: #241d33; color: #9a8fb8;
           font-size: 12px; cursor: pointer; border: 1px solid #3d3356; user-select: none; }
   .chip.active { color: #eae6f2; }
@@ -42,10 +51,13 @@
 <body>
 <header>
   <h1>声の部屋</h1>
+  <button id="boardBtn" class="hbtn" title="作業ボード">📋</button>
+  <button id="logBtn" class="hbtn" title="会話ログ">📄</button>
   <div id="status">接続中…</div>
 </header>
 <div id="notice"></div>
 <div id="roster"></div>
+<div id="board"></div>
 <div id="log"></div>
 <footer>
   <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>

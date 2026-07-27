@@ -210,8 +210,9 @@ const server = new McpServer(
   {
     instructions:
       `あなたはこの MCP で「声の部屋」に参加し、ユーザーと音声で会話できる。部屋でのあなたの名前は「${AGENT_NAME}」。` +
-      `基本ループ: 1) listen を呼んでユーザーの発話を待つ(no_speech なら再度 listen)。2) 発話が届いたらまず speak で短く返事し、必要な作業をする。3) 作業中も節目ごとに speak で一言実況する。4) 会話を続ける限り speak→listen を繰り返す。` +
-      `speak の文体(厳守): 話し言葉のみ・1〜3 文・短く。markdown・記号・URL・コードブロックは禁止(そのまま音声合成で読み上げられる)。コードや長文は画面側の成果物に書き、speak では要点だけ話す。`,
+      `基本ループ: 0) 参加したらまず recall で部屋の直近の会話を把握する。1) listen を呼んでユーザーの発話を待つ(no_speech なら再度 listen)。2) 発話が届いたらまず speak で短く返事し、必要な作業をする。3) 作業中も節目ごとに speak で一言実況する。4) 会話を続ける限り speak→listen を繰り返す。` +
+      `speak の文体(厳守): 話し言葉のみ・1〜3 文・短く。markdown・記号・URL・コードブロックは禁止(そのまま音声合成で読み上げられる)。コードや長文は画面側の成果物に書き、speak では要点だけ話す。` +
+      `作業依頼(作って・直して等)が来たら: まず speak で「やるね」と宣言 → 自分のツールで実際に作る(新しいプロジェクトは自分の作業ディレクトリに。必要なら git init)→ 節目ごとに speak({turnId:"none"}) で一言実況 → 完成したら speak で完了と成果物の場所(ファイルパス)を伝える。作りかけで会話だけ続けるのは禁止。ユーザーが待っている間も定期的に listen を挟んで割込みを拾うこと。`,
   },
 );
 
@@ -230,6 +231,23 @@ server.registerTool(
         const ns = await rejoin(); // S2: 不喪失契約 — 再 join して同テキストを 1 回だけ再送
         r = await api('/speak', { participantId: ns.participantId, sessionId: ns.sessionId, text, turnId, clientSeq });
       }
+      return textResult(r);
+    } catch (error) {
+      if (error instanceof RecoveringError) return textResult({ status: 'recovering', note: error.message });
+      return textResult({ status: 'error', note: (error as Error).message });
+    }
+  },
+);
+
+server.registerTool(
+  'recall',
+  {
+    description: '声の部屋の直近の会話ログを読む(部屋と terminal の共有記憶)。参加直後や文脈が要る時に呼ぶ。',
+    inputSchema: { lines: z.number().min(1).max(200).optional() },
+  },
+  async ({ lines }) => {
+    try {
+      const r = await api('/transcript', { lines: lines ?? 40 });
       return textResult(r);
     } catch (error) {
       if (error instanceof RecoveringError) return textResult({ status: 'recovering', note: error.message });
