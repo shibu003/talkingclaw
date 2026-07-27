@@ -31,6 +31,12 @@
   @keyframes pulse { 50% { transform: scale(1.08); } }
   #text { flex: 1; padding: 12px 16px; border-radius: 24px; border: 1px solid #3d3356; background: #241d33; color: #eae6f2; font-size: 15px; outline: none; }
   #notice { padding: 8px 18px; color: #e75480; font-size: 13px; display: none; }
+  #roster { display: flex; gap: 8px; padding: 0 18px 6px; flex-wrap: wrap; }
+  .chip { padding: 4px 12px; border-radius: 14px; background: #241d33; color: #9a8fb8;
+          font-size: 12px; cursor: pointer; border: 1px solid #3d3356; user-select: none; }
+  .chip.active { color: #eae6f2; }
+  .chip.selected { background: #b48ef7; color: #16121f; border-color: #b48ef7; }
+  .chip.gone { opacity: .45; }
 </style>
 </head>
 <body>
@@ -39,6 +45,7 @@
   <div id="status">接続中…</div>
 </header>
 <div id="notice"></div>
+<div id="roster"></div>
 <div id="log"></div>
 <footer>
   <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>

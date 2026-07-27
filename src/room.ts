@@ -551,6 +551,18 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && path === '/participants') {
+    return json(res, 200, {
+      selected: selectedPid,
+      participants: registry.all().map((p) => ({
+        participantId: p.participantId,
+        name: p.assignedName,
+        presence: registry.presence(p, waiters.has(p.participantId)),
+        voice: p.voice.status,
+      })),
+    });
+  }
+
   if (req.method === 'GET' && path.startsWith('/audio/')) {
     const wav = audioStore.get(Number(path.slice('/audio/'.length)));
     if (!wav) return json(res, 404, { error: 'audio が見つかりません' });

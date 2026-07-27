@@ -66,6 +66,10 @@ function post(path, body) {
 }
 
 function playNext() {
+  if (gateActive() && audioQueue.length > 0) { // 発話中はゲート(解除後に再開)
+    setTimeout(playNext, 250);
+    return;
+  }
   const next = audioQueue.shift();
   if (!next) {
     playing = false;
@@ -150,6 +154,7 @@ function render(ev) {
   } else if (ev.type === 'system' || ev.type === 'presence') {
     addSys((ev.name ? ev.name + ': ' : '') + (ev.text ?? ev.type));
     bubbles.delete('last');
+    if (ev.type === 'presence' && typeof refreshRoster === 'function') setTimeout(() => refreshRoster(), 100);
   }
 }
 
@@ -196,6 +201,15 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
 let interimEl = null;
 let speechEndAt = 0;
+let interimUpdatedAt = 0; // interim ゲート(S6): 本応答の再生開始を保留(ack は対象外)
+let interimStartedAt = 0;
+function gateActive() {
+  const now = performance.now();
+  if (!interimUpdatedAt) return false;
+  if (now - interimUpdatedAt > 1500) return false;   // 新鮮な interim のみ
+  if (now - interimStartedAt > 4000) return false;   // 最大保持 4s
+  return true;
+}
 
 if (!SR) {
   notice('このブラウザは音声認識に未対応。Chrome を使うか、テキスト入力してね。');
@@ -214,6 +228,7 @@ if (!SR) {
   recognition.onspeechend = () => { speechEndAt = performance.now(); };
   recognition.onend = () => {
     listening = false;
+    interimUpdatedAt = 0;
     micBtn.classList.remove('listening');
     interimEl?.remove(); interimEl = null;
     if (handsfree && !playing) setTimeout(() => { if (handsfree && !playing && !listening) startMic(); }, 300);
@@ -225,12 +240,16 @@ if (!SR) {
     let finalText = '', interim = '';
     for (const r of e.results) (r.isFinal ? (finalText += r[0].transcript) : (interim += r[0].transcript));
     if (interim) {
+      const now = performance.now();
+      if (!interimUpdatedAt || now - interimUpdatedAt > 1500) interimStartedAt = now;
+      interimUpdatedAt = now;
       if (!interimEl) { interimEl = document.createElement('div'); interimEl.className = 'interim'; }
       interimEl.textContent = interim + '…';
       log.appendChild(interimEl);
       log.scrollTop = log.scrollHeight;
     }
     if (finalText) {
+      interimUpdatedAt = 0; // final で即クリア(S6)
       if (speechEndAt > 0) { // gate ① 計測(15s 超は計測異常として捨てる)
         const delay = Math.round(performance.now() - speechEndAt);
         if (delay < 15_000) void post('/metrics', { kind: 'stt_final_delay', ms: delay });
@@ -252,5 +271,30 @@ micBtn.addEventListener('click', () => {
   if (handsfree) startMic();
   else { pauseMic(); setStatus('🎤 でハンズフリー開始'); }
 });
+
+// ---- 在室リスト + 相手選択(4A-2)----
+const rosterEl = document.getElementById('roster');
+let selectedPid = null;
+async function refreshRoster() {
+  try {
+    const r = await fetch('/participants?token=' + TOKEN);
+    const d = await r.json();
+    selectedPid = d.selected;
+    rosterEl.replaceChildren();
+    for (const p of d.participants) {
+      const chip = document.createElement('span');
+      chip.className = 'chip ' + (p.presence === 'gone' ? 'gone' : 'active') + (p.participantId === selectedPid ? ' selected' : '');
+      chip.textContent = p.name + (p.voice !== 'ready' ? '(声なし)' : '');
+      chip.onclick = async () => {
+        const next = selectedPid === p.participantId ? null : p.participantId;
+        await post('/select', { participantId: next });
+        void refreshRoster();
+      };
+      rosterEl.appendChild(chip);
+    }
+  } catch { /* 次の更新で */ }
+}
+setInterval(refreshRoster, 5000);
+void refreshRoster();
 
 connect();
