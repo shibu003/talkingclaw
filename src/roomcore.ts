@@ -21,6 +21,11 @@ export type RoomEvent = {
 const MAX_LOG = 1000;
 const AGENT_REPLAY_LIMIT = 50;
 
+// S4: 名前マッチ用の正規化(カタカナ→ひらがな + 小文字化)
+export function kanaNormalize(s: string): string {
+  return s.toLowerCase().replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60));
+}
+
 export class EventStore {
   readonly bootId = randomUUID();
   #log: RoomEvent[] = [];
@@ -46,6 +51,10 @@ export class EventStore {
 
   get oldestRetainedId(): number {
     return this.#log.length > 0 ? this.#log[0].id : this.#seq + 1;
+  }
+
+  get(id: number): RoomEvent | undefined {
+    return this.#log.find((e) => e.id === id);
   }
 
   // SSE replay 用(全 event)

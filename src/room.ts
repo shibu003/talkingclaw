@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
-import { EventStore, Registry, type RoomEvent } from './roomcore.ts';
+import { EventStore, Registry, kanaNormalize, type RoomEvent } from './roomcore.ts';
 import { Voice, splitSentences } from './voice.ts';
 
 const PORT = Number(process.env.PORT ?? 3300);
@@ -125,6 +125,7 @@ async function resolveVoice(requested: string): Promise<number | null> {
 }
 
 async function onEngineReady(): Promise<void> {
+  buildNarrationPool();
   for (const p of registry.all()) {
     if (p.voice.status === 'ready') continue;
     const speaker = await resolveVoice(p.voice.requested);
@@ -139,6 +140,16 @@ async function onEngineReady(): Promise<void> {
 const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
 const ackPools = new Map<string, string[]>();
 let ackRotate = 0;
+// ナレーション(未達通知等)= まお/ノーマル固定(S6)。engineReady で合成
+const NARRATION_TEXT = '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね';
+const narrationPool: string[] = [];
+
+function buildNarrationPool(): void {
+  if (narrationPool.length > 0) return;
+  void resolveVoice('まお/ノーマル').then((speaker) => {
+    if (speaker !== null) enqueueJob({ pid: '__narration__', priority: 3, kind: 'ack-pool', text: NARRATION_TEXT, speaker });
+  });
+}
 
 function buildAckPool(pid: string, speaker: number): void {
   if (ackPools.has(pid)) return;
@@ -206,7 +217,10 @@ async function runJob(job: SynthJob): Promise<void> {
       synthFailStreak = 0;
       if (!wav) return emitSpeech(null);
       const url = putAudio(wav, job.kind === 'ack-pool');
-      if (job.kind === 'ack-pool') ackPools.get(job.pid)?.push(url);
+      if (job.kind === 'ack-pool') {
+        if (job.pid === '__narration__') narrationPool.push(url);
+        else ackPools.get(job.pid)?.push(url);
+      }
       else emitSpeech(url);
       return;
     } catch (error) {
@@ -255,11 +269,15 @@ function resolveListen(pid: string, after: number): object | null {
   if (events.length === 0) return null;
   const p = registry.get(pid);
   if (p) p.ackedCursor = after; // ack = 前回配送分の確認(S1)
+  for (const e of events) {
+    if (e.type === 'user_speech' && e.turnId) { const t = turns.get(e.turnId); if (t && t.target === pid) t.delivered = true; }
+  }
   const stripped = events.map(({ audio, ...rest }) => rest); // S2: agent 応答から audio 除去
   return { status: 'speech', bootId: store.bootId, truncated, events: stripped, cursor: events[events.length - 1].id };
 }
 
 store.onAppend((ev) => {
+  if (ev.type === 'agent_speech' && !ev.filler && ev.audio === null && ev.from !== 'room') floorAdvance(ev.from); // S4
   if (!ev.targets && !ev.broadcast) return;
   for (const [pid, waiter] of waiters) {
     if (!(ev.broadcast === true || ev.targets?.includes(pid))) continue;
@@ -275,20 +293,96 @@ store.onAppend((ev) => {
 
 // ---- user 発話(3A-1a-i の routing: default = active 全員。名前/floor は 4A)----
 let turnSeq = 0;
+// ---- Router(S4/4A-1): 名前 > UI 選択 > floor > last_responder > default(クロエ)----
+let selectedPid: string | null = null;
+let floorOwner: string | null = null;
+let lastResponder: string | null = null;
+
+type Turn = { turnId: string; target: string; delivered: boolean; responded: boolean; noticeSent: boolean };
+const turns = new Map<string, Turn>();
+
+function trackTurn(turnId: string, target: string): void {
+  turns.set(turnId, { turnId, target, delivered: false, responded: false, noticeSent: false });
+  if (turns.size > 200) turns.delete(turns.keys().next().value as string);
+}
+
+// speak の turnId 省略時: 配送済み・未応答の最古 turn(無ければ最新の自分宛 turn)— S4
+function attributeTurn(pid: string, explicit: string | undefined): string | undefined {
+  if (explicit === 'none') return 'none';
+  if (explicit) { markResponded(explicit); return explicit; }
+  let latest: string | undefined;
+  for (const t of turns.values()) {
+    if (t.target !== pid) continue;
+    latest = t.turnId;
+    if (t.delivered && !t.responded) { markResponded(t.turnId); return t.turnId; }
+  }
+  if (latest) markResponded(latest);
+  return latest;
+}
+
+function markResponded(turnId: string): void {
+  const t = turns.get(turnId);
+  if (t) t.responded = true;
+}
+
+function floorAdvance(pid: string): void {
+  floorOwner = pid;
+  lastResponder = pid;
+}
+
+function routeTargets(text: string): { targets: string[]; routing: RoomEvent['routing'] } {
+  const head = kanaNormalize(text.slice(0, 12));
+  let best: { pid: string; alias: string } | null = null;
+  for (const p of registry.all()) {
+    if (!registry.alive(p)) continue; // gone は名前マッチ候補から除外(ghost 対策。作業中 = active はマッチ)
+    for (const raw of [p.assignedName, p.requestedName]) {
+      const alias = kanaNormalize(raw);
+      const idx = alias ? head.indexOf(alias) : -1;
+      // 呼びかけ = 名前が文頭近く(開始位置 ≤5)。文中の言及(「後でコハクに頼む」等)は除外
+      if (idx >= 0 && idx <= 5 && (!best || alias.length > best.alias.length)) best = { pid: p.participantId, alias: raw };
+    }
+  }
+  if (best) return { targets: [best.pid], routing: { method: 'name', matchedAlias: best.alias } };
+  const aliveTarget = (pid: string | null): boolean => {
+    if (!pid) return false;
+    const p = registry.get(pid);
+    return p !== undefined && registry.alive(p); // S4: gone は floor/last_responder から自然解除
+  };
+  if (aliveTarget(selectedPid)) return { targets: [selectedPid!], routing: { method: 'selection' } };
+  if (aliveTarget(floorOwner)) return { targets: [floorOwner!], routing: { method: 'floor' } };
+  if (aliveTarget(lastResponder)) return { targets: [lastResponder!], routing: { method: 'last_responder' } };
+  if (chloePid && registry.get(chloePid)) return { targets: [chloePid], routing: { method: 'default' } };
+  return { targets: registry.all().map((p) => p.participantId), routing: { method: 'default' } };
+}
+
 function userSpeech(text: string): RoomEvent {
   speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
-  // S4 default: クロエ在室ならクロエへ(名前呼びかけ・選択・floor は 4A)。
-  // 不在なら gone 含む全員配送(inbox 蓄積 — S1 at-least-once)
-  const targets = chloePid !== null && registry.get(chloePid)
-    ? [chloePid]
-    : registry.all().map((p) => p.participantId);
-  const ev = store.append({
-    type: 'user_speech', from: 'user', text,
-    turnId: `T${++turnSeq}`, targets, routing: { method: 'default' },
-  });
-  // S6: t=0 相槌。複数 target の turn は ack 無効(単独 target のみ)
-  if (targets.length === 1) fireAck(targets[0], ev.turnId);
+  const { targets, routing } = routeTargets(text);
+  const turnId = `T${++turnSeq}`;
+  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing });
+  if (targets.length === 1) {
+    trackTurn(turnId, targets[0]);
+    fireAck(targets[0], turnId); // S6: t=0 相槌(単独 target のみ)
+    scheduleUndeliveredNotice(turnId, targets[0]);
+  }
   return ev;
+}
+
+// S4: routed 先に 6s 以内に配送されなければ未達通知(1 回・ナレーション)+ floor 解除
+function scheduleUndeliveredNotice(turnId: string, target: string): void {
+  if (target === chloePid) return; // in-process は即配送
+  const timer = setTimeout(() => {
+    const t = turns.get(turnId);
+    if (!t || t.delivered || t.noticeSent) return;
+    t.noticeSent = true;
+    store.append({
+      type: 'agent_speech', from: 'room', name: 'ナレーション',
+      text: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
+      audio: narrationPool[0] ?? null, filler: 'status', turnId,
+    });
+    if (floorOwner === target) floorOwner = null;
+  }, 6_000);
+  timer.unref();
 }
 
 // ---- 内蔵クロエ(3C): Brain を in-process participant として部屋に接続 ----
@@ -325,6 +419,7 @@ function startChloe(): void {
   const speakStreamed = (turnId: string | undefined): ((sentence: string) => void) => {
     let first = true;
     return (sentence) => {
+      if (first && turnId) markResponded(turnId);
       enqueueJob({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch });
       first = false;
     };
@@ -361,6 +456,7 @@ function startChloe(): void {
 
   store.onAppend((ev) => {
     if (ev.type === 'user_speech' && ev.targets?.includes(chloePid!)) {
+      if (ev.turnId) { const t = turns.get(ev.turnId); if (t) t.delivered = true; } // in-process = 即配送
       inbox.push(ev);
       void drain();
     }
@@ -512,11 +608,21 @@ const server = createServer(async (req, res) => {
     return json(res, 200, { ok: true });
   }
 
+  if (path === '/select') {
+    const pid = body.participantId === null ? null : String(body.participantId ?? '');
+    if (pid !== null && !registry.get(pid)) return json(res, 400, { error: '不明な participant です' });
+    selectedPid = pid;
+    store.append({ type: 'system', from: 'room', text: pid ? `話し相手を ${registry.get(pid)!.assignedName} にしたよ` : '話し相手の指定を外したよ' });
+    return json(res, 200, { ok: true, selected: selectedPid });
+  }
+
   if (path === '/played') {
     // S4/S10: 再生完了通知(floor 集計は 4A で使用)
     const eventId = Number(body.eventId);
     if (!Number.isFinite(eventId)) return json(res, 400, { error: 'eventId が必要です' });
     playedIds.add(eventId);
+    const ev = store.get(eventId);
+    if (ev && ev.type === 'agent_speech' && !ev.filler && ev.from !== 'room') floorAdvance(ev.from); // S4: 再生完了基準
     return json(res, 200, { ok: true });
   }
 
@@ -552,7 +658,8 @@ const server = createServer(async (req, res) => {
       if (seen.size > 200) seen.delete(seen.values().next().value as string);
       seenSpeakSeqs.set(p.participantId, seen);
     }
-    speakSentences(p.participantId, p.assignedName, text, body.turnId ? String(body.turnId) : undefined);
+    const resolvedTurn = attributeTurn(p.participantId, body.turnId ? String(body.turnId) : undefined);
+    speakSentences(p.participantId, p.assignedName, text, resolvedTurn === 'none' ? undefined : resolvedTurn);
     return json(res, 200, { status: engineState === 'ready' && p.voice.status === 'ready' ? 'ok' : 'text_only' });
   }
 
