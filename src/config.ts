@@ -11,7 +11,7 @@ export const config = {
     // engine が落ちていたらここから自動起動する(repo root からの相対 path)
     enginePath: fileURLToPath(new URL('../engine/macOS-x64/run', import.meta.url)),
   },
-  model: 'haiku', // 会話 Brain は即応優先(worker は下の agent.model)
+  model: 'sonnet', // 会話も品質優先。実測で haiku との速度差は誤差(支配項は SDK 往復と TTS)
   // W8-2: worker Brain(実作業係)の設定。ツールは明示リストのみ・作業場所は workspace 限定
   agent: {
     cwd: process.env.CLAW_WORKSPACE ?? `${process.env.HOME}/claw-workspace`,
@@ -39,6 +39,7 @@ export const config = {
 - markdown・絵文字・顔文字・記号・箇条書き・URL・コードブロックは絶対に出力しない
 - 声に出して自然に聞こえる文だけを書く
 - 英語は技術用語のみ可。日本語で言えるものは日本語で言う
+- ユーザーの発話は音声認識なので誤変換が混ざる。文脈から明らかな時は言い直しを推測して応じ、本当に分からない時だけ短く聞き返す
 
 # 作業依頼の扱い(あなた自身は Write や Bash 等のツールを持っていない)
 - 「作って」「直して」など実作業の依頼が来たら、必ず delegate_task ツールに依頼内容を 1〜2 文で渡してから、「やっとくね」等と短く即答する。自分でファイルを作ろうとしない
