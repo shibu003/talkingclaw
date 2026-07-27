@@ -624,6 +624,20 @@ const server = createServer(async (req, res) => {
     });
     return res.end(html);
   }
+  if (req.method === 'GET' && path.startsWith('/vad/')) {
+    const name = path.slice('/vad/'.length);
+    if (!/^[a-zA-Z0-9._-]+$/.test(name)) return json(res, 404, { error: 'not found' });
+    const types: Record<string, string> = { '.onnx': 'application/octet-stream', '.wasm': 'application/wasm', '.mjs': 'text/javascript', '.js': 'text/javascript' };
+    const ext = name.slice(name.lastIndexOf('.'));
+    try {
+      const buf = await readFile(fileURLToPath(new URL(`../public/vad/${name}`, import.meta.url)));
+      res.writeHead(200, { 'content-type': types[ext] ?? 'application/octet-stream', 'x-content-type-options': 'nosniff' });
+      return res.end(buf);
+    } catch {
+      return json(res, 404, { error: 'not found' });
+    }
+  }
+
   if (req.method === 'GET' && path === '/room.js') {
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     return res.end(await readFile(fileURLToPath(new URL('../public/room.js', import.meta.url))));

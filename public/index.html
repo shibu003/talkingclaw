@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; connect-src 'self'; media-src 'self'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; media-src 'self'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'">
 <meta name="room-token" content="__ROOM_TOKEN__">
 <meta name="room-boot" content="__BOOT_ID__">
 <title>talkingclaw — 声の部屋</title>
@@ -51,6 +51,7 @@
   <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>
   <input id="text" placeholder="テキストでも話しかけられるよ" autocomplete="off">
 </footer>
+<script src="/vad/vad-web.js"></script>
 <script src="/room.js"></script>
 </body>
 </html>

@@ -12,6 +12,7 @@ let replayBoundary = 0;   // hello の lastId 以前は replay(S1: 音声 enqueu
 let handsfree = false;
 let listening = false;
 let playing = false;
+let currentAudio = null; // 6C: barge-in の duck/pause 対象
 const audioQueue = [];    // { url, bubble, eventId }
 const bubbles = new Map(); // 連続する同一発話者の文を 1 吹き出しにまとめる: key=from
 
@@ -81,6 +82,7 @@ function playNext() {
   pauseMic();
   next.bubble.classList.add('speaking');
   const audio = new Audio(next.url + '?token=' + TOKEN); // S1: token 付与はブラウザ側
+  currentAudio = audio;
   let advanced = false;
   const advance = () => {
     if (advanced) return;
@@ -105,6 +107,7 @@ function playAckNow(url, bubble, eventId) {
   pauseMic(); // マイク方針は SP3 の実測で確定(現状は保守的に停止)
   bubble.classList.add('speaking');
   const audio = new Audio(url + '?token=' + TOKEN);
+  currentAudio = audio;
   let advanced = false;
   const advance = () => {
     if (advanced) return;
@@ -286,10 +289,49 @@ function startMic() { try { recognition.start(); } catch { /* already */ } }
 function pauseMic() { if (recognition && listening) recognition.abort(); }
 function resumeMic() { if (handsfree && !listening) startMic(); setStatus(handsfree ? '聞いてるよ' : '🎤 でハンズフリー開始'); }
 
+// ---- 6C barge-in: VAD(silero v5・自前配信)で再生中の割込みを検知 ----
+// duck(音量 0.15)→ 250ms 継続で確定: 再生停止 + 未再生破棄 + 認識再開(S11:
+// 未合成テキスト・タスクは無傷。timeline はそのまま)
+let vadInstance = null;
+let bargeTimer = null;
+async function ensureVad() {
+  if (vadInstance || !window.vad) return;
+  try {
+    vadInstance = await window.vad.MicVAD.new({
+      baseAssetPath: '/vad/',
+      onnxWASMBasePath: '/vad/',
+      model: 'v5',
+      onSpeechStart: () => {
+        if (!playing || !currentAudio) return;
+        currentAudio.volume = 0.15; // duck
+        bargeTimer = setTimeout(() => {
+          if (!playing || !currentAudio) return;
+          currentAudio.pause();           // 再生中 = pause(S11)
+          audioQueue.length = 0;          // 未再生 = 破棄
+          playing = false;
+          document.querySelectorAll('.agent.speaking').forEach((el) => el.classList.remove('speaking'));
+          void post('/metrics', { kind: 'barge_in', ms: 0 });
+          setStatus('どうぞ');
+          resumeMic();                    // 発話を拾いに行く
+        }, 250);
+      },
+      onVADMisfire: () => {
+        if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = null; }
+        if (currentAudio) currentAudio.volume = 1;
+      },
+      onSpeechEnd: () => {
+        if (bargeTimer) { clearTimeout(bargeTimer); bargeTimer = null; }
+        if (playing && currentAudio) currentAudio.volume = 1;
+      },
+    });
+    vadInstance.start();
+  } catch (e) { console.warn('VAD 初期化失敗(barge-in なしで継続):', e); }
+}
+
 micBtn.addEventListener('click', () => {
   handsfree = !handsfree;
   micBtn.classList.toggle('on', handsfree);
-  if (handsfree) startMic();
+  if (handsfree) { startMic(); void ensureVad(); }
   else { pauseMic(); setStatus('🎤 でハンズフリー開始'); }
 });
 
