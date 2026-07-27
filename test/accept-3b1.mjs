@@ -94,7 +94,7 @@ async function readEvents(rj, ms = 1500) {
 }
 const rj = roomJson();
 let reached = false;
-for (let i = 0; i < 20 && !reached; i++) { // 合成(Intel で 4-6s)+ 同一 FIFO の相槌プール分を待つ
+for (let i = 0; i < 40 && !reached; i++) { // 合成 + join 直後のプール構築(ack3+context2+narration2 ≈ 30s)を待つ
   reached = (await readEvents(rj)).includes('プロキシからのテスト発話だよ');
   if (!reached) await sleep(1500);
 }
@@ -130,13 +130,13 @@ s1.proc.kill('SIGKILL');
 await sleep(500);
 await fetch(`http://127.0.0.1:${rj.port}/chat`, {
   method: 'POST', headers: { 'content-type': 'application/json', 'x-room-token': rj.token },
-  body: JSON.stringify({ text: '不在中のメッセージだよ' }),
+  body: JSON.stringify({ text: 'コハク、不在中のメッセージだよ' }),
 });
 await sleep(4000); // ALIVE_MS は本番値だが listen waiter は死んでいるので takeover 条件は resume で満たす
 const s2 = startProxy();
 await init(s2);
 const li6 = toolJson(await rpc(s2, 'tools/call', { name: 'listen', arguments: { wait_seconds: 5 } }));
-if (li6.status === 'speech' && li6.events?.some((e) => e.text === '不在中のメッセージだよ')) ok('不在中の発話が再配送された');
+if (li6.status === 'speech' && li6.events?.some((e) => (e.text || '').includes('不在中のメッセージだよ'))) ok('不在中の発話が再配送された');
 else if (li6.status === 'rejoined') ng('resume できず fresh join に落ちた');
 else ng(JSON.stringify(li6));
 const pid2 = JSON.parse(readFileSync(join(homedir(), '.talkingclaw', `agent-${'コハク'.toLowerCase().replace(/[^a-z0-9]/g, '')}-${(await import('node:crypto')).createHash('sha256').update('コハク').digest('hex').slice(0, 6)}.json`), 'utf8')).participantId;

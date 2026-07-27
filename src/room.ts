@@ -172,7 +172,8 @@ function buildAckPool(pid: string, speaker: number): void {
 function fireAck(target: string, turnId: string | undefined): void {
   const p = registry.get(target);
   const pool = ackPools.get(target) ?? [];
-  if (!p || p.voice.status !== 'ready' || pool.length === 0 || engineState !== 'ready') return;
+  if (!p || !registry.alive(p)) return; // gone の相手の声で相槌しない(偽生存の防止)
+  if (p.voice.status !== 'ready' || pool.length === 0 || engineState !== 'ready') return;
   const text = ACK_TEXTS[ackRotate % ACK_TEXTS.length];
   const audio = pool[ackRotate % pool.length];
   ackRotate++;
@@ -361,7 +362,9 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
   const head = kanaNormalize(text.slice(0, 12));
   let best: { pid: string; alias: string } | null = null;
   for (const p of registry.all()) {
-    if (!registry.alive(p)) continue; // gone は名前マッチ候補から除外(ghost 対策。作業中 = active はマッチ)
+    // ghost(suffix ephemeral)の gone だけ除外。本物(canonical)の gone は名指し可
+    // → inbox に積まれ復帰後に再配送 + 未達通知が出る(v6.1 修正)
+    if (!registry.alive(p) && p.ephemeral) continue;
     for (const raw of [p.assignedName, p.requestedName]) {
       const alias = kanaNormalize(raw);
       const idx = alias ? head.indexOf(alias) : -1;

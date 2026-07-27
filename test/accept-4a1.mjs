@@ -112,7 +112,11 @@ eq(r.targets, [kohaku.participantId]) ? ok('10 名前 > floor') : ng(`10: ${JSON
 // gone 化(8s 放置)→ 名前マッチ・floor から除外
 await sleep(9000);
 r = await chatTargets('まい、いる?');
-r && !eq(r.targets, [mai.participantId]) ? ok('11 gone は名前/floor から除外(全員配送)') : ng(`11: ${JSON.stringify(r)}`);
+r && eq(r.targets, [mai.participantId]) && r.routing.method === 'name'
+  ? ok('11a canonical gone への名指しは inbox に積まれる(v6.1)') : ng(`11a: ${JSON.stringify(r)}`);
+r = await chatTargets('今日はいい天気だね');
+r && !eq(r.targets, [mai.participantId]) && !eq(r.targets, [kohaku.participantId])
+  ? ok('11b gone は floor/last_responder から除外') : ng(`11b: ${JSON.stringify(r)}`);
 
 console.log('== Part B: SP4 turnId 帰属(独立 boot・クリーン状態)==');
 await kill_();
