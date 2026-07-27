@@ -47,6 +47,11 @@ export class Brain {
     this.#waiting = null;
   }
 
+  // 実行中の turn を中断する(SDK が result を返し、待機中の ask が解決される)
+  async interrupt(): Promise<void> {
+    await this.#query.interrupt();
+  }
+
   async #pump(): Promise<void> {
     try {
       for await (const msg of this.#query) {

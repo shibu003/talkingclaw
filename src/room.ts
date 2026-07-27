@@ -277,8 +277,11 @@ store.onAppend((ev) => {
 let turnSeq = 0;
 function userSpeech(text: string): RoomEvent {
   speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
-  // gone 含む全員に配送(inbox に積まれ、復帰後の listen で再配送される — S1 at-least-once)
-  const targets = registry.all().map((p) => p.participantId);
+  // S4 default: クロエ在室ならクロエへ(名前呼びかけ・選択・floor は 4A)。
+  // 不在なら gone 含む全員配送(inbox 蓄積 — S1 at-least-once)
+  const targets = chloePid !== null && registry.get(chloePid)
+    ? [chloePid]
+    : registry.all().map((p) => p.participantId);
   const ev = store.append({
     type: 'user_speech', from: 'user', text,
     turnId: `T${++turnSeq}`, targets, routing: { method: 'default' },
@@ -287,6 +290,88 @@ function userSpeech(text: string): RoomEvent {
   if (targets.length === 1) fireAck(targets[0], ev.turnId);
   return ev;
 }
+
+// ---- 内蔵クロエ(3C): Brain を in-process participant として部屋に接続 ----
+import { Brain } from './brain.ts';
+
+let chloePid: string | null = null;
+const TIMEOUT = Symbol('timeout');
+function timeoutMarker(ms: number): Promise<typeof TIMEOUT> {
+  return new Promise((r) => setTimeout(() => r(TIMEOUT), ms));
+}
+
+function startChloe(): void {
+  const outcome = registry.join(config.character.name, '', store.lastId, store.bootId);
+  if ('error' in outcome) return console.error(`クロエ参加失敗: ${outcome.error}`);
+  const chloe = outcome.participant;
+  chloePid = chloe.participantId;
+  const keepAlive = setInterval(() => { chloe.lastSeen = Date.now(); }, 30_000); // in-process = 常時 active
+  keepAlive.unref();
+  store.append({ type: 'presence', from: chloePid, name: chloe.assignedName, text: 'joined' });
+  if (engineState === 'ready') {
+    // engineReady がクロエ join より先に発火していた場合の取りこぼし防止
+    void resolveVoice('').then((speaker) => {
+      if (speaker === null) return;
+      chloe.voice.resolvedSpeaker = speaker;
+      chloe.voice.status = 'ready';
+      buildAckPool(chloePid!, speaker);
+    });
+  }
+
+  let brain = new Brain({ systemPrompt: config.systemPrompt, model: config.model });
+  const inbox: RoomEvent[] = [];
+  let busy = false;
+
+  const speakStreamed = (turnId: string | undefined): ((sentence: string) => void) => {
+    let first = true;
+    return (sentence) => {
+      enqueueJob({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch });
+      first = false;
+    };
+  };
+
+  // ask を 60s で見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
+  async function askGuarded(text: string, turnId: string | undefined): Promise<void> {
+    const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
+    const ask = hang ? new Promise<string>(() => {}) : brain.ask(text, speakStreamed(turnId));
+    if ((await Promise.race([ask, timeoutMarker(60_000)])) !== TIMEOUT) return;
+    console.error('クロエの応答が 60s 超過 → interrupt');
+    if (!hang) await brain.interrupt().catch(() => {});
+    if ((await Promise.race([ask.catch(() => ''), timeoutMarker(10_000)])) !== TIMEOUT) return;
+    void brain.close().catch(() => {});
+    brain = new Brain({ systemPrompt: config.systemPrompt, model: config.model });
+    store.append({ type: 'system', from: 'room', text: 'クロエの接続を作り直したよ。少し前の話は忘れちゃったかも' });
+    store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId });
+  }
+
+  async function drain(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    try {
+      while (inbox.length > 0) {
+        const ev = inbox.shift()!;
+        await askGuarded(ev.text ?? '', ev.turnId).catch((e: Error) => {
+          store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: `ごめん、エラーが出ちゃった。${e.message}`, audio: null, turnId: ev.turnId });
+        });
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  store.onAppend((ev) => {
+    if (ev.type === 'user_speech' && ev.targets?.includes(chloePid!)) {
+      inbox.push(ev);
+      void drain();
+    }
+  });
+
+  // greeting = Brain warmup(初回コールドスタートを起動時に消化)
+  void askGuarded('(ユーザーが声の部屋に来られるようになった。あなたらしく短く一言で挨拶して)', undefined)
+    .then(() => console.error('クロエ warmup 完了'));
+}
+
+if (process.env.NO_CHLOE !== '1') startChloe();
 
 // ---- token(room.json 書込み。atomic 化・単一性は 3A-1b)----
 const token = randomBytes(24).toString('hex');
@@ -342,7 +427,7 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === 'GET' && path === '/') {
     // S8/S9: token 配布の唯一の経路 = このページへの埋め込み(no-store)
-    const html = (await readFile(fileURLToPath(new URL('../public/room.html', import.meta.url)), 'utf8'))
+    const html = (await readFile(fileURLToPath(new URL('../public/index.html', import.meta.url)), 'utf8'))
       .replace('__ROOM_TOKEN__', token)
       .replace('__BOOT_ID__', store.bootId);
     res.writeHead(200, {
