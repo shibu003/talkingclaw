@@ -140,6 +140,7 @@ async function onEngineReady(): Promise<void> {
 const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
 const ackPools = new Map<string, string[]>();
 let ackRotate = 0;
+const lastAckAt = new Map<string, number>(); // 実機フィードバック: 相槌の連発防止
 // ナレーション(未達通知・状況報告)= まお/ノーマル固定(S6)。engineReady で合成
 const NARRATION_TEXTS = {
   undelivered: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
@@ -169,14 +170,17 @@ function buildAckPool(pid: string, speaker: number): void {
   for (const text of CONTEXT_TEXTS) enqueueJob({ pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker });
 }
 
-function fireAck(target: string, turnId: string | undefined): void {
+function fireAck(target: string, turnId: string | undefined, utterance = ''): void {
   const p = registry.get(target);
   const pool = ackPools.get(target) ?? [];
   if (!p || !registry.alive(p)) return; // gone の相手の声で相槌しない(偽生存の防止)
   if (p.voice.status !== 'ready' || pool.length === 0 || engineState !== 'ready') return;
+  if (utterance.length <= 4) return; // 「はい」等の短い発話に相槌は不要
+  if (Date.now() - (lastAckAt.get(target) ?? 0) < 8_000) return; // 連発防止
+  lastAckAt.set(target, Date.now());
+  ackRotate += 1 + Math.floor(Math.random() * ACK_TEXTS.length); // 機械的ローテを崩す
   const text = ACK_TEXTS[ackRotate % ACK_TEXTS.length];
   const audio = pool[ackRotate % pool.length];
-  ackRotate++;
   const ackEv = store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId });
   metric('ack_emitted', { turnId, eventId: ackEv.id });
 }
@@ -393,7 +397,7 @@ function userSpeech(text: string): RoomEvent {
   metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
     trackTurn(turnId, targets[0]);
-    fireAck(targets[0], turnId); // S6: t=0 相槌(単独 target のみ)
+    fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
     scheduleEscalation(turnId, targets[0], 1, 3_500); // /played で前倒し、無ければ fallback
     scheduleUndeliveredNotice(turnId, targets[0]);
   }
@@ -455,19 +459,23 @@ function onFillerPlayed(ev: RoomEvent): void {
 }
 
 // S4: routed 先に 6s 以内に配送されなければ未達通知(1 回・ナレーション)+ floor 解除
+const lastNoticeAt = new Map<string, number>(); // 実機フィードバック: 通知の出過ぎ防止
+
 function scheduleUndeliveredNotice(turnId: string, target: string): void {
   if (target === chloePid) return; // in-process は即配送
   const timer = setTimeout(() => {
     const t = turns.get(turnId);
     if (!t || t.delivered || t.noticeSent) return;
     t.noticeSent = true;
+    if (Date.now() - (lastNoticeAt.get(target) ?? 0) < 60_000) return; // 同じ相手への連発防止
+    lastNoticeAt.set(target, Date.now());
     store.append({
       type: 'agent_speech', from: 'room', name: 'ナレーション',
       text: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
       audio: narrationPool[0] ?? null, filler: 'status', turnId,
     });
     if (floorOwner === target) floorOwner = null;
-  }, 6_000);
+  }, 12_000);
   timer.unref();
 }
 

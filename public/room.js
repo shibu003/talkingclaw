@@ -15,6 +15,23 @@ let playing = false;
 let currentAudio = null; // 6C: barge-in の duck/pause 対象
 const audioQueue = [];    // { url, bubble, eventId }
 const bubbles = new Map(); // 連続する同一発話者の文を 1 吹き出しにまとめる: key=from
+// 自己音声棄却(SP3 実機で誤認を確認): 直近 8s に再生したテキストと一致する認識結果は捨てる
+const recentPlayed = [];
+function rememberPlayed(text) {
+  if (!text) return;
+  recentPlayed.push({ text: normText(text), at: performance.now() });
+  while (recentPlayed.length > 8) recentPlayed.shift();
+}
+function normText(t) {
+  return (t || '').toLowerCase().replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/[、。!?！?\s]/g, '');
+}
+function isEcho(finalText) {
+  const n = normText(finalText);
+  if (n.length < 2) return false;
+  const now = performance.now();
+  return recentPlayed.some((r) => now - r.at < 8000 && (r.text.includes(n) || n.includes(r.text)));
+}
 
 function setStatus(t) { statusEl.textContent = t; }
 function notice(t) { noticeEl.style.display = 'block'; noticeEl.textContent = t; }
@@ -75,11 +92,12 @@ function playNext() {
   if (!next) {
     playing = false;
     document.querySelectorAll('.agent.speaking').forEach((el) => el.classList.remove('speaking'));
-    resumeMic();
+    setTimeout(resumeMic, 500); // エコー尾の拾い込み防止
     return;
   }
   playing = true;
   pauseMic();
+  rememberPlayed(next.text);
   next.bubble.classList.add('speaking');
   const audio = new Audio(next.url + '?token=' + TOKEN); // S1: token 付与はブラウザ側
   currentAudio = audio;
@@ -96,15 +114,16 @@ function playNext() {
   audio.play().catch(advance);
 }
 
-function enqueueAudio(url, bubble, eventId, turnId, filler) {
-  audioQueue.push({ url, bubble, eventId, turnId, filler });
+function enqueueAudio(url, bubble, eventId, turnId, filler, text) {
+  audioQueue.push({ url, bubble, eventId, turnId, filler, text });
   if (!playing) playNext();
 }
 
 // 相槌の即時再生(queue を経由しない。終了後に通常 queue を再開)
-function playAckNow(url, bubble, eventId) {
+function playAckNow(url, bubble, eventId, text) {
   playing = true;
   pauseMic(); // マイク方針は SP3 の実測で確定(現状は保守的に停止)
+  rememberPlayed(text);
   bubble.classList.add('speaking');
   const audio = new Audio(url + '?token=' + TOKEN);
   currentAudio = audio;
@@ -153,8 +172,8 @@ function render(ev) {
     const b = agentBubble(ev.from, ev.name, ev.text ?? '');
     if (ev.audio && !isReplay) {
       // S6: 相槌(ack)は FIFO に入れない独立即時スロット — 再生中なら即スキップ
-      if (ev.filler === 'ack') { if (!playing) playAckNow(ev.audio, b.div, ev.id); }
-      else enqueueAudio(ev.audio, b.div, ev.id, ev.turnId, ev.filler);
+      if (ev.filler === 'ack') { if (!playing) playAckNow(ev.audio, b.div, ev.id, ev.text); }
+      else enqueueAudio(ev.audio, b.div, ev.id, ev.turnId, ev.filler, ev.text);
       // 6B: 本応答が来たら同 turn の未再生 filler を破棄(キャンセル 3 層目)
       if (!ev.filler && ev.turnId) {
         for (let i = audioQueue.length - 1; i >= 0; i--) {
@@ -274,6 +293,12 @@ if (!SR) {
     if (finalText) {
       sttFails = 0;
       interimUpdatedAt = 0; // final で即クリア(S6)
+      if (isEcho(finalText)) {
+        interimEl?.remove(); interimEl = null;
+        addSys('(自分の声っぽいので無視したよ)');
+        speechEndAt = 0;
+        return;
+      }
       if (speechEndAt > 0) { // gate ① 計測(15s 超は計測異常として捨てる)
         const delay = Math.round(performance.now() - speechEndAt);
         if (delay < 15_000) void post('/metrics', { kind: 'stt_final_delay', ms: delay });
