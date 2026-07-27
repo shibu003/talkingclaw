@@ -90,11 +90,12 @@ function playNext() {
     playNext();
   };
   audio.onended = audio.onerror = advance;
+  audio.onplaying = () => { if (next.eventId) void post('/metrics', { kind: 'play_started', ms: 0, eventId: next.eventId }); };
   audio.play().catch(advance);
 }
 
-function enqueueAudio(url, bubble, eventId) {
-  audioQueue.push({ url, bubble, eventId });
+function enqueueAudio(url, bubble, eventId, turnId, filler) {
+  audioQueue.push({ url, bubble, eventId, turnId, filler });
   if (!playing) playNext();
 }
 
@@ -113,6 +114,7 @@ function playAckNow(url, bubble, eventId) {
     playNext(); // 通常 queue の続きへ(空なら resumeMic される)
   };
   audio.onended = audio.onerror = advance;
+  audio.onplaying = () => { if (eventId) void post('/metrics', { kind: 'play_started', ms: 0, eventId }); };
   audio.play().catch(advance);
 }
 
@@ -149,7 +151,13 @@ function render(ev) {
     if (ev.audio && !isReplay) {
       // S6: 相槌(ack)は FIFO に入れない独立即時スロット — 再生中なら即スキップ
       if (ev.filler === 'ack') { if (!playing) playAckNow(ev.audio, b.div, ev.id); }
-      else enqueueAudio(ev.audio, b.div, ev.id);
+      else enqueueAudio(ev.audio, b.div, ev.id, ev.turnId, ev.filler);
+      // 6B: 本応答が来たら同 turn の未再生 filler を破棄(キャンセル 3 層目)
+      if (!ev.filler && ev.turnId) {
+        for (let i = audioQueue.length - 1; i >= 0; i--) {
+          if (audioQueue[i].filler && audioQueue[i].turnId === ev.turnId) audioQueue.splice(i, 1);
+        }
+      }
     }
   } else if (ev.type === 'system' || ev.type === 'presence') {
     addSys((ev.name ? ev.name + ': ' : '') + (ev.text ?? ev.type));
@@ -226,14 +234,26 @@ if (!SR) {
     setStatus('聞いてるよ');
   };
   recognition.onspeechend = () => { speechEndAt = performance.now(); };
+  let sttFails = 0; // 6D: network 等の連続失敗で指数 backoff(no-speech は即再開)
+  let lastSttError = '';
   recognition.onend = () => {
     listening = false;
     interimUpdatedAt = 0;
     micBtn.classList.remove('listening');
     interimEl?.remove(); interimEl = null;
-    if (handsfree && !playing) setTimeout(() => { if (handsfree && !playing && !listening) startMic(); }, 300);
+    if (!handsfree || playing) return;
+    let delay = 300;
+    if (lastSttError === 'network' || lastSttError === 'service-not-allowed') {
+      delay = Math.min(8000, 1000 * 2 ** sttFails);
+      setStatus(`認識サービスに再接続中…(${Math.round(delay / 1000)}s)`);
+    }
+    lastSttError = '';
+    setTimeout(() => { if (handsfree && !playing && !listening) startMic(); }, delay);
   };
   recognition.onerror = (e) => {
+    lastSttError = e.error;
+    if (e.error === 'network') sttFails++;
+    else if (e.error !== 'no-speech') sttFails = 0;
     if (e.error === 'not-allowed') { handsfree = false; micBtn.classList.remove('on'); setStatus('マイクが許可されていないよ'); }
   };
   recognition.onresult = (e) => {
@@ -249,6 +269,7 @@ if (!SR) {
       log.scrollTop = log.scrollHeight;
     }
     if (finalText) {
+      sttFails = 0;
       interimUpdatedAt = 0; // final で即クリア(S6)
       if (speechEndAt > 0) { // gate ① 計測(15s 超は計測異常として捨てる)
         const delay = Math.round(performance.now() - speechEndAt);

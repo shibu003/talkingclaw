@@ -7,7 +7,8 @@
     "start": "node src/index.ts",
     "smoke": "node src/smoke.ts",
     "web": "node src/room.ts",
-    "setup-voice": "node scripts/setup-voice.mjs"
+    "setup-voice": "node scripts/setup-voice.mjs",
+    "metrics": "node scripts/metrics-report.mjs"
   },
   "repository": {
     "type": "git",

@@ -140,23 +140,33 @@ async function onEngineReady(): Promise<void> {
 const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
 const ackPools = new Map<string, string[]>();
 let ackRotate = 0;
-// ナレーション(未達通知等)= まお/ノーマル固定(S6)。engineReady で合成
-const NARRATION_TEXT = '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね';
-const narrationPool: string[] = [];
+// ナレーション(未達通知・状況報告)= まお/ノーマル固定(S6)。engineReady で合成
+const NARRATION_TEXTS = {
+  undelivered: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
+  status: 'まだ作業中みたい。もう少し待ってね',
+} as const;
+const narrationAudio = new Map<string, string>(); // key → /audio path
+const narrationPool: string[] = []; // 後方互換(未達通知 = undelivered)
 
 function buildNarrationPool(): void {
-  if (narrationPool.length > 0) return;
+  if (narrationAudio.size > 0) return;
   void resolveVoice('まお/ノーマル').then((speaker) => {
-    if (speaker !== null) enqueueJob({ pid: '__narration__', priority: 3, kind: 'ack-pool', text: NARRATION_TEXT, speaker });
+    if (speaker === null) return;
+    for (const [key, text] of Object.entries(NARRATION_TEXTS)) {
+      enqueueJob({ pid: `__narration_${key}__`, priority: 3, kind: 'ack-pool', text, speaker });
+    }
   });
 }
+
+// 文脈 filler(target の声・事前合成)— S6
+const CONTEXT_TEXTS = ['ん、いま考えてるところ。', 'ちょっと確認してるね。'];
+const contextPools = new Map<string, string[]>();
 
 function buildAckPool(pid: string, speaker: number): void {
   if (ackPools.has(pid)) return;
   ackPools.set(pid, []);
-  for (const text of ACK_TEXTS) {
-    enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker });
-  }
+  for (const text of ACK_TEXTS) enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker });
+  for (const text of CONTEXT_TEXTS) enqueueJob({ pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker });
 }
 
 function fireAck(target: string, turnId: string | undefined): void {
@@ -166,7 +176,8 @@ function fireAck(target: string, turnId: string | undefined): void {
   const text = ACK_TEXTS[ackRotate % ACK_TEXTS.length];
   const audio = pool[ackRotate % pool.length];
   ackRotate++;
-  store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId });
+  const ackEv = store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId });
+  metric('ack_emitted', { turnId, eventId: ackEv.id });
 }
 
 // ---- TtsScheduler(S5): participant 内 FIFO、participant 間は (priority, round-robin) ----
@@ -218,8 +229,16 @@ async function runJob(job: SynthJob): Promise<void> {
       if (!wav) return emitSpeech(null);
       const url = putAudio(wav, job.kind === 'ack-pool');
       if (job.kind === 'ack-pool') {
-        if (job.pid === '__narration__') narrationPool.push(url);
-        else ackPools.get(job.pid)?.push(url);
+        if (job.pid.startsWith('__narration_')) {
+          const key = job.pid.slice('__narration_'.length, -2);
+          narrationAudio.set(key, url);
+          if (key === 'undelivered') narrationPool.push(url);
+        } else if (job.pid.startsWith('__context_')) {
+          const pid = job.pid.slice('__context_'.length, -2);
+          const pool = contextPools.get(pid) ?? [];
+          pool.push(url);
+          contextPools.set(pid, pool);
+        } else ackPools.get(job.pid)?.push(url);
       }
       else emitSpeech(url);
       return;
@@ -270,7 +289,7 @@ function resolveListen(pid: string, after: number): object | null {
   const p = registry.get(pid);
   if (p) p.ackedCursor = after; // ack = 前回配送分の確認(S1)
   for (const e of events) {
-    if (e.type === 'user_speech' && e.turnId) { const t = turns.get(e.turnId); if (t && t.target === pid) t.delivered = true; }
+    if (e.type === 'user_speech' && e.turnId) { const t = turns.get(e.turnId); if (t && t.target === pid && !t.delivered) { t.delivered = true; metric('turn_delivered', { turnId: e.turnId }); } }
   }
   const stripped = events.map(({ audio, ...rest }) => rest); // S2: agent 応答から audio 除去
   return { status: 'speech', bootId: store.bootId, truncated, events: stripped, cursor: events[events.length - 1].id };
@@ -302,6 +321,9 @@ type Turn = { turnId: string; target: string; delivered: boolean; responded: boo
 const turns = new Map<string, Turn>();
 
 function trackTurn(turnId: string, target: string): void {
+  for (const t of turns.values()) {
+    if (t.target === target && !t.responded) cancelEscalation(t.turnId); // 新 turn が旧 escalation を supersede
+  }
   turns.set(turnId, { turnId, target, delivered: false, responded: false, noticeSent: false });
   if (turns.size > 200) turns.delete(turns.keys().next().value as string);
 }
@@ -314,7 +336,8 @@ function attributeTurn(pid: string, explicit: string | undefined): string | unde
   for (const t of turns.values()) {
     if (t.target !== pid) continue;
     latest = t.turnId;
-    if (t.delivered && !t.responded) { markResponded(t.turnId); return t.turnId; }
+    // 窓を閉じた turn(打切り/未達)は自動帰属から除外 — 以降の返信は明示 turnId の領分
+    if (t.delivered && !t.responded && !t.noticeSent) { markResponded(t.turnId); return t.turnId; }
   }
   if (latest) markResponded(latest);
   return latest;
@@ -322,7 +345,11 @@ function attributeTurn(pid: string, explicit: string | undefined): string | unde
 
 function markResponded(turnId: string): void {
   const t = turns.get(turnId);
-  if (t) t.responded = true;
+  if (t && !t.responded) {
+    t.responded = true;
+    cancelEscalation(turnId);
+    metric('turn_window_closed', { turnId, reason: 'responded' });
+  }
 }
 
 function floorAdvance(pid: string): void {
@@ -360,12 +387,68 @@ function userSpeech(text: string): RoomEvent {
   const { targets, routing } = routeTargets(text);
   const turnId = `T${++turnSeq}`;
   const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing });
+  metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
     trackTurn(turnId, targets[0]);
     fireAck(targets[0], turnId); // S6: t=0 相槌(単独 target のみ)
+    scheduleEscalation(turnId, targets[0], 1, 3_500); // /played で前倒し、無ければ fallback
     scheduleUndeliveredNotice(turnId, targets[0]);
   }
   return ev;
+}
+
+// ---- 6B: filler escalation(S6 完全形)----
+// ack →(再生終了 or fallback)→ 文脈 filler →(+5s)→ 状況報告 ×2 → 打切り(窓閉じ)
+// キャンセル: 本応答 speak(markResponded)/ 同 target への新 turn / 窓閉じ
+const escalations = new Map<string, NodeJS.Timeout>();
+let statusRotate = 0;
+
+function cancelEscalation(turnId: string): void {
+  const t = escalations.get(turnId);
+  if (t) { clearTimeout(t); escalations.delete(turnId); }
+}
+
+function scheduleEscalation(turnId: string, target: string, stage: number, delayMs: number): void {
+  cancelEscalation(turnId);
+  const timer = setTimeout(() => {
+    escalations.delete(turnId);
+    const t = turns.get(turnId);
+    if (!t || t.responded || !t.delivered) return; // 応答済み/未配送(未達経路が担当)は終了
+    const p = registry.get(target);
+    if (stage === 1) {
+      const pool = contextPools.get(target) ?? [];
+      const ev = store.append({
+        type: 'agent_speech', from: target, name: p?.assignedName,
+        text: CONTEXT_TEXTS[statusRotate % CONTEXT_TEXTS.length],
+        audio: pool[statusRotate % Math.max(1, pool.length)] ?? null, filler: 'context', turnId,
+      });
+      metric('filler_emitted', { turnId, stage, eventId: ev.id });
+      scheduleEscalation(turnId, target, 2, 8_000); // /played が来れば前倒し(下の onPlayed 経由)
+    } else if (stage <= 3) {
+      const ev = store.append({
+        type: 'agent_speech', from: 'room', name: 'ナレーション',
+        text: NARRATION_TEXTS.status, audio: narrationAudio.get('status') ?? null, filler: 'status', turnId,
+      });
+      metric('filler_emitted', { turnId, stage, eventId: ev.id });
+      if (stage < 3) scheduleEscalation(turnId, target, stage + 1, 8_000);
+      else {
+        store.append({ type: 'system', from: 'room', text: '返事が来たら教えるね' }); // 打切り(窓閉じ)
+        metric('turn_window_closed', { turnId, reason: 'exhausted' });
+        turns.get(turnId)!.noticeSent = true;
+      }
+    }
+  }, delayMs);
+  timer.unref();
+  escalations.set(turnId, timer);
+}
+
+// /played で次段を前倒し(再生終了 + 5s — 相対スケジュール)
+function onFillerPlayed(ev: RoomEvent): void {
+  if (!ev.turnId || !ev.filler || ev.filler === 'status' && !escalations.has(ev.turnId)) return;
+  const t = turns.get(ev.turnId);
+  if (!t || t.responded) return;
+  const stage = ev.filler === 'ack' ? 1 : ev.filler === 'context' ? 2 : 3;
+  if (escalations.has(ev.turnId)) scheduleEscalation(ev.turnId, t.target, stage, 5_000);
 }
 
 // S4: routed 先に 6s 以内に配送されなければ未達通知(1 回・ナレーション)+ floor 解除
@@ -473,6 +556,13 @@ if (process.env.NO_CHLOE !== '1') startChloe();
 const token = randomBytes(24).toString('hex');
 const stateDir = join(homedir(), '.talkingclaw');
 const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了記録
+
+// 6A: 計測(S10)。サーバ受信時刻で metrics.jsonl に統一記録
+function metric(kind: string, extra: Record<string, unknown> = {}): void {
+  try {
+    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date().toISOString(), kind, ...extra }) + '\n', { mode: 0o600 });
+  } catch { /* 計測は本流を止めない */ }
+}
 const seenSpeakSeqs = new Map<string, Set<string>>(); // S2: speak 冪等(participant 毎)
 
 function authed(req: IncomingMessage, url: URL): boolean {
@@ -616,7 +706,9 @@ const server = createServer(async (req, res) => {
     const kind = String(body.kind ?? '').slice(0, 40);
     const ms = Number(body.ms);
     if (!kind || !Number.isFinite(ms)) return json(res, 400, { error: 'kind と ms が必要です' });
-    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date().toISOString(), kind, ms }) + '\n', { mode: 0o600 });
+    const eventId = Number.isFinite(Number(body.eventId)) ? Number(body.eventId) : undefined;
+    const evRef = eventId !== undefined ? store.get(eventId) : undefined;
+    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date().toISOString(), kind, ms, eventId, turnId: evRef?.turnId, filler: evRef?.filler }) + '\n', { mode: 0o600 });
     return json(res, 200, { ok: true });
   }
 
@@ -635,6 +727,7 @@ const server = createServer(async (req, res) => {
     playedIds.add(eventId);
     const ev = store.get(eventId);
     if (ev && ev.type === 'agent_speech' && !ev.filler && ev.from !== 'room') floorAdvance(ev.from); // S4: 再生完了基準
+    if (ev && ev.filler) onFillerPlayed(ev); // 6B: 相対スケジュール前倒し
     return json(res, 200, { ok: true });
   }
 
