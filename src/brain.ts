@@ -14,6 +14,8 @@ export class Brain {
     systemPrompt: string; model: string;
     allowedTools?: string[]; cwd?: string; maxTurns?: number;
     mcpServers?: Record<string, unknown>;
+    settingSources?: ('user' | 'project' | 'local')[];
+    effort?: string;
     canUseTool?: (name: string, input: Record<string, unknown>) => Promise<
       { behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }
     >;
@@ -30,6 +32,8 @@ export class Brain {
         maxTurns: opts.maxTurns ?? 1,
         ...(opts.mcpServers ? { mcpServers: opts.mcpServers as never } : {}),
         ...(opts.canUseTool ? { canUseTool: opts.canUseTool as never } : {}),
+        ...(opts.settingSources ? { settingSources: opts.settingSources } : {}),
+        ...(opts.effort ? { effort: opts.effort as never } : {}),
         includePartialMessages: true,
       },
     });

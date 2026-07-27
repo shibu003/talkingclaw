@@ -403,6 +403,21 @@ async function refreshRoster() {
 setInterval(refreshRoster, 5000);
 void refreshRoster();
 
+// ---- W8-7: 成果物プレビュー(その場で見る)----
+const previewEl = document.getElementById('preview');
+const previewFrame = document.getElementById('previewFrame');
+const previewTitle = document.getElementById('previewTitle');
+const previewOpen = document.getElementById('previewOpen');
+document.getElementById('previewClose').onclick = () => { previewEl.classList.remove('open'); previewFrame.src = 'about:blank'; };
+function showPreview(relPath) {
+  const url = '/files/' + encodeURIComponent(relPath).replace(/%2F/g, '/') + '?token=' + TOKEN;
+  previewTitle.textContent = relPath;
+  previewOpen.href = url;
+  previewFrame.src = url;
+  previewEl.classList.add('open');
+}
+const previewedTasks = new Set();
+
 // ---- W8-3: 作業ボード(誰が何をどこまで)----
 const boardEl = document.getElementById('board');
 let boardOpen = false;
@@ -413,10 +428,10 @@ document.getElementById('boardBtn').onclick = () => {
 };
 document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN);
 async function refreshBoard() {
-  if (!boardOpen) return;
   try {
     const r = await post('/tasks', {});
     const d = await r.json();
+    if (!boardOpen) { checkAutoPreview(d); return; }
     boardEl.replaceChildren();
     const rows = [...(d.tasks ?? []), ...(d.open ?? [])];
     if (rows.length === 0) {
@@ -440,15 +455,63 @@ async function refreshBoard() {
       }
       for (const a of t.artifacts ?? []) {
         const link = document.createElement('a');
-        link.href = '/files/' + encodeURIComponent(a).replace(/%2F/g, '/') + '?token=' + TOKEN;
-        link.target = '_blank';
+        link.href = '#';
         link.textContent = ' 📦 ' + a;
+        link.onclick = (e) => { e.preventDefault(); showPreview(a); };
         div.appendChild(link);
+      }
+      if (t.id && t.status === 'done' && (t.artifacts ?? []).length > 0 && !previewedTasks.has(t.id)) {
+        previewedTasks.add(t.id);
+        showPreview(t.artifacts[0]); // 完成したらその場で開く
       }
       boardEl.appendChild(div);
     }
   } catch { /* 次回 */ }
 }
+function checkAutoPreview(d) {
+  for (const t of d.tasks ?? []) {
+    if (t.id && t.status === 'done' && (t.artifacts ?? []).length > 0 && !previewedTasks.has(t.id)) {
+      previewedTasks.add(t.id);
+      showPreview(t.artifacts[0]);
+    }
+  }
+}
 setInterval(refreshBoard, 5000);
+
+// ---- W8-7: worker 設定パネル ----
+const settingsEl = document.getElementById('settings');
+let settingsOpen = false;
+document.getElementById('settingsBtn').onclick = async () => {
+  settingsOpen = !settingsOpen;
+  settingsEl.style.display = settingsOpen ? 'block' : 'none';
+  if (settingsOpen) await renderSettings();
+};
+async function renderSettings() {
+  const d = await (await post('/settings', {})).json();
+  settingsEl.replaceChildren();
+  const mk = (labelText, el) => { const l = document.createElement('label'); l.textContent = labelText + ' '; l.appendChild(el); settingsEl.appendChild(l); };
+  const modelSel = document.createElement('select');
+  for (const m of ['haiku', 'sonnet', 'opus']) {
+    const o = document.createElement('option'); o.value = m; o.textContent = m; if (d.workerModel === m) o.selected = true; modelSel.appendChild(o);
+  }
+  modelSel.onchange = () => void post('/settings', { workerModel: modelSel.value });
+  mk('作業モデル:', modelSel);
+  const effortSel = document.createElement('select');
+  for (const e of ['', 'low', 'medium', 'high']) {
+    const o = document.createElement('option'); o.value = e; o.textContent = e || '既定'; if (d.workerEffort === e) o.selected = true; effortSel.appendChild(o);
+  }
+  effortSel.onchange = () => void post('/settings', { workerEffort: effortSel.value });
+  mk('effort:', effortSel);
+  const skills = document.createElement('input');
+  skills.type = 'checkbox'; skills.checked = !!d.useUserSettings;
+  skills.onchange = () => void post('/settings', { useUserSettings: skills.checked });
+  mk('あなたの Claude 設定(skills 等)を使う:', skills);
+  const note = document.createElement('div');
+  note.className = 'tnote';
+  note.textContent = (d.externalMcp ?? []).length > 0
+    ? '外部 MCP: ' + d.externalMcp.join(', ')
+    : '外部 MCP は ~/.talkingclaw/worker-mcp.json で追加できるよ(次の作業から反映)';
+  settingsEl.appendChild(note);
+}
 
 connect();

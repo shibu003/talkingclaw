@@ -481,6 +481,31 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
   timer.unref();
 }
 
+// ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
+const SETTINGS_PATH = join(homedir(), '.talkingclaw', 'settings.json');
+type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean };
+function loadSettings(): WorkerSettings {
+  try {
+    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false, ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) };
+  } catch {
+    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false };
+  }
+}
+let workerSettings = loadSettings();
+function saveSettings(): void {
+  try { writeFileSync(SETTINGS_PATH, JSON.stringify(workerSettings), { mode: 0o600 }); } catch { /* */ }
+}
+// 外部 MCP: ~/.talkingclaw/worker-mcp.json({ mcpServers: { name: {command, args, env?} } })
+function loadWorkerMcp(): { mcpServers: Record<string, unknown>; allow: string[] } {
+  try {
+    const d = JSON.parse(readFileSync(join(homedir(), '.talkingclaw', 'worker-mcp.json'), 'utf8'));
+    const servers = (d.mcpServers ?? {}) as Record<string, unknown>;
+    return { mcpServers: servers, allow: Object.keys(servers).map((n) => `mcp__${n}`) };
+  } catch {
+    return { mcpServers: {}, allow: [] };
+  }
+}
+
 // ---- W8-2/3: office tasks(見る = board の元データ。導出 + 起票の 2 系統)----
 type OfficeTask = {
   id: number; agent: string; agentName: string; request: string;
@@ -505,6 +530,7 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
 let chloePid: string | null = null;
+let chloeResetWorker: (() => void) | null = null;
 const TIMEOUT = Symbol('timeout');
 function timeoutMarker(ms: number): Promise<typeof TIMEOUT> {
   return new Promise((r) => setTimeout(() => r(TIMEOUT), ms));
@@ -546,6 +572,11 @@ function startChloe(): void {
     return task;
   }
 
+  chloeResetWorker = () => {
+    if (!workerBusy && worker) { void worker.close().catch(() => {}); worker = null; }
+    else if (!workerBusy) worker = null;
+  };
+
   async function pumpTasks(): Promise<void> {
     if (workerBusy) return;
     workerBusy = true;
@@ -568,11 +599,21 @@ function startChloe(): void {
 
   async function runTask(task: OfficeTask): Promise<void> {
     if (!worker) {
-      worker = new Brain({
-        systemPrompt: config.workerPrompt, model: config.agent.model,
-        allowedTools: config.agent.allowedTools as unknown as string[],
+      const ext = loadWorkerMcp();
+      const opts = {
+        systemPrompt: config.workerPrompt, model: workerSettings.workerModel,
+        allowedTools: [...(config.agent.allowedTools as unknown as string[]), ...ext.allow],
         cwd: config.agent.cwd, maxTurns: config.agent.maxTurns,
-      });
+        ...(Object.keys(ext.mcpServers).length > 0 ? { mcpServers: ext.mcpServers } : {}),
+        ...(workerSettings.useUserSettings ? { settingSources: ['user', 'project'] as ('user' | 'project')[] } : {}),
+        ...(workerSettings.workerEffort ? { effort: workerSettings.workerEffort } : {}),
+      };
+      try {
+        worker = new Brain(opts);
+      } catch {
+        delete (opts as Record<string, unknown>).effort; // SDK が effort 未対応でも作業は続ける
+        worker = new Brain(opts);
+      }
     }
     try {
       const askP = worker.ask(task.request, workerSay(task));
@@ -903,6 +944,17 @@ const server = createServer(async (req, res) => {
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
     const ev = userSpeech(text);
     return json(res, 200, { ok: true, eventId: ev.id, turnId: ev.turnId });
+  }
+
+  if (path === '/settings') {
+    const allowedModels = ['haiku', 'sonnet', 'opus'];
+    if (typeof body.workerModel === 'string' && allowedModels.includes(body.workerModel)) workerSettings.workerModel = body.workerModel;
+    if (typeof body.workerEffort === 'string' && ['', 'low', 'medium', 'high'].includes(body.workerEffort)) workerSettings.workerEffort = body.workerEffort;
+    if (typeof body.useUserSettings === 'boolean') workerSettings.useUserSettings = body.useUserSettings;
+    saveSettings();
+    chloeResetWorker?.(); // 次の task から新設定(実行中の task は続行)
+    const ext = loadWorkerMcp();
+    return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers) });
   }
 
   if (path === '/tasks') {
