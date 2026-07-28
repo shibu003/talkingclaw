@@ -943,6 +943,14 @@ async function renderSettings() {
   consult.type = 'checkbox'; consult.checked = d.consultMode !== false;
   consult.onchange = () => void post('/settings', { consultMode: consult.checked });
   mk('相談してから着手する(すぐ始めない):', consult);
+  const commit = document.createElement('input');
+  commit.type = 'checkbox'; commit.checked = d.autoCommit !== false;
+  commit.onchange = () => void post('/settings', { autoCommit: commit.checked });
+  mk('作業が終わったら自動でコミット:', commit);
+  const push = document.createElement('input');
+  push.type = 'checkbox'; push.checked = !!d.autoPush;
+  push.onchange = () => void post('/settings', { autoPush: push.checked });
+  mk('そのまま GitHub に push(取り消せないので注意):', push);
   const skills = document.createElement('input');
   skills.type = 'checkbox'; skills.checked = !!d.useUserSettings;
   skills.onchange = () => void post('/settings', { useUserSettings: skills.checked });

@@ -51,7 +51,9 @@ function putAudio(wav: Buffer, isProtected = false): string {
 }
 
 // ---- EngineManager(S5): daemon が engine を保有・監視。kill は自分の子(handle 基準)のみ ----
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
 import { existsSync } from 'node:fs';
 
 let engineState: 'starting' | 'ready' | 'down' = 'starting';
@@ -676,12 +678,14 @@ function loadProjects(): Record<string, string> {
 
 // ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
 const SETTINGS_PATH = join(homedir(), '.talkingclaw', 'settings.json');
-type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string; consultMode: boolean };
+type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string; consultMode: boolean; autoCommit: boolean; autoPush: boolean };
 function loadSettings(): WorkerSettings {
   const defaults: WorkerSettings = {
     workerModel: config.agent.model, workerEffort: '', useUserSettings: false,
     chatModel: config.model, chatEffort: '',
     consultMode: true, // 既定は相談モード: いきなり着手せず、まず進め方を相談して合意してから登録する
+    autoCommit: true,  // 作業が終わったら作業先フォルダで commit まで
+    autoPush: false,   // push は取り返しがつかないので、明示 ON にした時だけ
   };
   try {
     return { ...defaults, ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) };
@@ -858,6 +862,53 @@ function startChloe(): void {
 
   let workerCwd = '';
 
+  // ---- 作業が終わったら git に残す(相談 → 実行 → 記録 を繋ぐ)----
+  // 既定はローカル commit まで。push は取り返しがつかないので ⚙ で明示 ON にした時だけ。
+  // ponytail: `git add -A` は作業フォルダ全体をまとめる。同じフォルダを人や他の agent が
+  // 同時に触っている時は巻き込むので、その場合は ⚙ の自動コミットを切って使う。
+  const SECRET_RE = /(^|\/)(\.env|\.dev\.vars|id_rsa|[^/]*\.pem|[^/]*\.key|credentials)($|[./])/i;
+  async function gitAutoCommit(task: OfficeTask, cwd: string, say: (s: string) => void): Promise<void> {
+    if (!workerSettings.autoCommit) return;
+    const git = async (...args: string[]): Promise<string> => {
+      const { stdout } = await execFileAsync('git', args, { cwd, timeout: 120_000 });
+      return stdout.trim();
+    };
+    const note = (s: string): void => {
+      task.notes.push(s);
+      while (task.notes.length > 20) task.notes.shift();
+      store.append({ type: 'system', from: 'room', text: s, channel: 'work' });
+    };
+    try {
+      await git('rev-parse', '--is-inside-work-tree');
+    } catch { return; } // git 管理下でないフォルダは何もしない(黙って通す)
+    try {
+      const dirty = await git('status', '--porcelain');
+      if (!dirty) return; // 変更なし = 記録することもない
+      const files = dirty.split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
+      // .env.example のような雛形は秘密ではないので通す
+      const secret = files.find((f) => SECRET_RE.test(f) && !/\.(example|sample|template)$/i.test(f));
+      if (secret) { note(`秘密が混ざりそうなので commit は見送ったよ(${secret})。中身を確認してね`); return; }
+
+      await git('add', '-A');
+      const title = task.request.split('\n')[0].slice(0, 60);
+      await git('commit', '-m', `${title}\n\n(声の部屋 task ${task.id})`);
+      const hash = await git('rev-parse', '--short', 'HEAD');
+      const head = files.slice(0, 3).join(' / ') + (files.length > 3 ? ` 他 ${files.length - 3} 件` : '');
+      note(`コミットしたよ ${hash}(${head})`);
+
+      if (!workerSettings.autoPush) return;
+      try {
+        await git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'); // upstream 無しは push しない
+      } catch { note('push 先(upstream)が無いので、コミットだけにしておいたね'); return; }
+      await git('push');
+      const branch = await git('rev-parse', '--abbrev-ref', 'HEAD');
+      note(`GitHub にも push したよ(${branch})`);
+      say('コミットして push まで済ませたよ。');
+    } catch (error) {
+      note(`git に残せなかった: ${String(error).slice(0, 120)}`);
+    }
+  }
+
   const workerSay = (task: OfficeTask) => (sentence: string): void => {
     task.notes.push(sentence);
     while (task.notes.length > 20) task.notes.shift();
@@ -916,6 +967,7 @@ function startChloe(): void {
       task.status = 'done';
       const m = String(result).match(/成果物[:：]\s*(\S+)/);
       if (m) task.artifacts.push(m[1].replace(/[、。`]+$/, '').replace(/^`/, ''));
+      await gitAutoCommit(task, cwd, workerSay(task)); // 出来上がりを git に残す(既定はローカル commit まで)
       // W10-4: まとめてでなく、終わったものから個別に報告する
       const head = task.request.slice(0, 24);
       enqueueJob({
@@ -1386,6 +1438,8 @@ const server = createServer(async (req, res) => {
     if (typeof body.useUserSettings === 'boolean') workerSettings.useUserSettings = body.useUserSettings;
     const beforeConsult = workerSettings.consultMode;
     if (typeof body.consultMode === 'boolean') workerSettings.consultMode = body.consultMode;
+    if (typeof body.autoCommit === 'boolean') workerSettings.autoCommit = body.autoCommit;
+    if (typeof body.autoPush === 'boolean') workerSettings.autoPush = body.autoPush;
     const beforeChat = `${workerSettings.chatModel}/${workerSettings.chatEffort}`;
     if (typeof body.chatModel === 'string' && allowedModels.includes(body.chatModel)) workerSettings.chatModel = body.chatModel;
     if (typeof body.chatEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.chatEffort)) workerSettings.chatEffort = body.chatEffort;

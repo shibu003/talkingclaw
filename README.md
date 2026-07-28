@@ -38,6 +38,17 @@ bash test/accept-3a1ai.sh などで受入テスト一式
 - 画面 / 他機能から: `POST /plan { action: "confirm" | "cancel" | "get" }`
 - すぐ着手してほしい人は ⚙ の「相談してから着手する」を OFF(従来どおり `delegate_task` 直行)
 
+### 出来上がったら git に残す(自動コミット)
+
+相談 → 着手 → 完了まで進んだら、作業先フォルダで自動的に `git add -A` + commit する(既定 ON)。
+コミットのハッシュと対象ファイルは作業ボードと会話に出る。
+
+- **push は既定 OFF**。GitHub まで自動で上げたい時だけ ⚙ の「そのまま GitHub に push」を ON にする
+  (upstream が無いブランチでは push せず、コミットだけで止める)
+- `.env` / `.dev.vars` / `id_rsa` / `*.pem` / `*.key` / `credentials` が混じっていたらコミットを見送って知らせる
+  (`.env.example` 等の雛形は通す)。判定は `npm run check-ui` で検査
+- 同じフォルダを人や他の agent が同時に触っている時は、`git add -A` が巻き込むので ⚙ で自動コミットを OFF にする
+
 ### 声だけで画面を動かす(音声ナビ)
 
 ボタンを押さなくても、話した言葉で画面が動く。会話に紛れて誤爆しないよう、短い言い切りか
