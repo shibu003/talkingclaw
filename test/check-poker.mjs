@@ -55,6 +55,11 @@ console.log('[3] 同じ seed で同じ札が配られる');
   ok(handText(x.seats[0].hole) === handText(y.seats[0].hole), '同じ seed なら同じ手札');
   const z = newTable(777, players); startHand(z);
   ok(handText(z.seats[0].hole) !== handText(x.seats[0].hole), '違う seed なら違う手札');
+  // 近い seed で同じ配札になっていた不具合の再発防止
+  const near = new Set([0, 1, 2, 999, 1000, 1001].map((s) => {
+    const t = newTable(s, players); startHand(t); return handText(t.seats[0].hole) + handText(t.seats[1].hole);
+  }));
+  ok(near.size === 6, `近い seed でも配札が別になる(${near.size}/6 種類)`);
 }
 
 console.log('[4] ブラインドと手番');

@@ -28,6 +28,9 @@ const ok = (cond, what) => { if (cond) console.log(`  ✅ ${what}`); else { cons
     && JSON.stringify(a.dealer) === JSON.stringify(b.dealer), '同じ seed で同じ札が配られる');
   const c = newGame(999); startHand(c, 100);
   ok(JSON.stringify(a.shoe) !== JSON.stringify(c.shoe), '違う seed なら違う山になる');
+  // 近い seed で同じ山になっていた不具合の再発防止(素朴な xorshift だと起きる)
+  const near = new Set([0, 1, 2, 999, 1000, 1001].map((s) => JSON.stringify(newGame(s).shoe.slice(0, 10))));
+  ok(near.size === 6, `近い seed でも山が別になる(${near.size}/6 種類)`);
 }
 
 // 山の中身: 6 デッキ ぴったりで、各カードが 6 枚ずつ

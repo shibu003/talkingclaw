@@ -1,6 +1,14 @@
 // 「言葉 → 手」の翻訳と 1 手ぶんの進行の検査(daemon 不要)。
 // 会話に紛れて誤爆しないこと、遊べる一通りの流れが通ることを見る。
 import { parseCommand, start, apply } from '../src/casino.ts';
+import { shanten as mjShanten, tileName as mjTileName } from '../src/mahjong.ts';
+
+// 自分が 1 枚も持っていない牌の名前(読み上げに混ざっていないか見るため)
+function tileOfOther(g) {
+  const mine = g.players[0].hand;
+  for (let t = 0; t < 34; t++) if (mine[t] === 0 && g.players[1].hand[t] > 0) return mjTileName(t);
+  return '\u0000';
+}
 
 let fail = 0;
 const ok = (cond, what) => { if (cond) console.log(`  ✅ ${what}`); else { console.log(`  ❌ ${what}`); fail = 1; } };
@@ -101,6 +109,58 @@ console.log('[7] 反則は日本語で断る');
   const rb = apply(b, { type: 'hit' });
   ok(rb.say[0].includes('賭ける'), '賭ける前に引こうとしたら案内する');
 }
+
+console.log('[8] 麻雀を声で遊ぶ');
+{
+  const s = start('mahjong', 4242, [
+    { id: 'c', name: 'クロエ', style: 0.7 }, { id: 'k', name: 'コハク', style: 0.3 }, { id: 'm', name: 'まい', style: 0.55 },
+  ]).session;
+  ok(s.kind === 'mahjong' && s.game.players.length === 4, '4 人卓になる');
+
+  const t = (text) => parseCommand(text, s)?.type;
+  ok(t('一萬切る') === 'discard', '切る牌を言葉で受ける');
+  ok(parseCommand('三筒切って', s)?.tile !== undefined, '牌が取れている');
+  ok(parseCommand('リーチ 東', s)?.riichi === true, '立直の宣言を拾う');
+  ok(t('ツモ') === 'tsumo' && t('ロン') === 'ron' && t('スルー') === 'skip', 'ツモ / ロン / スルー');
+  ok(t('配って') === 'deal' && t('ルール教えて') === 'rules', '配って / ルール');
+  ok(parseCommand('さっきの麻雀の話なんだけど一萬ってどう読むの', s) === null, '長い発話は手にしない');
+  ok(parseCommand('一萬', s)?.type === 'discard', '牌だけ短く言えば手になる');
+  ok(parseCommand('その一萬がどうかしたの', s) === null, '牌名が会話に混ざっても動作語が無ければ拾わない');
+
+  // 1 局まわす: 自分の番で止まり、切ると進む
+  let r = apply(s, { type: 'deal', bet: 0 });
+  const g = s.game;
+  ok(r.say.length > 0 && r.hand.length > 0, '配牌して手牌が出る');
+  const total = () => g.players.reduce((n, p) => n + p.points, 0) + g.riichiSticks * 1000;
+  const start0 = total();
+  let steps = 0;
+  while (steps++ < 120 && g.phase !== 'over') {
+    if (g.phase === 'done') { apply(s, { type: 'deal', bet: 0 }); continue; }
+    if (g.phase === 'ron') { apply(s, { type: 'skip' }); continue; }
+    if (g.phase === 'discard' && g.turn === 0) {
+      const me = g.players[0];
+      if (mahjongCanTsumo(g)) { apply(s, { type: 'tsumo' }); continue; }
+      const tile = me.drawn ?? me.hand.findIndex((n) => n > 0);
+      const res = apply(s, { type: 'discard', tile, riichi: false });
+      if (res.say.some((l) => l.includes('切れない') || l.includes('持ってない'))) { ok(false, `打牌が通らない: ${res.say[0]}`); break; }
+      continue;
+    }
+    break;
+  }
+  ok(steps > 5, `${steps} 手ぶん進んだ`);
+  ok(total() === start0, `点棒の合計が変わらない(${total()} = ${start0})`);
+  ok(!r.say.join('').includes(tileOfOther(g)), '他家の手牌は読み上げに出ない');
+
+  const q = apply(s, { type: 'quit' });
+  ok(q.session === null && q.say[0].includes('点'), 'やめると点数を言って席を立つ');
+}
+
+function mahjongCanTsumo(g) {
+  const me = g.players[0];
+  return me.drawn !== null && g.phase === 'discard' && g.turn === 0
+    && shantenOf(me.hand) === -1;
+}
+function shantenOf(hand) { return mjShanten(hand); }
 
 console.log(fail === 0 ? '\nカジノ: ALL PASS' : '\nカジノ: FAIL あり');
 process.exit(fail);

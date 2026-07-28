@@ -59,11 +59,17 @@ export function handText(cards: Card[]): string { return cards.map(cardName).joi
 
 // ---- seed 付き乱数(同じ seed なら同じ札順 = 後から検証できる)----
 function next(t: { seed: number; cursor: number }): number {
-  let x = (t.seed + t.cursor * 0x9e3779b9) | 0;
-  x ^= x << 13; x |= 0;
-  x ^= x >>> 17;
-  x ^= x << 5; x |= 0;
   t.cursor++;
+  return mix(t.seed, t.cursor);
+}
+
+// splitmix32 の仕上げ。近い seed でも別の並びになるまで混ぜる
+// (素朴な xorshift だと小さい seed の違いが上位ビットに届かず、山が同じになる)
+export function mix(seed: number, cursor: number): number {
+  let x = (seed ^ Math.imul(cursor, 0x9e3779b9)) | 0;
+  x = Math.imul(x ^ (x >>> 16), 0x21f0aaad);
+  x = Math.imul(x ^ (x >>> 15), 0x735a2d97);
+  x = x ^ (x >>> 15);
   return (x >>> 0) / 0x1_0000_0000;
 }
 

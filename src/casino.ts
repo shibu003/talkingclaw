@@ -5,17 +5,22 @@
 // ここで即座に判定して返し、クロエは審判ではなく実況に回る。
 import * as bj from './blackjack.ts';
 import * as pk from './poker.ts';
+import * as mj from './mahjong.ts';
+import * as mg from './mahjongGame.ts';
 
 export type Session =
   | { kind: 'blackjack'; game: bj.Game }
-  | { kind: 'poker'; table: pk.Table; meId: string };
+  | { kind: 'poker'; table: pk.Table; meId: string }
+  | { kind: 'mahjong'; game: mg.Game; meId: string };
 
 export type Cmd =
-  | { type: 'start'; game: 'blackjack' | 'poker' }
+  | { type: 'start'; game: 'blackjack' | 'poker' | 'mahjong' }
   | { type: 'quit' }
   | { type: 'hit' } | { type: 'stand' } | { type: 'double' }
   | { type: 'fold' } | { type: 'check' } | { type: 'call' } | { type: 'raise'; amount: number } | { type: 'allin' }
   | { type: 'deal'; bet: number }
+  | { type: 'discard'; tile: mj.Tile; riichi: boolean }
+  | { type: 'tsumo' } | { type: 'ron' } | { type: 'skip' }
   | { type: 'refill' }
   | { type: 'status' }
   | { type: 'rules' };
@@ -35,6 +40,7 @@ export function parseCommand(text: string, session: Session | null): Cmd | null 
   if (!session) {
     if (has('ポーカー', 'ぽーかー', 'ホールデム')) return { type: 'start', game: 'poker' };
     if (has('ブラックジャック', 'ぶらっくじゃっく', 'ジャックポット21')) return { type: 'start', game: 'blackjack' };
+    if (has('麻雀', 'マージャン', 'まーじゃん', 'リーチ麻雀')) return { type: 'start', game: 'mahjong' };
     return null;
   }
 
@@ -43,6 +49,21 @@ export function parseCommand(text: string, session: Session | null): Cmd | null 
   if (has('ルール', 'どういう決まり', '配当')) return { type: 'rules' };
   if (has('補充', 'チップちょうだい', 'チップ足し', 'お金貸し')) return { type: 'refill' };
   if (has('いまいくら', '今いくら', 'チップは', '成績', '状況', 'どうなって', '手札')) return { type: 'status' };
+
+  if (session.kind === 'mahjong') {
+    if (has('ツモ', 'つも')) return { type: 'tsumo' };
+    if (has('ロン', 'ろん')) return { type: 'ron' };
+    if (has('スルー', '見送', 'いらない', 'パス')) return { type: 'skip' };
+    if (has('次の局', '次いく', '続け', '配って', '次')) return { type: 'deal', bet: 0 };
+    const riichi = has('リーチ', 'りーち', '立直');
+    // 牌の名前は会話にも出るので、「切る」等の動作語があるか、牌だけを短く言った時にだけ手にする
+    const acting = riichi || has('切', 'きる', 'きって', '捨て', 'すて', '打つ', 'うつ');
+    if (!acting && t.length > 8) return null;
+    const tile = mj.parseSpokenTile(t);
+    if (tile !== null) return { type: 'discard', tile, riichi };
+    if (riichi) return { type: 'discard', tile: -1, riichi: true }; // 牌を言わない立直 = ツモ切り立直
+    return null;
+  }
 
   if (session.kind === 'blackjack') {
     if (has('引く', 'ひく', 'ヒット', 'もう一枚', 'もういちまい', 'ちょうだい', 'カード')) return { type: 'hit' };
@@ -72,9 +93,12 @@ const RULES_BJ = 'ブラックジャックのルールね。6 デッキで、わ
   + 'ブラックジャックは 1.5 倍。ダブルは最初の 2 枚だけ。スプリットと保険は無しね。';
 const RULES_PK = 'テキサスホールデムだよ。ブラインドは 5 と 10、上限なし。'
   + '降りる・チェック・コール・レイズ・オールインで言ってね。手札は 2 枚、場に 5 枚出るよ。';
+const RULES_MJ = '東風戦の 4 人麻雀。25000 点持ちで、赤ドラは無し。鳴きは入れてないから門前だけね。'
+  + '「一萬切る」みたいに切る牌を言ってね。聴牌したら「リーチ」、和了れる時は「ツモ」か「ロン」。'
+  + '振聴あり、流局は聴牌してる人で分けるよ。';
 
 /** ゲームを始める。相手(AI)の名前は部屋にいる人から渡してもらう */
-export function start(game: 'blackjack' | 'poker', seed: number, opponents: { id: string; name: string; style?: number }[]): Reply {
+export function start(game: 'blackjack' | 'poker' | 'mahjong', seed: number, opponents: { id: string; name: string; style?: number }[]): Reply {
   if (game === 'blackjack') {
     const g = bj.newGame(seed);
     return {
@@ -86,6 +110,19 @@ export function start(game: 'blackjack' | 'poker', seed: number, opponents: { id
     { id: 'you', name: 'あなた', human: true },
     ...opponents.slice(0, 3).map((o) => ({ id: o.id, name: o.name, human: false, style: o.style ?? 0.5 })),
   ];
+  if (game === 'mahjong') {
+    const players = [
+      { id: 'you', name: 'あなた', human: true },
+      ...opponents.slice(0, 3).map((o) => ({ id: o.id, name: o.name, human: false, style: o.style ?? 0.5 })),
+    ];
+    while (players.length < 4) players.push({ id: `bot${players.length}`, name: `NPC${players.length}`, human: false, style: 0.5 });
+    const g = mg.newGame(seed, players);
+    const names = players.filter((p) => !p.human).map((p) => p.name).join('と');
+    return {
+      say: [`麻雀やろう。${names}と 4 人ね。`, '東風戦、25000 点持ち。鳴きは無しで門前だけだよ。', '「配って」で始めるね。'],
+      session: { kind: 'mahjong', game: g, meId: 'you' },
+    };
+  }
   const table = pk.newTable(seed, seats, 1000, 10);
   const names = seats.filter((s) => !s.human).map((s) => s.name).join('と');
   return {
@@ -97,12 +134,15 @@ export function start(game: 'blackjack' | 'poker', seed: number, opponents: { id
 /** 1 コマンドぶん進める。say はそのまま順に読み上げる文 */
 export function apply(session: Session, cmd: Cmd): Reply {
   if (cmd.type === 'quit') {
-    const chips = session.kind === 'blackjack' ? session.game.chips : session.table.seats.find((s) => s.human)?.chips ?? 0;
-    return { say: [`おつかれさま。チップは ${chips} 枚で終わりだね。`], session: null };
+    const tail = session.kind === 'blackjack' ? `チップは ${session.game.chips} 枚`
+      : session.kind === 'poker' ? `チップは ${session.table.seats.find((s) => s.human)?.chips ?? 0} 枚`
+        : `点数は ${session.game.players.find((p) => p.human)?.points ?? 0} 点`;
+    return { say: [`おつかれさま。${tail}で終わりだね。`], session: null };
   }
   if (cmd.type === 'rules') {
-    return { say: [session.kind === 'blackjack' ? RULES_BJ : RULES_PK], session };
+    return { say: [{ blackjack: RULES_BJ, poker: RULES_PK, mahjong: RULES_MJ }[session.kind]], session };
   }
+  if (session.kind === 'mahjong') return applyMahjong(session, cmd);
   return session.kind === 'blackjack' ? applyBlackjack(session, cmd) : applyPoker(session, cmd);
 }
 
@@ -163,6 +203,99 @@ function applyPoker(session: Session & { kind: 'poker' }, cmd: Cmd): Reply {
   if (!r.ok) return { say: [r.error], session };
   const before = t.log.length;
   return { ...runAi(t, session, t.log.slice(before - 1)), hand: board() };
+}
+
+function applyMahjong(session: Session & { kind: 'mahjong' }, cmd: Cmd): Reply {
+  const g = session.game;
+  const seat = g.players.findIndex((p) => p.id === session.meId);
+  const me = g.players[seat];
+
+  if (cmd.type === 'status') {
+    return { say: [mg.describe(g, session.meId), `点数は ${g.players.map((p) => `${p.name} ${p.points}`).join('、')}。`],
+      session, hand: mg.handDisplay(g, session.meId) };
+  }
+  if (cmd.type === 'refill') return { say: ['麻雀では点棒は足せないよ。飛んだら終わりね。'], session };
+  if (cmd.type === 'deal') {
+    if (g.phase === 'over') return { say: [g.log[g.log.length - 1] ?? '終局してるよ。「やめる」で席を立とう。'], session };
+    const r = mg.startHand(g);
+    if (!r.ok) return { say: [r.error], session };
+    return runMahjongAi(g, session, [...g.log]);
+  }
+  if (cmd.type === 'tsumo') {
+    const r = mg.win(g, seat, true);
+    if (!r.ok) return { say: [r.error], session };
+    return { say: [...g.log.slice(-2), '次いく?'], session, hand: mg.handDisplay(g, session.meId) };
+  }
+  if (cmd.type === 'ron') {
+    const r = mg.win(g, seat, false);
+    if (!r.ok) return { say: [r.error], session };
+    return { say: [...g.log.slice(-2), '次いく?'], session, hand: mg.handDisplay(g, session.meId) };
+  }
+  if (cmd.type === 'skip') {
+    if (g.phase !== 'ron') return { say: ['いまは見送る場面じゃないよ'], session };
+    const before = g.log.length;
+    if (!mg.pass(g).ok) return { say: ['進められなかった'], session };
+    return runMahjongAi(g, session, g.log.slice(before));
+  }
+  if (cmd.type === 'discard') {
+    if (g.phase !== 'discard' || g.turn !== seat) return { say: ['いまは切る番じゃないよ'], session };
+    const tile = cmd.tile >= 0 ? cmd.tile : (me.drawn ?? -1);
+    if (tile < 0) return { say: ['どれを切るか言ってね'], session };
+    const before = g.log.length;
+    const r = mg.discard(g, seat, tile, cmd.riichi);
+    if (!r.ok) return { say: [r.error], session, hand: mg.handDisplay(g, session.meId) };
+    return runMahjongAi(g, session, [`${mj.tileName(tile)} を切ったよ。`, ...g.log.slice(before)]);
+  }
+  return { say: ['それは麻雀では使えないよ。切る牌を言うか、ツモ・ロン・リーチだよ。'], session };
+}
+
+// 自分の番が来るまで他家に打たせる。ロンできる場面では止めて聞く
+function runMahjongAi(g: mg.Game, session: Session & { kind: 'mahjong' }, say: string[]): Reply {
+  const seat = g.players.findIndex((p) => p.id === session.meId);
+  let guard = 0;
+  while (guard++ < 200) {
+    if (g.phase === 'done' || g.phase === 'over') {
+      say.push(...g.log.slice(-2));
+      say.push(g.phase === 'over' ? '終局。もう一回やる?' : '次いく?');
+      break;
+    }
+    if (g.phase === 'ron') {
+      // 自分がロンできるなら止めて聞く(勝手に和了らない)
+      if (mg.canRon(g, seat)) {
+        const t = g.lastDiscard!;
+        say.push(`${g.players[t.from].name} が ${mj.tileName(t.tile)} を切ったよ。ロンできる! ロンする?`);
+        break;
+      }
+      let ronned = false;
+      for (let i = 1; i <= 3; i++) {
+        const s = (g.lastDiscard!.from + i) % 4;
+        if (s !== seat && mg.canRon(g, s)) { const before = g.log.length; mg.win(g, s, false); say.push(...g.log.slice(before)); ronned = true; break; }
+      }
+      if (ronned) continue;
+      const before = g.log.length;
+      if (!mg.pass(g).ok) break;
+      say.push(...g.log.slice(before));
+      continue;
+    }
+    if (g.phase === 'discard') {
+      if (g.turn === seat) {
+        const t = mg.canTsumo(g, seat);
+        if (t) say.push(`${mj.tileName(g.players[seat].drawn!)} をツモった。和了れるよ! ツモする?`);
+        say.push(mg.describe(g, session.meId));
+        break;
+      }
+      const s = g.turn;
+      const t = mg.canTsumo(g, s);
+      if (t) { const before = g.log.length; mg.win(g, s, true); say.push(...g.log.slice(before)); continue; }
+      const { tile, riichi } = mg.chooseDiscard(g, s);
+      const before = g.log.length;
+      if (!mg.discard(g, s, tile, riichi).ok) break;
+      say.push(...g.log.slice(before));
+      continue;
+    }
+    break;
+  }
+  return { say: dedupe(say), session, hand: mg.handDisplay(g, session.meId) };
 }
 
 // 人間の番が来るまで AI に打たせる。1 手ごとの出来事をそのまま読み上げ文にする

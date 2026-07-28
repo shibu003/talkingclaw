@@ -47,6 +47,29 @@ export function handText(tiles: Tile[]): string {
   return [...tiles].sort((a, b) => a - b).map(tileName).join(' ');
 }
 
+/** 声で言われた牌を読み取る。「一萬」「1マン」「いちまん」「東」などを受ける */
+export function parseSpokenTile(text: string): Tile | null {
+  const t = (text || '').replace(/\s|[、。!?！?]/g, '');
+  for (let i = 0; i < HONOR_NAME.length; i++) {
+    if (t.includes(HONOR_NAME[i])) return HONOR + i;
+  }
+  const alias: Record<string, number> = { はく: HAKU, ハク: HAKU, はつ: HATSU, ハツ: HATSU, ちゅん: CHUN, チュン: CHUN,
+    ひがし: EAST, みなみ: SOUTH, にし: WEST, きた: NORTH };
+  for (const [k, v] of Object.entries(alias)) if (t.includes(k)) return v;
+
+  const suit = /萬|万|まん|マン|[mM]/.test(t) ? MAN
+    : /筒|ぴん|ピン|[pP]/.test(t) ? PIN
+      : /索|そう|ソウ|ソー|[sS]/.test(t) ? SOU : null;
+  if (suit === null) return null;
+  const kanji = '一二三四五六七八九';
+  const kana = ['いち', 'に', 'さん', 'よん|し', 'ご', 'ろく', 'なな|しち', 'はち', 'きゅう|く'];
+  const digit = t.match(/[1-9]/)?.[0];
+  if (digit) return suit + Number(digit) - 1;
+  for (let i = 0; i < 9; i++) if (t.includes(kanji[i])) return suit + i;
+  for (let i = 0; i < 9; i++) if (new RegExp(kana[i]).test(t)) return suit + i;
+  return null;
+}
+
 // ---- 面子 ----
 export type MeldKind = 'run' | 'triplet' | 'kan' | 'pair';
 export type Meld = { kind: MeldKind; tile: Tile; open: boolean }; // run は tile = 一番小さい牌

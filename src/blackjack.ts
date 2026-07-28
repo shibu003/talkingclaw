@@ -39,13 +39,19 @@ const DECKS = 6;
 const RESHUFFLE_AT = 0.75; // 75% 配ったら次の手の前に組み直す
 export const MIN_BET = 10;
 
-// xorshift32。Math.random を使わないのは「同じ seed で同じ札順」を作れるようにするため
+// Math.random を使わないのは「同じ seed で同じ札順」を作れるようにするため
 function next(g: Game): number {
-  let x = (g.seed + g.cursor * 0x9e3779b9) | 0;
-  x ^= x << 13; x |= 0;
-  x ^= x >>> 17;
-  x ^= x << 5; x |= 0;
   g.cursor++;
+  return mix(g.seed, g.cursor);
+}
+
+// splitmix32 の仕上げ。近い seed(999 と 1000)でも別の並びになるまで混ぜる。
+// 素朴な xorshift だと小さい seed の違いが上位ビットに届かず、山が同じになる
+export function mix(seed: number, cursor: number): number {
+  let x = (seed ^ Math.imul(cursor, 0x9e3779b9)) | 0;
+  x = Math.imul(x ^ (x >>> 16), 0x21f0aaad);
+  x = Math.imul(x ^ (x >>> 15), 0x735a2d97);
+  x = x ^ (x >>> 15);
   return (x >>> 0) / 0x1_0000_0000;
 }
 
