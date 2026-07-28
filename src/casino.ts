@@ -205,6 +205,116 @@ function applyPoker(session: Session & { kind: 'poker' }, cmd: Cmd): Reply {
   return { ...runAi(t, session, t.log.slice(before - 1)), hand: board() };
 }
 
+// 画面に出すための今の様子。ボタンは「声で言うのと同じ言葉」を持たせるので、
+// 押した時の道筋は声とまったく同じになる(判定の入口を二重に作らない)
+export type View = {
+  kind: Session['kind'] | null;
+  title: string;
+  state: string[];
+  rules: string;
+  moves: { label: string; text: string }[];
+  tiles: { label: string; text: string }[];
+};
+
+export function view(session: Session | null): View {
+  if (!session) {
+    return {
+      kind: null, title: 'いまは遊んでないよ', state: [],
+      rules: 'ゲーム部屋で遊べるよ。ポーカーはクロエたちと、ブラックジャックはクロエがディーラー、麻雀は 4 人で東風戦。',
+      moves: [
+        { label: '🃏 ポーカー', text: 'ポーカーやろう' },
+        { label: '♠ ブラックジャック', text: 'ブラックジャックやろう' },
+        { label: '🀄 麻雀', text: '麻雀やろう' },
+      ],
+      tiles: [],
+    };
+  }
+  if (session.kind === 'blackjack') {
+    const g = session.game;
+    const playing = g.phase === 'player';
+    return {
+      kind: 'blackjack',
+      title: `ブラックジャック — チップ ${g.chips} 枚`,
+      state: [
+        g.player.length > 0 ? `あなた ${bj.handText(g.player)}(${bj.handValue(g.player).total})` : '賭けるところから',
+        g.dealer.length > 0 ? `ディーラー ${playing ? `${bj.cardName(g.dealer[0])} ■` : bj.handText(g.dealer)}` : '',
+        `${g.hands} 手 ${g.wins} 勝 ${g.losses} 敗 ${g.pushes} 分`,
+      ].filter(Boolean),
+      rules: RULES_BJ,
+      moves: playing
+        ? [{ label: '引く', text: '引く' }, { label: '勝負', text: '勝負' },
+          ...(g.player.length === 2 ? [{ label: 'ダブル', text: 'ダブル' }] : [])]
+        : [{ label: '100 賭ける', text: '100賭ける' }, { label: '500 賭ける', text: '500賭ける' },
+          { label: '補充', text: '補充して' }, { label: 'やめる', text: 'もうやめる' }],
+      tiles: [],
+    };
+  }
+  if (session.kind === 'poker') {
+    const t = session.table;
+    const me = t.seats.find((s) => s.id === session.meId)!;
+    const myTurn = t.street !== 'done' && t.seats[t.toAct]?.id === session.meId;
+    const need = pk.toCall(t, me);
+    return {
+      kind: 'poker',
+      title: `ポーカー — ポット ${pk.potOf(t)} / あなた ${me.chips} 枚`,
+      state: [
+        me.hole.length > 0 ? `あなたの手 ${pk.handText(me.hole)}` : '「配って」で始まるよ',
+        t.board.length > 0 ? `場 ${pk.handText(t.board)}` : '',
+        t.seats.map((s) => `${s.name} ${s.chips}${s.folded ? '(降)' : ''}`).join(' / '),
+      ].filter(Boolean),
+      rules: RULES_PK,
+      moves: myTurn
+        ? [
+          ...(need > 0 ? [{ label: '降りる', text: '降りる' }, { label: `コール ${need}`, text: 'コール' }]
+            : [{ label: 'チェック', text: 'チェック' }]),
+          { label: 'レイズ', text: `${t.bet + Math.max(t.minRaise, Math.floor(pk.potOf(t) / 2))}まで上げる` },
+          { label: 'オールイン', text: 'オールイン' },
+        ]
+        : [{ label: '配って', text: '配って' }, { label: 'やめる', text: 'もうやめる' }],
+      tiles: [],
+    };
+  }
+  const g = session.game;
+  const seat = g.players.findIndex((p) => p.id === session.meId);
+  const me = g.players[seat];
+  const myDiscard = g.phase === 'discard' && g.turn === seat;
+  const canT = myDiscard && mg.canTsumo(g, seat) !== null;
+  const canR = g.phase === 'ron' && mg.canRon(g, seat) !== null;
+  const tiles: { label: string; text: string }[] = [];
+  if (myDiscard) {
+    for (let t = 0; t < 34; t++) {
+      for (let i = 0; i < me.hand[t]; i++) {
+        if (me.riichi && t !== me.drawn) continue; // 立直中はツモ切りだけ
+        tiles.push({ label: mj.tileName(t), text: `${mj.tileName(t)}切る` });
+        break; // 同じ牌は 1 つのボタンで足りる
+      }
+    }
+  }
+  const moves: { label: string; text: string }[] = [];
+  if (canT) moves.push({ label: '🎉 ツモ', text: 'ツモ' });
+  if (canR) moves.push({ label: '🎉 ロン', text: 'ロン' }, { label: 'スルー', text: 'スルー' });
+  if (myDiscard && !me.riichi) {
+    const after = me.hand.slice();
+    if (me.drawn !== null) after[me.drawn]--;
+    if (mj.shanten(after) === 0) moves.push({ label: 'リーチ(ツモ切り)', text: 'リーチ' });
+  }
+  if (g.phase === 'done' || g.phase === 'over') moves.push({ label: '次の局', text: '配って' });
+  moves.push({ label: 'やめる', text: 'もうやめる' });
+  return {
+    kind: 'mahjong',
+    title: `麻雀 — 東${g.round}局 ${g.honba}本場 / 残り ${mg.remaining(g)} 枚`,
+    state: [
+      me.hand.some((n) => n > 0) ? `手牌 ${mg.handDisplay(g, session.meId)}` : '「配って」で始まるよ',
+      `ドラ ${mj.tileName(mg.doraOf(g.doraIndicator))}${me.riichi ? ' / 立直中' : ''}`,
+      g.players.map((p) => `${p.name} ${p.points}`).join(' / '),
+      g.phase === 'discard' && g.turn === seat ? `${mj.shanten(me.hand) === 0 ? '聴牌' : `${mj.shanten(me.hand)} シャンテン`}` : `${g.players[g.turn]?.name ?? ''} の番`,
+    ].filter(Boolean),
+    rules: RULES_MJ,
+    moves,
+    tiles,
+  };
+}
+
 function applyMahjong(session: Session & { kind: 'mahjong' }, cmd: Cmd): Reply {
   const g = session.game;
   const seat = g.players.findIndex((p) => p.id === session.meId);

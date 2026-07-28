@@ -236,6 +236,24 @@
   .att { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 0 3.7em; max-width: var(--measure); }
   .att .shot { width: auto; max-width: 220px; max-height: 140px; margin-top: 0; }
   .att a { color: var(--accent); font-size: var(--fs-small); align-self: center; }
+
+  /* ---- ゲーム: 声で言えることは全部ボタンでも押せるようにする ---- */
+  #gameList h3 { font-size: var(--fs-ui); font-weight: 700; line-height: 1.6; margin-bottom: 6px; }
+  #gameList .gstate { font-size: var(--fs-small); line-height: 1.8; color: var(--muted); margin-bottom: 10px; }
+  #gameList .gstate b { color: var(--text); font-weight: 400; }
+  .gmoves { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .gmove { background: var(--surface-2); border: 1px solid var(--line); color: var(--text);
+           border-radius: 999px; padding: 8px 16px; font-size: var(--fs-ui); font-weight: 600; line-height: 1.4; }
+  .gmove:hover { border-color: var(--accent); }
+  .gmove.hot { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  /* 麻雀の牌は押して切る。等幅にして並びを揃える */
+  .gtiles { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
+  .gtile { background: #f6f2e8; color: #17111f; border: 1px solid #cbbfa6; border-radius: 5px;
+           padding: 7px 6px; min-width: 40px; font-size: 14px; font-weight: 700; line-height: 1.3; }
+  .gtile:hover { border-color: var(--accent); transform: translateY(-3px); }
+  #gameList details { margin-top: 6px; }
+  #gameList summary { cursor: pointer; color: var(--muted); font-size: var(--fs-small); }
+  #gameList .grules { margin-top: 6px; font-size: var(--fs-small); line-height: 1.8; color: var(--muted); }
   #text::placeholder { color: var(--muted); }
   #text:focus { border-color: var(--accent); }
   #send { width: 46px; height: 46px; border-radius: 50%; border: 1px solid var(--line);
@@ -367,10 +385,12 @@
     <button id="tabArtifact" class="tab on">成果物</button>
     <button id="tabInbox" class="tab">報告 <span id="inboxCount"></span></button>
     <button id="tabHistory" class="tab" title="完了したものと全部の履歴">履歴</button>
+    <button id="tabGame" class="tab" title="遊ぶ">ゲーム <span id="gameBadge" class="badge"></span></button>
   </div>
   <div id="artifactList"></div>
   <div id="inboxList" hidden></div>
   <div id="historyList" hidden></div>
+  <div id="gameList" hidden></div>
 </div>
 <div id="preview">
   <div class="phead">

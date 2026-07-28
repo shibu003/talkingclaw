@@ -304,6 +304,7 @@ function render(ev) {
   }
   // 部屋で何か起きた = 作業の状態も変わっている可能性。進捗表示をすぐ取り直す
   boardSoon();
+  if (gameKind !== null || sideView === 'game') setTimeout(() => void refreshGame(), 200);
 }
 
 // ---- daemon 再起動検出(S8: EventSource は 401 を読めない → 無認証 /health を poll)----
@@ -838,6 +839,7 @@ async function enterRoom(next) {
   void refreshRoster();    // 誰がいるか
   boardSoon(50);           // 何をしているか
   void renderRooms();      // 部屋の名前(一覧とヘッダの表示)
+  void refreshGame();      // 部屋ごとに別のゲームなので取り直す
 }
 
 // 部屋に入った時、その部屋で話していた内容を読み直す(音は鳴らさない)
@@ -1142,7 +1144,11 @@ const artifactEl = document.getElementById('artifactList');
 const historyEl = document.getElementById('historyList');
 // 右レーンの 3 面。生きている一覧(成果物・報告)は短く保ち、
 // 済んだものと全部の履歴は「履歴」に集める(ここだけは長くなってよい)
-const SIDE_VIEWS = { artifact: [artifactEl, 'tabArtifact'], inbox: [inboxEl, 'tabInbox'], history: [historyEl, 'tabHistory'] };
+const gameEl = document.getElementById('gameList');
+const SIDE_VIEWS = {
+  artifact: [artifactEl, 'tabArtifact'], inbox: [inboxEl, 'tabInbox'],
+  history: [historyEl, 'tabHistory'], game: [gameEl, 'tabGame'],
+};
 let sideView = 'artifact';
 let inboxTab = false; // 報告を見ている間は成果物一覧を描き直さない
 for (const [name, [, btnId]] of Object.entries(SIDE_VIEWS)) {
@@ -1156,7 +1162,70 @@ function switchBoardTab(view) {
     el.hidden = name !== sideView;
     document.getElementById(btnId).classList.toggle('on', name === sideView);
   }
-  void (sideView === 'inbox' ? refreshInbox() : refreshBoard());
+  void (sideView === 'inbox' ? refreshInbox() : sideView === 'game' ? refreshGame() : refreshBoard());
+}
+
+// ---- ゲーム: 声で言えることは全部ボタンでも押せる ----
+// ボタンは声とまったく同じ言葉を /chat に送るので、判定の入口が二重にならない
+const gameBadgeEl = document.getElementById('gameBadge');
+let gameKind = null;
+async function refreshGame() {
+  try {
+    const v = await (await post('/game', {})).json();
+    gameKind = v.kind;
+    gameBadgeEl.textContent = v.kind ? '●' : '';
+    if (sideView !== 'game') return;
+    gameEl.replaceChildren();
+    const h = document.createElement('h3');
+    h.textContent = v.title;
+    gameEl.appendChild(h);
+    if ((v.state ?? []).length > 0) {
+      const st = document.createElement('div');
+      st.className = 'gstate';
+      for (const line of v.state) {
+        const b = document.createElement('b');
+        b.textContent = line;
+        st.append(b, document.createElement('br'));
+      }
+      gameEl.appendChild(st);
+    }
+    if ((v.tiles ?? []).length > 0) {
+      const box = document.createElement('div');
+      box.className = 'gtiles';
+      for (const t of v.tiles) {
+        const b = document.createElement('button');
+        b.className = 'gtile';
+        b.textContent = t.label;
+        b.title = '押すと切るよ';
+        b.onclick = () => void playMove(t.text);
+        box.appendChild(b);
+      }
+      gameEl.appendChild(box);
+    }
+    const moves = document.createElement('div');
+    moves.className = 'gmoves';
+    for (const m of v.moves ?? []) {
+      const b = document.createElement('button');
+      b.className = 'gmove' + (m.label.startsWith('🎉') ? ' hot' : '');
+      b.textContent = m.label;
+      b.onclick = () => void playMove(m.text);
+      moves.appendChild(b);
+    }
+    gameEl.appendChild(moves);
+    const det = document.createElement('details');
+    const sum = document.createElement('summary');
+    sum.textContent = 'ルール';
+    const rules = document.createElement('div');
+    rules.className = 'grules';
+    rules.textContent = v.rules ?? '';
+    det.append(sum, rules);
+    gameEl.appendChild(det);
+  } catch { /* 次の更新で */ }
+}
+// ボタンを押す = その言葉を言うのと同じ
+async function playMove(text) {
+  await post('/chat', { text, immediate: true });
+  setTimeout(() => void refreshGame(), 400);
 }
 
 // 履歴: 済んだ作業を新しい順に。生きている一覧から外したものはここで必ず見つかる
@@ -1425,6 +1494,30 @@ function pickBar(host, onDone) {
     picked.clear();
     onDone();
   };
+  // 1 件だけ選んでいる時は、その場で書き直せる(まとめては 2 件以上から)
+  if (picked.size === 1) {
+    const edit = document.createElement('button');
+    edit.className = 'tact';
+    edit.textContent = '直す';
+    edit.onclick = () => {
+      const id = [...picked][0];
+      const input = document.createElement('input');
+      input.className = 'tedit';
+      input.placeholder = '書き直して Enter(Esc でやめる)';
+      input.onkeydown = async (e) => {
+        if (e.key === 'Escape') { picked.clear(); onDone(); return; }
+        if (e.key !== 'Enter' || e.isComposing || !input.value.trim()) return;
+        const r = await post('/task', { action: 'edit', taskId: id, text: input.value.trim() });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) addSys(d.error ?? '直せなかった');
+        picked.clear();
+        onDone();
+      };
+      bar.replaceChildren(input);
+      input.focus();
+    };
+    bar.appendChild(edit);
+  }
   for (const [text, action] of [['まとめる', 'merge'], ['消す', 'delete']]) {
     const b = document.createElement('button');
     b.className = 'tact';
@@ -1607,4 +1700,5 @@ async function renderSettings() {
 
 connect();
 void renderSideAlways();          // 常設パネル(部屋・設定)の中身を最初から描いておく
+void refreshGame();               // 遊んでいる途中なら、リロードしてもボタンが戻るように
 void showHistory(currentChannel); // リロード直後も直近の会話が見えるように

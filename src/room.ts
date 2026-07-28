@@ -1879,6 +1879,11 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  // ゲームの今の様子(画面のボタンを組み立てるため)。ボタンは声と同じ言葉を /chat に送る
+  if (path === '/game') {
+    return json(res, 200, casino.view(gameSessions.get(activeChannel) ?? null));
+  }
+
   if (path === '/chat') {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
