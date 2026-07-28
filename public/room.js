@@ -459,8 +459,11 @@ function showPreview(relPath, project) {
 const previewedTasks = new Set();
 
 // ---- パネル(部屋 / 作業ボード / 設定)。開くのは同時に 1 枚だけ ----
+// 広い画面では左右のレーンに常設される(CSS 側の三分割)ので、開閉は狭い画面だけの話になる。
+const wideQuery = matchMedia('(min-width: 1100px)');
+const wideLayout = () => wideQuery.matches;
 const boardEl = document.getElementById('boardList');
-let boardOpen = false;
+let boardOpen = wideLayout(); // 右レーン常設中は「開いている」— 描画を止めない
 const panels = {
   rooms: { el: document.getElementById('rooms'), btn: document.getElementById('roomBtn'), render: renderRooms },
   board: { el: document.getElementById('board'), btn: document.getElementById('boardBtn'), render: refreshBoard },
@@ -474,10 +477,12 @@ function openPanel(name) {
     p.el.classList.toggle('open', on);
     p.btn.setAttribute('aria-expanded', String(on));
   }
-  boardOpen = openedPanel === 'board';
+  boardOpen = wideLayout() || openedPanel === 'board';
   if (openedPanel) void panels[openedPanel].render();
 }
 for (const [key, p] of Object.entries(panels)) p.btn.onclick = () => openPanel(key);
+// 幅が変わってレーン ⇄ 1 カラムを跨いだら、開閉状態を揃え直す(レイアウト自体は CSS が持つ)
+wideQuery.addEventListener('change', () => { openPanel(null); void refreshBoard(); });
 
 document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel);
 document.getElementById('archiveBtn').onclick = () => window.open('/archives.md?token=' + TOKEN);
