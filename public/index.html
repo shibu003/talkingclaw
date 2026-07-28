@@ -195,6 +195,20 @@
   #send:hover { border-color: var(--accent); }
 
   /* ---- 成果物プレビュー ---- */
+  .tabs { display: flex; gap: 8px; margin: 0 0 8px; }
+  .tab { background: #241d33; border: 1px solid #3d3356; color: #9a8fb8; border-radius: 8px; padding: 4px 12px; cursor: pointer; font-size: 13px; }
+  .tab.on { background: #b48ef7; color: #16121f; border-color: #b48ef7; }
+  .thread { padding: 10px 0; border-bottom: 1px solid #241d33; }
+  .thread.unread { border-left: 3px solid #b48ef7; padding-left: 8px; }
+  .thread h3 { font-size: 14px; margin: 0 0 4px; font-weight: 600; }
+  .thread .req { font-size: 11px; color: #9a8fb8; margin-bottom: 6px; }
+  .thread .sec { font-size: 12px; margin: 4px 0 0; }
+  .thread .sec b { color: #b48ef7; font-weight: 600; display: block; font-size: 11px; margin-bottom: 2px; }
+  .thread ul { margin: 0; padding-left: 18px; }
+  .thread .warn { color: #e75480; }
+  .thread .actions { display: flex; gap: 8px; margin-top: 8px; }
+  .thread input { flex: 1; background: #241d33; border: 1px solid #3d3356; color: #eae6f2; border-radius: 8px; padding: 5px 10px; font-size: 12px; }
+  #inboxCount:not(:empty) { background: #b48ef7; color: #16121f; border-radius: 8px; padding: 0 6px; font-size: 11px; }
   #preview { display: none; flex-direction: column; margin: 0 18px 8px; border: 1px solid var(--line, #3d3356);
              border-radius: 12px; overflow: hidden; background: #1d1729; height: 42dvh; flex: none; }
   #preview.open { display: flex; }
@@ -233,7 +247,7 @@
   </div>
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
-<div id="board" class="panel"><h2>作業ボード</h2><div id="boardList"></div></div>
+<div id="board" class="panel"><h2>作業ボード</h2><div class="tabs"><button id="tabWork" class="tab on">進行中</button><button id="tabInbox" class="tab">報告 <span id="inboxCount"></span></button></div><div id="boardList"></div><div id="inboxList" hidden></div></div>
 <div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
 <div id="preview">
   <div class="phead">

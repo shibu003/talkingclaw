@@ -865,6 +865,95 @@ function renderProgress(rows) {
   }
 }
 
+// ---- W12: 報告 INBOX(board パネルの 2 タブ目)----
+const inboxEl = document.getElementById('inboxList');
+const inboxCountEl = document.getElementById('inboxCount');
+let inboxTab = false;
+document.getElementById('tabWork').onclick = () => switchBoardTab(false);
+document.getElementById('tabInbox').onclick = () => switchBoardTab(true);
+function switchBoardTab(toInbox) {
+  inboxTab = toInbox;
+  document.getElementById('tabWork').classList.toggle('on', !toInbox);
+  document.getElementById('tabInbox').classList.toggle('on', toInbox);
+  boardEl.hidden = toInbox;
+  inboxEl.hidden = !toInbox;
+  void (toInbox ? refreshInbox() : refreshBoard());
+}
+
+function threadCard(t) {
+  const r = t.report ?? {};
+  const div = document.createElement('div');
+  div.className = 'thread' + (t.unread ? ' unread' : '');
+  const h = document.createElement('h3');
+  h.textContent = r.headline || t.request.slice(0, 40);
+  div.appendChild(h);
+  const req = document.createElement('div');
+  req.className = 'req';
+  req.textContent = `依頼: 「${t.request.slice(0, 60)}」(${(t.at || '').slice(11, 16)})`;
+  div.appendChild(req);
+  const sec = (label, items, warn) => {
+    if (!items || items.length === 0) return;
+    const s = document.createElement('div');
+    s.className = 'sec' + (warn ? ' warn' : '');
+    const b = document.createElement('b');
+    b.textContent = label;
+    s.appendChild(b);
+    const ul = document.createElement('ul');
+    for (const it of items) { const li = document.createElement('li'); li.textContent = it; ul.appendChild(li); }
+    s.appendChild(ul);
+    div.appendChild(s);
+  };
+  sec('できるようになったこと', r.can);
+  sec('確かめかた', r.check, (r.check ?? []).some((c) => c.includes('書き忘れ')));
+  sec('やらなかったこと', r.skipped);
+  if ((r.touched ?? []).length > 0) {
+    const s = document.createElement('div');
+    s.className = 'sec';
+    const b = document.createElement('b'); b.textContent = 'さわったもの'; s.appendChild(b);
+    for (const p of r.touched) {
+      const a = document.createElement('a');
+      a.href = '#'; a.textContent = ' 📦 ' + p;
+      a.onclick = (e) => { e.preventDefault(); showPreview(p); };
+      s.appendChild(a);
+    }
+    div.appendChild(s);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const input = document.createElement('input');
+  input.placeholder = 'この報告に返信(続けて直したいこと)';
+  input.onkeydown = async (e) => {
+    if (e.key !== 'Enter' || e.isComposing || !input.value.trim()) return;
+    await post('/inbox/reply', { threadId: t.id, text: input.value.trim() });
+    input.value = '';
+    void refreshInbox();
+  };
+  actions.appendChild(input);
+  if (t.unread) {
+    const btn = document.createElement('button');
+    btn.className = 'tab';
+    btn.textContent = '既読';
+    btn.onclick = async () => { await post('/inbox/read', { threadId: t.id }); void refreshInbox(); };
+    actions.appendChild(btn);
+  }
+  div.appendChild(actions);
+  return div;
+}
+
+async function refreshInbox() {
+  try {
+    const d = await (await post('/inbox', {})).json();
+    inboxCountEl.textContent = d.unread > 0 ? String(d.unread) : '';
+    if (!inboxTab) return;
+    inboxEl.replaceChildren();
+    if ((d.threads ?? []).length === 0) {
+      const e = document.createElement('div'); e.className = 'tnote'; e.textContent = 'まだ報告はないよ'; inboxEl.appendChild(e);
+      return;
+    }
+    for (const t of d.threads) inboxEl.appendChild(threadCard(t));
+  } catch { /* 次の更新で */ }
+}
+
 async function refreshBoard() {
   if (boardBusy) return; // 取得が重ならないように(SSE 連打 + 定期更新)
   boardBusy = true;

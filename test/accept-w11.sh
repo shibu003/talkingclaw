@@ -73,7 +73,7 @@ lastUser "$BASE" | grep -q "talkingclaw" && ok "追加した語が反映" || ng 
 echo "[6] 作業係が独立した話者として在室(別の声)"
 curl -s "$B/participants?token=$TOKEN" | grep -q '作業係' && ok "作業係が在室" || ng "作業係がいない"
 grep -q "workerParticipant" src/config.ts && grep -q "helperPid" src/room.ts && ok "実況は作業係から発話" || ng "未配線"
-grep -q "BOILERPLATE" src/room.ts && ok "定型文(skipped: 等)は無音でテキストのみ" || ng "定型文フィルタなし"
+grep -q "途中経過は会話ストリームに流さない" src/room.ts && ok "W12: 途中経過は声に出さず報告スレッドへ(定型文フィルタは不要になった)" || ng "実況がまだ声に出る"
 
 echo "[7] 確認・取消・単語学習のツールが会話 Brain に登録されている"
 grep -q "'cancel_task'" src/room.ts && grep -q "mcp__office__cancel_task" src/room.ts && ok "cancel_task" || ng "cancel_task なし"

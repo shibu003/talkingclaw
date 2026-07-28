@@ -508,6 +508,52 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
   return { targets: registry.all().map((p) => p.participantId), routing: { method: 'default' } };
 }
 
+// ---- W12: 報告ブロックの解析。テンプレを守っていれば構造化、守っていなければ notes から組み立てる ----
+function parseReport(raw: string, task: OfficeTask): TaskReport {
+  const now = new Date().toISOString();
+  const body = raw.includes('報告:') ? raw.slice(raw.lastIndexOf('報告:') + 3) : '';
+  const section = (name: string): string[] => {
+    const re = new RegExp(`^\\s*${name}\\s*[:：]\\s*(.*)$`, 'm');
+    const m = re.exec(body);
+    if (!m) return [];
+    const inline = m[1].trim();
+    const rest = body.slice(m.index + m[0].length).split('\n');
+    const items: string[] = [];
+    if (inline) items.push(inline);
+    for (const line of rest) {
+      const t = line.trim();
+      if (!t) continue;
+      if (/^[^\s-].*[:：]\s*$/.test(t) || /^(見出し|できるようになったこと|確かめかた|やらなかったこと|技術メモ|さわったもの)\s*[:：]/.test(t)) break;
+      if (/^[-・*]\s*/.test(t) || /^\d+[.、)]\s*/.test(t)) items.push(t.replace(/^[-・*]\s*/, '').replace(/^\d+[.、)]\s*/, ''));
+      else break;
+    }
+    return items.filter(Boolean);
+  };
+
+  const headline = section('見出し')[0] ?? '';
+  const can = section('できるようになったこと');
+  const check = section('確かめかた');
+  const touched = (section('さわったもの')[0] ?? '')
+    .split(/[,、]/).map((x) => x.trim().replace(/^`|`$/g, '')).filter(Boolean);
+
+  if (headline && can.length > 0) {
+    return {
+      headline, can, check: check.length > 0 ? check : ['作業係が確かめかたを書き忘れました。聞き直してください'],
+      skipped: section('やらなかったこと'), memo: section('技術メモ'),
+      touched: touched.length > 0 ? touched : task.artifacts, at: now, template: true,
+    };
+  }
+  // フォールバック: テンプレ違反。報告が無いより不完全でも出す(違反自体が見えるように)
+  const plain = task.notes.filter((n) => !/^(skipped:|add when|成果物[:：])/.test(n.trim()));
+  return {
+    headline: task.request.slice(0, 40),
+    can: plain.slice(0, 3),
+    check: ['作業係が確かめかたを書き忘れました。聞き直してください'],
+    skipped: task.notes.filter((n) => /^(skipped:|やらなかった)/.test(n.trim())),
+    memo: [], touched: task.artifacts, at: now, template: false,
+  };
+}
+
 // ---- W11-2: 認識テキストの補正辞書(誤変換をここで直してから部屋に流す)----
 const DICT_PATH = join(homedir(), '.talkingclaw', 'dictionary.json');
 let dictCache: { at: number; map: Record<string, string> } = { at: 0, map: {} };
@@ -837,6 +883,20 @@ function loadWorkerMcp(): { mcpServers: Record<string, unknown>; allow: string[]
 type OfficeTask = {
   id: number; agent: string; agentName: string; request: string; project?: string;
   status: 'queued' | 'working' | 'done' | 'failed' | 'interrupted'; notes: string[]; artifacts: string[]; at: string;
+  // W12: 報告 INBOX。1 タスク = 1 スレッド。報告はここに構造化して置き、会話ストリームには流さない
+  report?: TaskReport;
+  unread?: boolean;
+  replies?: { at: string; text: string }[]; // このスレッドへの追加依頼
+};
+type TaskReport = {
+  headline: string;      // 結果を 1 行
+  can: string[];         // できるようになったこと(ユーザー目線)
+  check: string[];       // 確かめかた(必須)
+  skipped: string[];     // やらなかったこと
+  memo: string[];        // 技術メモ(読み上げない)
+  touched: string[];     // さわったもの
+  at: string;
+  template: boolean;     // worker がテンプレを守ったか(false = フォールバック生成)
 };
 const officeTasks: OfficeTask[] = loadTasks(); // W9-1: 台帳は再起動を跨ぐ
 let taskSeq = officeTasks.reduce((m, t) => Math.max(m, t.id), 0);
@@ -939,6 +999,7 @@ import { z } from 'zod';
 let chloePid: string | null = null;
 let chloeResetWorker: (() => void) | null = null;
 let chloeResetChat: (() => void) | null = null;
+let chloeReply: ((task: OfficeTask, text: string) => void) | null = null;
 // W9-2: 本番は 180s(sonnet + delegate の長 turn を誤殺しない)。テストは短縮して回転を速く
 // テスト時も「通常応答(context 注入込みで 20-40s)は切らず、ハングだけ捕まえる」値にする
 const ASK_GUARD_MS = Number(process.env.ASK_GUARD_MS ?? (process.env.ROOM_TEST_HOOKS === '1' ? 90_000 : 180_000));
@@ -983,9 +1044,6 @@ function startChloe(): void {
     }
   }
 
-  // 実況として声に出す価値がない定型文(画面には残す)
-  const BOILERPLATE = /^(skipped:|add when|成果物[:：]|補足[:：]|注意[:：])/;
-
   // --- W8-2: worker(実作業係)。会話 Brain とは別セッションで並行動作 ---
   mkdirSync(config.agent.cwd, { recursive: true });
   let worker: Brain | null = null;
@@ -1005,6 +1063,30 @@ function startChloe(): void {
     return task;
   }
   planDelegate = delegate; // 相談がまとまった時の登録先(confirm_plan / POST /plan から使う)
+
+  // W12: 未読が溜まったことを 1 回だけ知らせる(既読か新規報告まで再通知しない)
+  let unreadNotified = 0;
+  const notifyUnread = (): void => {
+    const n = officeTasks.filter((t) => t.unread).length;
+    if (n === 0) { unreadNotified = 0; return; }
+    if (n <= unreadNotified) return;
+    unreadNotified = n;
+    if (n >= 2) {
+      enqueueJob({
+        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+        text: `報告が ${n} 件たまってるよ。読んでほしい時は「報告読んで」って言ってね。`,
+      });
+    }
+  };
+
+  // W12: 報告への返信 = そのスレッドの続き(worker には前回の作業として文脈を渡す)
+  chloeReply = (task, text) => {
+    task.status = 'queued';
+    task.notes.push(`【追加依頼】${text}`);
+    taskQueue.push(task);
+    saveTasks();
+    void pumpTasks();
+  };
 
   chloeResetChat = () => {
     for (const [c, cs] of channelState) {
@@ -1030,6 +1112,10 @@ function startChloe(): void {
         const task = taskQueue.shift()!;
         task.status = 'working';
         saveTasks();
+        enqueueJob({
+          pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+          text: `${task.request.slice(0, 20)}、始めるね。`,
+        });
         await runTask(task);
         saveTasks();
       }
@@ -1090,12 +1176,7 @@ function startChloe(): void {
   const workerSay = (task: OfficeTask) => (sentence: string): void => {
     task.notes.push(sentence);
     while (task.notes.length > 20) task.notes.shift();
-    // W11-3: 実況は「作業係」の声で。定型文(skipped: 等)は画面だけに出して読み上げない
-    if (BOILERPLATE.test(sentence.trim())) {
-      store.append({ type: 'agent_speech', from: helperPid!, name: helper?.assignedName ?? '作業係', text: sentence, audio: null, turnId: 'none', channel: 'work' });
-      return;
-    }
-    enqueueJob({ pid: helperPid!, priority: 2, kind: 'speech', text: sentence, turnId: 'none', epoch: speechEpoch, channel: 'work' });
+    // W12: 途中経過は会話ストリームに流さない。スレッド(notes)に溜めて INBOX で読む
   };
 
   async function runTask(task: OfficeTask): Promise<void> {
@@ -1107,7 +1188,7 @@ function startChloe(): void {
       const ext = loadWorkerMcp();
       const allowList = [...(config.agent.allowedTools as unknown as string[]), ...ext.allow];
       const opts = {
-        systemPrompt: config.workerPrompt, model: workerSettings.workerModel,
+        systemPrompt: `${config.workerPrompt}\n${config.reportTemplate}`, model: workerSettings.workerModel,
         allowedTools: allowList,
         // W8-8/W9-1: allow-list 外は自動拒否でなく声で確認。Bash は内容が安全なら自動許可
         canUseTool: async (name: string, input: Record<string, unknown>) => {
@@ -1136,7 +1217,10 @@ function startChloe(): void {
       const brief = others.length > 0
         ? `(同じ作業場で他にも依頼が並んでる: ${others.map((t) => t.request.slice(0, 40)).join(' / ')}。同じファイルを壊し合わないよう、既存の変更を確認してから作業して)\n`
         : '';
-      const askP = worker.ask(brief + task.request, workerSay(task));
+      const followUp = (task.replies ?? []).length > 0
+        ? `(この作業の続き。前回の報告: ${task.report?.headline ?? '(なし)'})\n追加の依頼: ${task.replies![task.replies!.length - 1].text}\n`
+        : '';
+      const askP = worker.ask(brief + followUp + task.request, workerSay(task));
       const result = await Promise.race([askP, timeoutMarker(600_000)]);
       if (result === TIMEOUT) {
         await worker.interrupt().catch(() => {});
@@ -1149,11 +1233,15 @@ function startChloe(): void {
       task.status = 'done';
       task.artifacts.push(...collectArtifacts(String(result), cwd));
       await gitAutoCommit(task, cwd, workerSay(task)); // 出来上がりを git に残す(既定はローカル commit まで)
-      // W10-4: まとめてでなく、終わったものから個別に報告する
-      const head = task.request.slice(0, 24);
+      // W12: 報告本体は INBOX スレッドへ。会話に出すのは 1 文だけ
+      task.report = parseReport(String(result), task);
+      task.unread = true;
+      saveTasks();
+      notifyUnread();
+      const firstCan = task.report.can[0] ? `${task.report.can[0]} ` : '';
       enqueueJob({
         pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
-        text: task.artifacts.length > 0 ? `${head}、できたよ。画面に出しておくね。` : `${head}、できたよ。`,
+        text: `${task.report.headline}、できたよ。${firstCan}確かめかたは報告に入れておくね。`,
       });
     } catch (error) {
       task.status = 'failed';
@@ -1186,6 +1274,31 @@ function startChloe(): void {
             planUnderDiscussion: plan, // 相談中の案(まだ着手していない)
             tasks, people, userScreen: uiState, engine: engineState, activeChannel,
           }, null, 1) }] };
+        },
+      ),
+      tool(
+        'read_inbox',
+        '作業係からの報告(未読)を読む。「報告読んで」「何ができた?」と聞かれたら使う。読み上げる時は見出しとできるようになったこと、確かめかたを伝える。',
+        {},
+        async () => {
+          const threads = officeTasks.filter((t) => t.report && t.unread);
+          if (threads.length === 0) return { content: [{ type: 'text' as const, text: '未読の報告はない。そう伝えて。' }] };
+          const list = threads.slice(0, 3).map((t) => ({
+            threadId: t.id, 依頼: t.request.slice(0, 60), 依頼時刻: t.at.slice(11, 16),
+            見出し: t.report!.headline, できるようになったこと: t.report!.can,
+            確かめかた: t.report!.check, やらなかったこと: t.report!.skipped,
+          }));
+          return { content: [{ type: 'text' as const, text: `未読 ${threads.length} 件。1 件ずつ短く伝えて、読んだら mark_read を呼ぶこと。\n${JSON.stringify(list, null, 1)}` }] };
+        },
+      ),
+      tool(
+        'mark_read',
+        '報告を読み終えたら既読にする。read_inbox で伝えた分だけ呼ぶ。',
+        { threadId: z.number() },
+        async ({ threadId }) => {
+          const t = officeTasks.find((x) => x.id === threadId);
+          if (t) { t.unread = false; saveTasks(); }
+          return { content: [{ type: 'text' as const, text: t ? '既読にした。' : 'そのスレッドは無い。' }] };
         },
       ),
       tool(
@@ -1278,7 +1391,7 @@ function startChloe(): void {
       ...(workerSettings.chatEffort ? { effort: workerSettings.chatEffort } : {}),
       mcpServers: { office: officeServer } as Record<string, unknown>,
       allowedTools: channel === 'work'
-        ? [...workTools, 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']
+        ? [...workTools, 'mcp__office__read_inbox', 'mcp__office__mark_read', 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']
         : ['mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word'],
       maxTurns: 8, // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
       // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
@@ -1684,6 +1797,32 @@ const server = createServer(async (req, res) => {
     uiState = { preview: body.preview ? String(body.preview).slice(0, 200) : undefined,
                 board: body.board === true, at: new Date().toISOString() };
     return json(res, 200, { ok: true });
+  }
+
+  if (path === '/inbox') {
+    const threads = officeTasks.filter((t) => t.report).slice(-30).reverse()
+      .sort((a, b) => Number(b.unread ?? false) - Number(a.unread ?? false));
+    return json(res, 200, { unread: threads.filter((t) => t.unread).length, threads });
+  }
+
+  if (path === '/inbox/read') {
+    const t = officeTasks.find((x) => x.id === Number(body.threadId));
+    if (!t) return json(res, 400, { error: 'そのスレッドは見つかりません' });
+    t.unread = false;
+    saveTasks();
+    return json(res, 200, { ok: true });
+  }
+
+  if (path === '/inbox/reply') {
+    const t = officeTasks.find((x) => x.id === Number(body.threadId));
+    const text = String(body.text ?? '').trim();
+    if (!t) return json(res, 400, { error: 'そのスレッドは見つかりません' });
+    if (!text) return json(res, 400, { error: '内容が空です' });
+    t.replies = [...(t.replies ?? []), { at: new Date().toISOString(), text }];
+    t.unread = false;
+    chloeReply?.(t, text); // 同じスレッドの続きとして作業係へ
+    saveTasks();
+    return json(res, 200, { ok: true, threadId: t.id });
   }
 
   if (path === '/tasks') {

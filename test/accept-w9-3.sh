@@ -27,7 +27,7 @@ grep -q "同じファイルを壊し合わないよう" src/room.ts && ok "待�
 grep -q "workerCwd !== cwd" src/room.ts && ok "同一 project は worker セッション継続 / 切替時のみ再生成" || ng "セッション継続なし"
 
 echo "[4] W10-4: 完了ごとの個別報告"
-grep -q "できたよ。画面に出しておくね" src/room.ts && ok "task done で個別報告" || ng "報告なし"
+grep -q "確かめかたは報告に入れておくね" src/room.ts && ok "task done で個別報告(W12: 報告 INBOX へ誘導)" || ng "報告なし"
 
 echo "[5] 会話モデル / 会話 effort が設定できる(雑談側も選べる)"
 R=$(curl -s -X POST "$B/settings" -H "$H" -H "$T" -d '{"chatModel":"fable","chatEffort":"high"}')

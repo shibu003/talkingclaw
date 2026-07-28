@@ -277,6 +277,7 @@ async function showWho(): Promise<void> {
 }
 
 const HELP = `${c.bold('コマンド')}
+  /inbox           作業係からの報告(read <id> / reply <id> <内容>)
   /tasks           作業ボード(誰が何をどこまで)
   /who             在室者
   /settings        設定表示  (/settings chatModel haiku のように変更も)
@@ -339,6 +340,29 @@ async function main(): Promise<void> {
       console.log(`${c.you('あなた(声)')} ${text}`);
       stopAudio();
       await api('/chat', { text }).catch(() => ({}));
+      continue;
+    }
+    if (line === '/inbox' || line === '/報告') {
+      const d = await api('/inbox', {}) as { unread?: number; threads?: Record<string, unknown>[] };
+      const threads = d.threads ?? [];
+      if (threads.length === 0) { console.log(c.dim('  まだ報告はないよ')); continue; }
+      console.log(c.dim(`  未読 ${d.unread ?? 0} 件`));
+      for (const t of threads.slice(0, 5)) {
+        const r = (t.report ?? {}) as Record<string, string[] | string>;
+        console.log(`  ${t.unread ? c.bold('●') : ' '} ${c.agent(String(r.headline ?? t.request))}`);
+        console.log(c.dim(`     依頼: ${String(t.request).slice(0, 50)}(${String(t.at).slice(11, 16)})`));
+        for (const x of (r.can as string[] ?? [])) console.log(`     ・${x}`);
+        const check = (r.check as string[] ?? []);
+        if (check.length > 0) { console.log(c.sys('     確かめかた:')); for (const x of check) console.log(`       ${x}`); }
+        for (const p of (r.touched as string[] ?? [])) console.log(c.dim(`     📦 ${p}`));
+      }
+      console.log(c.dim('  既読: /inbox read <id> / 返信: /inbox reply <id> <内容>'));
+      continue;
+    }
+    if (line.startsWith('/inbox ')) {
+      const [, sub, id, ...rest] = line.split(/\s+/);
+      if (sub === 'read') { await api('/inbox/read', { threadId: Number(id) }); console.log(c.dim('  既読にしたよ')); }
+      else if (sub === 'reply') { await api('/inbox/reply', { threadId: Number(id), text: rest.join(' ') }); console.log(c.dim('  返信を作業係に渡したよ')); }
       continue;
     }
     if (line === '/tasks') { await showTasks().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
