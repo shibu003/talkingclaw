@@ -1805,10 +1805,49 @@ const server = createServer(async (req, res) => {
     return json(res, 200, { unread: threads.filter((t) => t.unread).length, threads });
   }
 
+  // 台帳の手入れ(ユーザーが自分で消す・直す)。要らなくなった依頼や、
+  // 言い間違いで登録された依頼を画面から片付けられるようにする。動き出したものは触らない。
+  if (path === '/task') {
+    const action = String(body.action ?? '');
+    const t = officeTasks.find((x) => x.id === Number(body.taskId));
+    if (!t) return json(res, 400, { error: 'その作業は見つかりません' });
+    if (action === 'delete') {
+      if (t.status === 'working') return json(res, 409, { error: 'いま動いているので消せません(先に取り消してね)' });
+      officeTasks.splice(officeTasks.indexOf(t), 1);
+      saveTasks();
+      return json(res, 200, { ok: true });
+    }
+    if (action === 'cancel') {
+      if (t.status !== 'queued') return json(res, 409, { error: 'まだ始まっていないものだけ取り消せます' });
+      t.status = 'failed';
+      t.notes.push('ユーザーの指示で取り消し');
+      saveTasks();
+      return json(res, 200, { ok: true });
+    }
+    if (action === 'edit') {
+      const text = String(body.text ?? '').trim();
+      if (!text) return json(res, 400, { error: '内容が空です' });
+      if (t.status !== 'queued') return json(res, 409, { error: 'まだ始まっていないものだけ直せます' });
+      t.request = text.slice(0, TEXT_MAX);
+      saveTasks();
+      return json(res, 200, { ok: true });
+    }
+    return json(res, 400, { error: 'action は delete / cancel / edit です' });
+  }
+
   if (path === '/inbox/read') {
     const t = officeTasks.find((x) => x.id === Number(body.threadId));
     if (!t) return json(res, 400, { error: 'そのスレッドは見つかりません' });
     t.unread = false;
+    saveTasks();
+    return json(res, 200, { ok: true });
+  }
+
+  // 報告を消す(読み終わって要らないもの)。作業の記録ごと台帳から外す
+  if (path === '/inbox/delete') {
+    const t = officeTasks.find((x) => x.id === Number(body.threadId));
+    if (!t) return json(res, 400, { error: 'そのスレッドは見つかりません' });
+    officeTasks.splice(officeTasks.indexOf(t), 1);
     saveTasks();
     return json(res, 200, { ok: true });
   }

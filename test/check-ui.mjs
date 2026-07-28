@@ -56,6 +56,42 @@ if (/\.style\.display\s*=/.test(js.replace(/noticeEl\.style\.display\s*=\s*'bloc
   } else console.log('  ✅ 進捗の帯は件数どおりに出る(0 件なら出ない)');
 }
 
+// 会話の描画: 発話を連結せず、依頼(turnId)ごとに束ねているか
+{
+  if (/\.textContent \+= /.test(js)) {
+    console.log('  ❌ 発話の連結(textContent +=)が戻ってる — 1 発話 = 1 行にして'); fail = 1;
+  }
+  const body = js.slice(js.indexOf('// >>> turnHostKey'), js.indexOf('// <<< turnHostKey'));
+  const turnHostKey = new Function(`${body}; return turnHostKey;`)();
+  const have = new Set(['T1']);
+  const cases = [
+    ['依頼はブロックを作る', { type: 'user_speech', turnId: 'T9' }, 'T9'],
+    ['返答は既存ブロックに入る', { type: 'agent_speech', turnId: 'T1' }, 'T1'],
+    ['未知の turn への返答は根', { type: 'agent_speech', turnId: 'T5' }, null],
+    ["実況(none)は根", { type: 'agent_speech', turnId: 'none' }, null],
+    ['turnId 無しは根', { type: 'agent_speech' }, null],
+  ];
+  let bad = 0;
+  for (const [what, ev, want] of cases) {
+    const got = turnHostKey(ev, have);
+    if (got !== want) { console.log(`  ❌ ${what}: ${got} ≠ ${want}`); bad = 1; fail = 1; }
+  }
+  if (!bad) console.log('  ✅ 発話は連結されず、返答は依頼ブロックに・実況は根に振り分く');
+}
+
+// 成果物 = 見て分かるものだけ(Claude の Artifact と同じ定義)。ソースは「さわったもの」で成果物ではない
+{
+  const body = js.slice(js.indexOf('// >>> artifactKind'), js.indexOf('// <<< artifactKind'));
+  const { artifactKind, isViewable } = new Function(`${body}; return { artifactKind, isViewable };`)();
+  const cases = [['a/b.PNG', 'image'], ['x.svg', 'image'], ['i.html', 'page'], ['doc.pdf', 'page'],
+    ['src/room.ts', 'file'], ['r.js', 'file'], ['README', 'file'], ['notes.md', 'file']];
+  const bad = cases.filter(([p, want]) => artifactKind(p) !== want);
+  if (bad.length > 0) { console.log('  ❌ 成果物の振り分けがおかしい: ' + bad.map((b) => b[0]).join(', ')); fail = 1; }
+  else if (isViewable('src/room.ts') || !isViewable('shot.png') || !isViewable('out.html')) {
+    console.log('  ❌ 「見て分かるものだけ成果物」の判定が壊れてる'); fail = 1;
+  } else console.log('  ✅ 成果物は「見て分かるもの」だけ(ソースは成果物に出さない)');
+}
+
 // 読みやすさ: 文字と背景のコントラストが WCAG AA(4.5:1)を割ってないか
 const varOf = (name) => html.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, 'i'))?.[1];
 const lum = (hex) => {

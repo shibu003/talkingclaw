@@ -142,7 +142,16 @@
                  padding: 2px 9px; border-radius: 999px; background: #3a3052; margin-right: 8px; }
   .task .tstat.done { background: #2f6440; } .task .tstat.failed { background: #7a3345; }
   .task .tnote { display: block; margin: 4px 0 0 4px; padding-left: 10px; border-left: 2px solid var(--line);
-                 color: var(--muted); font-size: var(--fs-small); line-height: 1.7; }
+                 color: var(--muted); font-size: var(--fs-small); line-height: 1.7;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task .treq { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  /* 自分で片付けるためのボタン(直す・やめる・消す)*/
+  .tacts { display: flex; gap: 6px; margin-top: 7px; }
+  .tact { background: transparent; border: 1px solid var(--line); color: var(--muted);
+          border-radius: 999px; padding: 3px 11px; font-size: 12.5px; line-height: 1.5; }
+  .tact:hover { border-color: var(--accent); color: var(--text); }
+  .tedit { width: 100%; background: var(--surface-2); border: 1px solid var(--accent); color: var(--text);
+           border-radius: var(--r-sm); padding: 6px 10px; font-size: var(--fs-small); }
   .task .tmeta { color: var(--muted); font-size: var(--fs-small); margin-left: 6px; }
   .task .tbar { display: block; height: 4px; margin-top: 7px; border-radius: 999px; background: #2c2440; overflow: hidden; }
   .task .tbar i { display: block; height: 100%; width: 100%; border-radius: 999px; }
@@ -159,23 +168,34 @@
     border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 10px; }
   #settings .tnote { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--surface-2); }
 
-  /* ---- 会話ログ ---- */
-  #log { flex: 1; overflow-y: auto; padding: 18px var(--pad); scroll-padding-bottom: 16px;
-         display: flex; flex-direction: column; gap: 14px; }
-  .msg { max-width: min(86%, var(--measure)); padding: 13px 17px; border-radius: var(--r-lg);
-         line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .user { align-self: flex-end; background: #4d3f7a; border-bottom-right-radius: 5px; }
-  .agent { align-self: flex-start; background: var(--surface-2); border-bottom-left-radius: 5px; }
-  .agent.speaking { box-shadow: 0 0 0 1px var(--accent), 0 0 20px -6px var(--accent); }
-  .agent .who { display: block; margin-bottom: 5px; font-size: var(--fs-ui); font-weight: 700;
-                letter-spacing: .04em; color: var(--accent); line-height: 1.4; }
-  .user .to { display: block; margin-top: 5px; font-size: 12.5px; color: var(--muted); text-align: right; line-height: 1.4; }
+  /* ---- 会話ログ: 吹き出しをやめ、発話 1 件 = 1 行にする ----
+     ① 文を連結しない(どの文がいつ話されたかが残る)
+     ② .turn = 1 つの依頼とその返答のまとまり。左の罫線で「どこへの返答か」が見える
+     ③ どの依頼にも属さない発話(実況・警告)は罫線の外に出す = 文脈が混ざらない */
+  #log { flex: 1; min-height: 0; overflow-y: auto; padding: 18px var(--pad); scroll-padding-bottom: 16px;
+         display: flex; flex-direction: column; }
+  .turn { display: flex; flex-direction: column; margin: 6px 0;
+          padding-left: 13px; border-left: 2px solid var(--line); }
+  .turn:hover { border-left-color: var(--accent); }
+  /* 話者の見出し(時刻 + 名前)。連続する発話ではこれを出さず、行だけを積む */
+  .spk { display: flex; align-items: baseline; gap: 9px; margin: 13px 0 3px; }
+  .turn > .spk:first-child { margin-top: 2px; }
+  .spk .tm { font-size: var(--fs-small); line-height: 1.5; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .spk .nm { font-size: var(--fs-ui); line-height: 1.5; font-weight: 700; letter-spacing: .04em; color: var(--accent); }
+  .spk .to { font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
+  .spk.me .nm { color: #9dc4ff; }
+  .tx { max-width: var(--measure); margin-left: 3.7em; line-height: 1.85;
+        white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* 読み上げ中はその 1 行だけ光る(どこを喋っているかが分かる)。outline なので行がずれない */
+  .tx.speaking { outline: 1px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+  .tx a { color: var(--accent); }
+  .tx code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .93em; }
   /* システム行 = 話者の発言ではない案内。区切りとして左右に線を引く */
   .sys { align-self: center; display: flex; align-items: center; gap: 10px; width: 100%;
-         margin: 2px 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.6; text-align: center; }
+         margin: 6px 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.6; text-align: center; }
   .sys::before, .sys::after { content: ""; flex: 1; height: 1px; background: var(--line); }
   .sys a { color: var(--accent); }
-  .interim { align-self: flex-end; max-width: min(84%, var(--measure)); padding: 0 16px;
+  .interim { margin: 4px 0 0 3.7em; max-width: var(--measure);
              color: var(--muted); font-size: 15px; line-height: 1.8; }
 
   /* ---- 入力 ---- */
@@ -214,8 +234,13 @@
   .thread input { flex: 1; min-width: 0; background: var(--surface-2); border: 1px solid var(--line);
                   color: var(--text); border-radius: var(--r-sm); padding: 7px 12px; font-size: var(--fs-small); }
   .thread input:focus { border-color: var(--accent); outline: none; }
-  #inboxCount:not(:empty) { background: var(--accent); color: var(--accent-ink); border-radius: 999px;
-                            padding: 0 7px; font-size: 12.5px; font-weight: 700; }
+  /* 未読の報告は赤丸 + 件数。タブにも 📋 にも同じ形で出す(見落とさないように)*/
+  #inboxCount:not(:empty), .badge:not(:empty) {
+    display: inline-block; min-width: 19px; padding: 0 5px; border-radius: 999px;
+    background: #e5484d; color: #fff; font-size: 12.5px; font-weight: 700;
+    line-height: 19px; text-align: center; }
+  .hbtn { position: relative; }
+  #boardBadge:not(:empty) { position: absolute; top: 0; right: 0; transform: translate(35%, -25%); }
   #preview { display: none; flex-direction: column; margin: 0 var(--pad) 8px; border: 1px solid var(--line);
              border-radius: var(--r-md); overflow: hidden; background: var(--surface); height: 42dvh; flex: none; }
   #preview.open { display: flex; }
@@ -223,6 +248,21 @@
                     font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
   #preview .phead a { color: var(--accent); margin-left: auto; }
   #preview iframe { flex: 1; border: 0; background: #fff; width: 100%; }
+
+  /* ---- 成果物: 会話の中に絵として出す / 右レーンに一覧する ----
+     「どんなものができたのか」を path の羅列ではなく現物で見せる */
+  .card { margin: 10px 0 10px 3.7em; max-width: var(--measure); padding: 12px 14px;
+          background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); }
+  .card .chead { font-size: var(--fs-ui); font-weight: 700; line-height: 1.6; }
+  .card .cwhat { margin-top: 3px; color: var(--muted); font-size: var(--fs-small); line-height: 1.7; }
+  .shot { display: block; width: 100%; max-height: 190px; object-fit: contain; object-position: left;
+          margin-top: 10px; border-radius: var(--r-sm); background: #fff; cursor: zoom-in; }
+  .files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .files a { display: inline-block; padding: 5px 12px; border-radius: 999px; background: var(--surface-2);
+             border: 1px solid var(--line); color: var(--text); font-size: var(--fs-small); line-height: 1.5;
+             text-decoration: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .files a:hover { border-color: var(--accent); }
+
 
   /* ---- 三分割レイアウト: 左=ナビ / 中央=会話 / 右=作業スペース ----
      広げるためではなく「会話を消さない」ための配置(CLAUDE.md ルール 2)。
@@ -238,16 +278,22 @@
                                 "nav log side"  "nav foot side"; }
     header { grid-area: head; } #notice { grid-area: note; } #plan { grid-area: plan; }
     #log { grid-area: log; } footer { grid-area: foot; }
+    /* 右レーンは常設しない。プレビューを開いた時と 📋 で呼んだ時だけ現れる */
+    body { grid-template-columns: 264px minmax(0, 1fr) 0; }
+    body.side-open { grid-template-columns: 264px minmax(0, 1fr) minmax(320px, 34%); }
     .lane { display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; padding: 12px 0; }
     .lane.nav { grid-area: nav; border-right: 1px solid var(--line); }
-    .lane.side { grid-area: side; border-left: 1px solid var(--line); }
-    .lane > * { margin: 0 var(--pad); width: auto; max-height: none; }
-    .lane #rooms, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
+    .lane.side { grid-area: side; border-left: 1px solid var(--line); display: none; }
+    body.side-open .lane.side { display: flex; }
+    .lane > * { margin: 0 var(--pad); width: auto; max-height: none; flex-shrink: 0; }
+    .lane #rooms, .lane #tasks, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
     #roster { padding: 0; }
     .lane.side #board { max-height: 55%; overflow-y: auto; flex-shrink: 0; }
     #preview { height: auto; flex: 1; min-height: 220px; }
     /* 部屋一覧と作業ボードが常設 = ヘッダのボタンは役目を終える(狭い画面では残る) */
-    #roomBtn, #boardBtn { display: none; }
+    #roomBtn { display: none; }   /* 部屋一覧は左に常設 */
+    .lane #rooms .tnote { display: none; }  /* 音声ヒントは狭い画面だけ(縦を詰める) */
+    .lane.nav .task .tnote { display: none; }  /* 実況は進捗の帯に出るので繰り返さない */
   }
 
   @media (max-width: 480px) { :root { --pad: 14px; } #roomBtn { max-width: 100%; } }
@@ -261,7 +307,7 @@
   </button>
   <div id="status">接続中…</div>
   <div class="tools">
-    <button id="boardBtn" class="hbtn" title="作業ボード" aria-expanded="false">📋</button>
+    <button id="boardBtn" class="hbtn" title="成果物と報告" aria-expanded="false">📋<span id="boardBadge" class="badge"></span></button>
     <button id="settingsBtn" class="hbtn" title="設定" aria-expanded="false">⚙</button>
   </div>
 </header>
@@ -270,7 +316,8 @@
 <!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
      display:contents になり、今までどおり会話の上に積まれる -->
 <div class="lane nav">
-<button id="progress" title="作業ボードを開く"></button>
+<button id="progress" title="進行中の作業を開く"></button>
+<div id="tasks" class="panel"><h2>進行中</h2><div id="boardList"></div></div>
 <div id="roster"></div>
 <div id="rooms" class="panel">
   <h2>部屋</h2>
@@ -288,7 +335,16 @@
 </div>
 <!-- 右レーン: 作業スペース(何ができたか)。中央の会話とは場所を取り合わない -->
 <div class="lane side">
-<div id="board" class="panel"><h2>作業ボード</h2><div class="tabs"><button id="tabWork" class="tab on">進行中</button><button id="tabInbox" class="tab">報告 <span id="inboxCount"></span></button></div><div id="boardList"></div><div id="inboxList" hidden></div></div>
+<div id="board" class="panel">
+  <div class="tabs">
+    <button id="tabArtifact" class="tab on">成果物</button>
+    <button id="tabInbox" class="tab">報告 <span id="inboxCount"></span></button>
+    <button id="tabHistory" class="tab" title="完了したものと全部の履歴">履歴</button>
+  </div>
+  <div id="artifactList"></div>
+  <div id="inboxList" hidden></div>
+  <div id="historyList" hidden></div>
+</div>
 <div id="preview">
   <div class="phead">
     <button id="previewClose" class="hbtn">✕</button>

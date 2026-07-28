@@ -17,7 +17,6 @@ let listening = false;
 let playing = false;
 let currentAudio = null; // 6C: barge-in の duck/pause 対象
 const audioQueue = [];    // { url, bubble, eventId }
-let lastBubble = null; // 連続する同一発話者の文を 1 吹き出しにまとめるための直前の吹き出し
 // 自己音声棄却(SP3 実機で誤認を確認): 直近 8s に再生したテキストと一致する認識結果は捨てる
 const recentPlayed = [];
 function rememberPlayed(text) {
@@ -39,21 +38,82 @@ function isEcho(finalText) {
 function setStatus(t) { statusEl.textContent = t; }
 function notice(t) { noticeEl.style.display = 'block'; noticeEl.textContent = t; }
 
-function addBubble(cls, text, who) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + cls;
-  if (who) {
-    const label = document.createElement('span');
-    label.className = 'who';
-    label.textContent = who;
-    div.appendChild(label);
+// ---- 会話の描画: 発話 1 件 = 1 行。文を連結しない ----
+// 依頼(user_speech)は .turn ブロックを作り、同じ turnId の返答をその中に置く。
+// turnId が 'none'/未定義の発話(実況・警告)は根に置いて、返答の列に混ぜない。
+const turnBlocks = new Map(); // turnId → .turn 要素
+let lastGroup = null;         // 直前の話者グループ { host, from }
+const MAX_BLOCKS = 200;       // #log の直下に積む塊の上限(サーバ側 MAX_LOG=1000 に対応)
+
+// >>> turnHostKey(pure: test/check-ui.mjs から取り出して単体で検査する)
+// その発話をどのブロックに置くか。null = 根に置く(どの依頼にも属さない発話)
+function turnHostKey(ev, existing) {
+  const id = ev.turnId;
+  if (!id || id === 'none') return null;
+  if (ev.type === 'user_speech') return id;      // 依頼は必ずブロックを作る
+  return existing.has(id) ? id : null;           // 返答は既にある依頼にだけぶら下がる
+}
+// <<< turnHostKey
+
+function turnHost(ev) {
+  const key = turnHostKey(ev, turnBlocks);
+  if (key === null) return log;
+  let el = turnBlocks.get(key);
+  if (el && log.contains(el)) return el;
+  el = document.createElement('div');
+  el.className = 'turn';
+  log.appendChild(el);
+  turnBlocks.set(key, el);
+  return el;
+}
+
+function timeLabel(iso) {
+  const d = new Date(iso ?? '');
+  return Number.isFinite(d.getTime()) ? `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` : '';
+}
+// 話者ごとに固定の色(誰の発言かを名前を読まずに判別できるように)
+function speakerHue(from) {
+  let h = 7;
+  for (const c of String(from)) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+
+// 1 発話 = 1 行。同じ話者が続く時は見出しを出さず行だけ足す(連結はしない)
+function addLine(host, from, name, text, at) {
+  if (!lastGroup || lastGroup.host !== host || lastGroup.from !== from || !log.contains(host)) {
+    const spk = document.createElement('div');
+    spk.className = 'spk' + (from === 'user' ? ' me' : '');
+    const tm = document.createElement('span');
+    tm.className = 'tm';
+    tm.textContent = timeLabel(at);
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = name || from;
+    if (from !== 'user') nm.style.color = `hsl(${speakerHue(from)} 72% 80%)`;
+    spk.append(tm, nm);
+    host.appendChild(spk);
+    lastGroup = { host, from, spk };
   }
-  const body = document.createElement('span');
-  body.textContent = text;
-  div.appendChild(body);
-  log.appendChild(div);
+  const line = document.createElement('div');
+  line.className = 'tx';
+  line.textContent = text;
+  host.appendChild(line);
+  trimLog();
   log.scrollTop = log.scrollHeight;
-  return { div, body };
+  return line;
+}
+
+// 古い塊から捨てる(読み上げ中・再生待ちの行は残す)。ブラウザ側に上限が無かった
+function trimLog() {
+  while (log.children.length > MAX_BLOCKS) {
+    const first = log.firstElementChild;
+    if (!first || first === interimEl) break;
+    if (first.classList.contains('speaking') || first.querySelector('.speaking')) break;
+    if (audioQueue.some((j) => j.bubble && first.contains(j.bubble))) break;
+    first.remove();
+  }
+  for (const [id, el] of turnBlocks) if (!log.contains(el)) turnBlocks.delete(id);
+  if (lastGroup && !log.contains(lastGroup.host)) lastGroup = null;
 }
 
 function addSys(text) {
@@ -61,18 +121,9 @@ function addSys(text) {
   div.className = 'sys';
   div.textContent = text;
   log.appendChild(div);
+  lastGroup = null;
+  trimLog();
   log.scrollTop = log.scrollHeight;
-}
-
-function agentBubble(from, name, text) {
-  if (lastBubble && lastBubble.from === from) {
-    lastBubble.body.textContent += ' ' + text;
-    log.scrollTop = log.scrollHeight;
-    return lastBubble;
-  }
-  const b = addBubble('agent', text, name || from);
-  lastBubble = { from, div: b.div, body: b.body };
-  return lastBubble;
 }
 
 // ---- 再生(audio 要素 = AEC 維持)----
@@ -92,7 +143,7 @@ function playNext() {
   const next = audioQueue.shift();
   if (!next) {
     playing = false;
-    document.querySelectorAll('.agent.speaking').forEach((el) => el.classList.remove('speaking'));
+    document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
     setTimeout(resumeMic, 500); // エコー尾の拾い込み防止
     return;
   }
@@ -178,21 +229,20 @@ function render(ev) {
     if (!isReplay) lastUserSpokeAt = performance.now();
     // 短い相槌(「うん」等)では溜まった読み上げを捨てない。長い発話 = 話題転換とみなして捨てる
     if (!isReplay && (ev.text ?? '').length >= 8) audioQueue.length = 0;
-    const b = addBubble('user', ev.text ?? '');
-    if (ev.targets && ev.targets.length > 0) {
+    addLine(turnHost(ev), 'user', 'あなた', ev.text ?? '', ev.at);
+    if (ev.targets && ev.targets.length > 0 && lastGroup) {
       const to = document.createElement('span');
       to.className = 'to';
       const names = ev.targets.map((t) => pidNames.get(t) ?? t);
       to.textContent = '→ ' + (ev.targets.length > 2 ? 'みんな' : names.join('・'));
-      b.div.appendChild(to);
+      lastGroup.spk.appendChild(to);
     }
-    lastBubble = null;
   } else if (ev.type === 'agent_speech') {
-    const b = agentBubble(ev.from, ev.name, ev.text ?? '');
+    const line = addLine(turnHost(ev), ev.from, ev.name, ev.text ?? '', ev.at);
     if (ev.audio && !isReplay) {
       // S6: 相槌(ack)は FIFO に入れない独立即時スロット — 再生中なら即スキップ
-      if (ev.filler === 'ack') maybePlayAck(ev.audio, b.div, ev.id, ev.text);
-      else enqueueAudio(ev.audio, b.div, ev.id, ev.turnId, ev.filler, ev.text);
+      if (ev.filler === 'ack') maybePlayAck(ev.audio, line, ev.id, ev.text);
+      else enqueueAudio(ev.audio, line, ev.id, ev.turnId, ev.filler, ev.text);
       // 6B: 本応答が来たら同 turn の未再生 filler を破棄(キャンセル 3 層目)
       if (!ev.filler && ev.turnId) {
         for (let i = audioQueue.length - 1; i >= 0; i--) {
@@ -202,7 +252,6 @@ function render(ev) {
     }
   } else if (ev.type === 'system' || ev.type === 'presence') {
     addSys((ev.name ? ev.name + ': ' : '') + (ev.text ?? ev.type));
-    lastBubble = null;
     if (ev.type === 'presence' && typeof refreshRoster === 'function') setTimeout(() => refreshRoster(), 100);
   }
   // 部屋で何か起きた = 作業の状態も変わっている可能性。進捗表示をすぐ取り直す
@@ -375,7 +424,7 @@ async function ensureVad() {
           currentAudio.pause();           // 再生中 = pause(S11)
           audioQueue.length = 0;          // 未再生 = 破棄
           playing = false;
-          document.querySelectorAll('.agent.speaking').forEach((el) => el.classList.remove('speaking'));
+          document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
           void post('/metrics', { kind: 'barge_in', ms: 0 });
           setStatus('どうぞ');
           resumeMic();                    // 発話を拾いに行く
@@ -445,7 +494,11 @@ const previewEl = document.getElementById('preview');
 const previewFrame = document.getElementById('previewFrame');
 const previewTitle = document.getElementById('previewTitle');
 const previewOpen = document.getElementById('previewOpen');
-document.getElementById('previewClose').onclick = () => { previewEl.classList.remove('open'); previewFrame.src = 'about:blank'; };
+document.getElementById('previewClose').onclick = () => {
+  previewEl.classList.remove('open');
+  previewFrame.src = 'about:blank';
+  if (sideView === 'artifact') openSide(false); // 見終わったら会話に場所を返す
+};
 // project = その作業がどのフォルダで行われたか(成果物はそこに出来る。既定は workspace)
 function showPreview(relPath, project) {
   void post('/ui-state', { preview: relPath, board: boardOpen }); // W10-2: クロエが画面を把握できるように
@@ -455,8 +508,54 @@ function showPreview(relPath, project) {
   previewOpen.href = url;
   previewFrame.src = url;
   previewEl.classList.add('open');
+  openSide(true);
 }
+
+// 右レーン(成果物・報告・履歴)は常設しない。呼ばれた時だけ出して、閉じたら会話に場所を返す
+function openSide(on) { document.body.classList.toggle('side-open', on); }
 const previewedTasks = new Set();
+
+// >>> artifactKind(pure: test/check-ui.mjs から取り出して単体で検査する)
+// 「見て分かるもの」だけを成果物と呼ぶ(Claude の Artifact と同じ考え方)。
+//   image = 会話にそのまま絵で出す / page = 開けば動くものとして見せる
+//   file  = ソースや設定。これは成果物ではなく「さわったもの」— 一覧には出さない
+function artifactKind(path) {
+  const ext = (String(path).match(/\.[a-z0-9]+$/i)?.[0] ?? '').toLowerCase();
+  if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.avif'].includes(ext)) return 'image';
+  if (['.html', '.htm', '.pdf'].includes(ext)) return 'page';
+  return 'file';
+}
+function isViewable(path) { return artifactKind(path) !== 'file'; }
+// <<< artifactKind
+
+// 成果物の URL(S9: token はイベントに載せず、ここで付ける)
+function fileUrl(relPath, project) {
+  return '/files/' + encodeURIComponent(relPath).replace(/%2F/g, '/')
+    + '?token=' + TOKEN + (project ? '&project=' + encodeURIComponent(project) : '');
+}
+
+// 画像の成果物。読めなければリンクに落とす(壊れた画像で場所を潰さない)
+function shotOf(relPath, project, onFail) {
+  const img = document.createElement('img');
+  img.className = 'shot';
+  img.loading = 'lazy';
+  img.alt = relPath;
+  img.src = fileUrl(relPath, project);
+  img.onerror = () => { img.remove(); onFail?.(); };
+  img.onclick = () => showPreview(relPath, project);
+  return img;
+}
+
+function fileChip(relPath, project, label) {
+  const a = document.createElement('a');
+  a.href = fileUrl(relPath, project);
+  a.textContent = (label ?? '📄 ') + relPath;
+  a.onclick = (e) => { e.preventDefault(); showPreview(relPath, project); };
+  return a;
+}
+
+// 記録に混ざる末尾の区切り(古い「成果物: a, b」行の名残)を落とす
+function cleanPath(raw) { return String(raw).replace(/[,、.]+$/, '').trim(); }
 
 // ---- パネル(部屋 / 作業ボード / 設定)。開くのは同時に 1 枚だけ ----
 // 広い画面では左右のレーンに常設される(CSS 側の三分割)ので、開閉は狭い画面だけの話になる。
@@ -466,6 +565,7 @@ const boardEl = document.getElementById('boardList');
 let boardOpen = wideLayout(); // 右レーン常設中は「開いている」— 描画を止めない
 const panels = {
   rooms: { el: document.getElementById('rooms'), btn: document.getElementById('roomBtn'), render: renderRooms },
+  tasks: { el: document.getElementById('tasks'), btn: document.getElementById('progress'), render: refreshBoard },
   board: { el: document.getElementById('board'), btn: document.getElementById('boardBtn'), render: refreshBoard },
   settings: { el: document.getElementById('settings'), btn: document.getElementById('settingsBtn'), render: renderSettings },
 };
@@ -477,10 +577,16 @@ function openPanel(name) {
     p.el.classList.toggle('open', on);
     p.btn.setAttribute('aria-expanded', String(on));
   }
-  boardOpen = wideLayout() || openedPanel === 'board';
+  boardOpen = wideLayout() || openedPanel === 'board' || openedPanel === 'tasks';
   if (openedPanel) void panels[openedPanel].render();
 }
-for (const [key, p] of Object.entries(panels)) p.btn.onclick = () => openPanel(key);
+for (const [key, p] of Object.entries(panels)) {
+  p.btn.onclick = () => {
+    // 広い画面の 📋 は「右レーンを出す/しまう」ボタン(パネル開閉は狭い画面の話)
+    if (key === 'board' && wideLayout()) return openSide(!document.body.classList.contains('side-open'));
+    openPanel(key);
+  };
+}
 // 幅が変わってレーン ⇄ 1 カラムを跨いだら、開閉状態を揃え直す(レイアウト自体は CSS が持つ)
 wideQuery.addEventListener('change', () => { openPanel(null); void refreshBoard(); });
 
@@ -569,7 +675,8 @@ async function enterRoom(next) {
   currentChannel = next;
   updateRoomBtn();
   log.replaceChildren();
-  lastBubble = null;
+  turnBlocks.clear();
+  lastGroup = null;
   audioQueue.length = 0;
   await showHistory(next); // 切り替えた部屋の直近の会話を読み込む(白紙にしない)
 }
@@ -581,11 +688,9 @@ async function showHistory(channel, lines = 40) {
     const rows = d.lines ?? [];
     if (rows.length === 0) { addSys('この部屋はまだ会話がないよ'); return; }
     addSys(`— ここまでが ${roomLabel(channel)} の直近の会話 —`);
-    for (const r of rows) {
-      if (r.who === 'あなた') addBubble('user', r.text);
-      else agentBubble('history:' + r.who, r.who, r.text);
-    }
-    lastBubble = null; // 履歴とライブの吹き出しをつなげない
+    // 履歴に turnId は残っていないので全部根に置く(推測でブロックを作らない)
+    for (const r of rows) addLine(log, r.who === 'あなた' ? 'user' : 'history:' + r.who, r.who, r.text, r.at);
+    lastGroup = null; // 履歴とライブの行をつなげない
     addSys('— ここから今 —');
     log.scrollTop = log.scrollHeight;
   } catch { addSys('履歴を読めなかった(📄 会話ログから見てね)'); }
@@ -677,8 +782,8 @@ function handleNav(text) {
     addSys('閉じたよ');
   } else if (intent.kind === 'rooms' || intent.kind === 'board' || intent.kind === 'settings') {
     // 「見せて」は常に開く方向(既に開いていても閉じない)。中身は開き直して最新に
-    showPanelForce(intent.kind);
-    addSys({ rooms: '部屋の一覧を出したよ', board: '作業ボードを出したよ', settings: '設定を出したよ' }[intent.kind]);
+    showPanelForce(intent.kind === 'board' ? 'tasks' : intent.kind);
+    addSys({ rooms: '部屋の一覧を出したよ', board: '進行中の作業を出したよ', settings: '設定を出したよ' }[intent.kind]);
   } else if (intent.kind === 'history') {
     void showHistory(currentChannel); // 別タブは音声だと出せない(ポップアップ扱い)ので、その場に読み込む
   } else if (intent.kind === 'archive' || intent.kind === 'logfile') {
@@ -829,7 +934,7 @@ async function planAction(action) {
 }
 
 const progressEl = document.getElementById('progress');
-progressEl.onclick = () => showPanelForce('board');
+progressEl.onclick = () => showPanelForce('tasks');
 function renderProgress(rows) {
   const s = progressSummary(rows);
   boardActive = s.counts.working + s.counts.queued > 0; // 動いている間は更新を速く
@@ -873,16 +978,99 @@ function renderProgress(rows) {
 // ---- W12: 報告 INBOX(board パネルの 2 タブ目)----
 const inboxEl = document.getElementById('inboxList');
 const inboxCountEl = document.getElementById('inboxCount');
-let inboxTab = false;
-document.getElementById('tabWork').onclick = () => switchBoardTab(false);
-document.getElementById('tabInbox').onclick = () => switchBoardTab(true);
-function switchBoardTab(toInbox) {
-  inboxTab = toInbox;
-  document.getElementById('tabWork').classList.toggle('on', !toInbox);
-  document.getElementById('tabInbox').classList.toggle('on', toInbox);
-  boardEl.hidden = toInbox;
-  inboxEl.hidden = !toInbox;
-  void (toInbox ? refreshInbox() : refreshBoard());
+const boardBadgeEl = document.getElementById('boardBadge');
+const artifactEl = document.getElementById('artifactList');
+const historyEl = document.getElementById('historyList');
+// 右レーンの 3 面。生きている一覧(成果物・報告)は短く保ち、
+// 済んだものと全部の履歴は「履歴」に集める(ここだけは長くなってよい)
+const SIDE_VIEWS = { artifact: [artifactEl, 'tabArtifact'], inbox: [inboxEl, 'tabInbox'], history: [historyEl, 'tabHistory'] };
+let sideView = 'artifact';
+let inboxTab = false; // 報告を見ている間は成果物一覧を描き直さない
+for (const [name, [, btnId]] of Object.entries(SIDE_VIEWS)) {
+  document.getElementById(btnId).onclick = () => switchBoardTab(name);
+}
+function switchBoardTab(view) {
+  sideView = typeof view === 'string' ? view : (view ? 'inbox' : 'artifact');
+  openSide(true);
+  inboxTab = sideView !== 'artifact';
+  for (const [name, [el, btnId]] of Object.entries(SIDE_VIEWS)) {
+    el.hidden = name !== sideView;
+    document.getElementById(btnId).classList.toggle('on', name === sideView);
+  }
+  void (sideView === 'inbox' ? refreshInbox() : refreshBoard());
+}
+
+// 履歴: 済んだ作業を新しい順に。生きている一覧から外したものはここで必ず見つかる
+function renderHistory(rows) {
+  if (sideView !== 'history') return;
+  const done = rows.filter((t) => t.status === 'done' || t.status === 'failed' || t.status === 'interrupted');
+  historyEl.replaceChildren();
+  if (done.length === 0) {
+    const e = document.createElement('div');
+    e.className = 'tnote';
+    e.textContent = 'まだ終わった作業はないよ';
+    historyEl.appendChild(e);
+    return;
+  }
+  for (const t of done) {
+    const div = document.createElement('div');
+    div.className = 'thread';
+    const h = document.createElement('h3');
+    h.textContent = (t.status === 'done' ? '✔ ' : '✖ ') + (t.report?.headline || (t.request ?? '').slice(0, 40));
+    div.appendChild(h);
+    const meta = document.createElement('div');
+    meta.className = 'req';
+    meta.textContent = `${t.agentName ?? ''} ・ ${elapsed(t.at)}前`;
+    div.appendChild(meta);
+    const files = document.createElement('div');
+    files.className = 'files';
+    for (const raw of t.artifacts ?? []) {
+      const path = cleanPath(raw);
+      if (path && isViewable(path)) files.appendChild(fileChip(path, t.project, artifactKind(path) === 'image' ? '🖼 ' : '▶ '));
+    }
+    if (files.children.length > 0) div.appendChild(files);
+    historyEl.appendChild(div);
+  }
+}
+
+// 右レーンの成果物一覧(新しい順)。画像はサムネを付けて「何ができたか」を見せる
+const ARTIFACT_SHOWN = 8; // レーンをスクロールさせないための上限
+const TASKS_SHOWN = 2;
+const THREADS_SHOWN = 4;
+function renderArtifacts(rows) {
+  if (inboxTab) return;
+  const items = [];
+  const seen = new Set();
+  for (const t of rows) {
+    for (const raw of t.artifacts ?? []) {
+      const path = cleanPath(raw);
+      const key = (t.project ?? '') + '|' + path;
+      if (!path || !isViewable(path) || seen.has(key)) continue; // 見て分かるものだけが成果物
+      seen.add(key);
+      items.push({ path, project: t.project });
+    }
+  }
+  artifactEl.replaceChildren();
+  if (items.length === 0) {
+    const e = document.createElement('div');
+    e.className = 'tnote';
+    e.textContent = 'まだ見える成果物はないよ(直したファイルは「報告」のさわったものに出るよ)';
+    artifactEl.appendChild(e);
+    return;
+  }
+  // 一覧にせずボタンを並べる(縦に伸ばさない = スクロールしない)
+  const box = document.createElement('div');
+  box.className = 'files';
+  for (const it of items.slice(0, ARTIFACT_SHOWN)) {
+    box.appendChild(fileChip(it.path, it.project, artifactKind(it.path) === 'image' ? '🖼 ' : '▶ '));
+  }
+  artifactEl.appendChild(box);
+  if (items.length > ARTIFACT_SHOWN) {
+    const more = document.createElement('div');
+    more.className = 'tnote';
+    more.textContent = `ほかに ${items.length - ARTIFACT_SHOWN} 件は「履歴」で見てね`;
+    artifactEl.appendChild(more);
+  }
 }
 
 function threadCard(t) {
@@ -890,7 +1078,10 @@ function threadCard(t) {
   const div = document.createElement('div');
   div.className = 'thread' + (t.unread ? ' unread' : '');
   const h = document.createElement('h3');
-  h.textContent = r.headline || t.request.slice(0, 40);
+  const stat = document.createElement('span');
+  stat.className = 'tstat ' + (t.status ?? 'done');
+  stat.textContent = STAT_LABEL[t.status] ?? '✔ 完了';
+  h.append(stat, document.createTextNode(r.headline || t.request.slice(0, 40)));
   div.appendChild(h);
   const req = document.createElement('div');
   req.className = 'req';
@@ -915,12 +1106,16 @@ function threadCard(t) {
     const s = document.createElement('div');
     s.className = 'sec';
     const b = document.createElement('b'); b.textContent = 'さわったもの'; s.appendChild(b);
-    for (const p of r.touched) {
-      const a = document.createElement('a');
-      a.href = '#'; a.textContent = ' 📦 ' + p;
-      a.onclick = (e) => { e.preventDefault(); showPreview(p); };
-      s.appendChild(a);
+    const files = document.createElement('div');
+    files.className = 'files';
+    // 画像はここでも絵で見せる(報告と成果物で、同じものが同じように見えるように)
+    for (const raw of r.touched) {
+      const p = cleanPath(raw);
+      if (!p) continue;
+      if (artifactKind(p) === 'image') s.appendChild(shotOf(p, t.project, () => files.appendChild(fileChip(p, t.project, '🖼 '))));
+      else files.appendChild(fileChip(p, t.project, artifactKind(p) === 'page' ? '▶ ' : '📄 '));
     }
+    s.appendChild(files);
     div.appendChild(s);
   }
   const actions = document.createElement('div');
@@ -941,6 +1136,11 @@ function threadCard(t) {
     btn.onclick = async () => { await post('/inbox/read', { threadId: t.id }); void refreshInbox(); };
     actions.appendChild(btn);
   }
+  const del = document.createElement('button');
+  del.className = 'tab';
+  del.textContent = '消す';
+  del.onclick = async () => { await post('/inbox/delete', { threadId: t.id }); void refreshInbox(); boardSoon(50); };
+  actions.appendChild(del);
   div.appendChild(actions);
   return div;
 }
@@ -948,14 +1148,23 @@ function threadCard(t) {
 async function refreshInbox() {
   try {
     const d = await (await post('/inbox', {})).json();
-    inboxCountEl.textContent = d.unread > 0 ? String(d.unread) : '';
+    const unread = d.unread ?? 0;
+    inboxCountEl.textContent = unread > 0 ? String(unread) : '';
+    boardBadgeEl.textContent = unread > 0 ? String(unread) : '';   // 狭い画面の 📋 に付ける赤丸
+    document.title = (unread > 0 ? `(${unread}) ` : '') + 'talkingclaw — 声の部屋';
     if (!inboxTab) return;
     inboxEl.replaceChildren();
     if ((d.threads ?? []).length === 0) {
       const e = document.createElement('div'); e.className = 'tnote'; e.textContent = 'まだ報告はないよ'; inboxEl.appendChild(e);
       return;
     }
-    for (const t of d.threads) inboxEl.appendChild(threadCard(t));
+    for (const t of d.threads.slice(0, THREADS_SHOWN)) inboxEl.appendChild(threadCard(t));
+    if (d.threads.length > THREADS_SHOWN) {
+      const more = document.createElement('div');
+      more.className = 'tnote';
+      more.textContent = `ほかに ${d.threads.length - THREADS_SHOWN} 件の報告があるよ`;
+      inboxEl.appendChild(more);
+    }
   } catch { /* 次の更新で */ }
 }
 
@@ -968,13 +1177,18 @@ async function refreshBoard() {
     const rows = [...(d.tasks ?? []), ...(d.open ?? [])];
     renderProgress(rows);          // 帯はボードを開いていなくても常に最新に
     renderPlan(d.plan ?? null);    // 相談中の案(あれば)
-    checkAutoPreview(d);           // 完成した成果物はその場で開く
+    checkAutoPreview(d);           // 出来たものは会話に成果物カードで出す
+    renderArtifacts(rows);         // 右レーンの成果物一覧(見えるものだけ)
+    renderHistory(rows);           // 済んだものは履歴に集める
     if (!boardOpen) return;
     boardEl.replaceChildren();
-    if (rows.length === 0) {
+    // スクロールさせないため、ここは「まだ動いているもの」だけ。
+    // 済んだもの・取り消したもの・skip されたものは残さない(見たい時は「履歴」)
+    const live = rows.filter((t) => t.status === 'queued' || t.status === 'working');
+    if (live.length === 0) {
       const e = document.createElement('div'); e.className = 'tnote'; e.textContent = 'いまは作業なし'; boardEl.appendChild(e);
     }
-    for (const t of rows) {
+    for (const t of live.slice(0, TASKS_SHOWN)) {
       const div = document.createElement('div');
       div.className = 'task';
       const stat = document.createElement('span');
@@ -982,6 +1196,7 @@ async function refreshBoard() {
       stat.textContent = STAT_LABEL[t.status] ?? t.status;
       div.appendChild(stat);
       const req = document.createElement('span');
+      req.className = 'treq';
       req.textContent = `${t.agentName}: ${(t.request ?? '').slice(0, 60)}`;
       div.appendChild(req);
       const ago = elapsed(t.at);
@@ -1003,43 +1218,106 @@ async function refreshBoard() {
         note.textContent = '実況: ' + t.notes[t.notes.length - 1];
         div.appendChild(note);
       }
-      for (const a of t.artifacts ?? []) {
-        const link = document.createElement('a');
-        link.href = '#';
-        link.textContent = ' 📦 ' + a;
-        link.onclick = (e) => { e.preventDefault(); showPreview(a, t.project); };
-        div.appendChild(link);
-      }
-      boardEl.appendChild(div);
+      if (t.id) div.appendChild(taskActions(t));
+      boardEl.appendChild(div); // 成果物は右レーンの一覧に出るので、ここでは繰り返さない
+    }
+    if (live.length > TASKS_SHOWN) {
+      const more = document.createElement('div');
+      more.className = 'tnote';
+      more.textContent = `ほかに ${live.length - TASKS_SHOWN} 件動いてるよ`;
+      boardEl.appendChild(more);
     }
   } catch { /* 次回 */ } finally {
     boardBusy = false;
     scheduleBoard(); // 次の更新を状況に合わせて予約(作業中は速く)
   }
 }
+// 自分で片付けるためのボタン。まだ始まっていない依頼は直せる / いつでも消せる
+function taskActions(t) {
+  const box = document.createElement('div');
+  box.className = 'tacts';
+  const act = async (action, text) => {
+    const r = await post('/task', { action, taskId: t.id, text });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) addSys(d.error ?? 'できなかった');
+    boardSoon(50);
+  };
+  if (t.status === 'queued') {
+    const edit = document.createElement('button');
+    edit.className = 'tact';
+    edit.textContent = '直す';
+    edit.onclick = () => {
+      const input = document.createElement('input');
+      input.value = t.request ?? '';
+      input.className = 'tedit';
+      input.onkeydown = (e) => {
+        if (e.key === 'Escape') return void boardSoon(50);
+        if (e.key !== 'Enter' || e.isComposing || !input.value.trim()) return;
+        void act('edit', input.value.trim());
+      };
+      box.replaceChildren(input);
+      input.focus();
+    };
+    box.appendChild(edit);
+    const cancel = document.createElement('button');
+    cancel.className = 'tact';
+    cancel.textContent = 'やめる';
+    cancel.onclick = () => void act('cancel');
+    box.appendChild(cancel);
+  }
+  const del = document.createElement('button');
+  del.className = 'tact';
+  del.textContent = '消す';
+  del.onclick = () => void act('delete');
+  box.appendChild(del);
+  return box;
+}
+
 function checkAutoPreview(d) {
   for (const t of d.tasks ?? []) {
-    if (t.id && t.status === 'done' && (t.artifacts ?? []).length > 0 && !previewedTasks.has(t.id)) {
-      previewedTasks.add(t.id);
-      offerPreview(t.artifacts[0], t.project);
-    }
+    if (!t.id || t.status !== 'done' || (t.artifacts ?? []).length === 0 || previewedTasks.has(t.id)) continue;
+    previewedTasks.add(t.id);
+    showResultCard(t);
+    // 勝手に右を開かない(開くと中央が細くなる = 会話の邪魔)。カードのボタンを押した時だけ開く
   }
 }
 
-// 厳格ルール: ユーザーの会話を邪魔してまで成果物を開かない。
-// 話している / 読み上げ中 / 直近 10 秒に発話があった時は、押せる案内だけ出す。
-let lastUserSpokeAt = 0;
-function offerPreview(relPath, project) {
-  const busy = playing || gateActive() || performance.now() - lastUserSpokeAt < 10_000;
-  if (!busy) { showPreview(relPath, project); return; }
-  const div = document.createElement('div');
-  div.className = 'sys';
-  const a = document.createElement('a');
-  a.href = '#';
-  a.textContent = `📦 ${relPath} — 押すと開くよ`;
-  a.onclick = (e) => { e.preventDefault(); showPreview(relPath, project); };
-  div.appendChild(a);
-  log.appendChild(div);
+// 出来たものを「文章と一緒に」会話へ出す(path の羅列で終わらせない)。
+// 会話の末尾に足すだけなので何も覆わない = 話している最中でも抑制する必要がない(ルール 2)
+function showResultCard(t) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  const head = document.createElement('div');
+  head.className = 'chead';
+  head.textContent = '✔ ' + (t.report?.headline || (t.request ?? '').slice(0, 40));
+  card.appendChild(head);
+  const what = (t.report?.can ?? [])[0];
+  if (what) {
+    const w = document.createElement('div');
+    w.className = 'cwhat';
+    w.textContent = what;
+    card.appendChild(w);
+  }
+  const files = document.createElement('div');
+  files.className = 'files';
+  const touched = [];
+  for (const raw of t.artifacts ?? []) {
+    const p = cleanPath(raw);
+    if (!p) continue;
+    if (artifactKind(p) === 'image') card.appendChild(shotOf(p, t.project, () => files.appendChild(fileChip(p, t.project, '🖼 '))));
+    else if (artifactKind(p) === 'page') files.appendChild(fileChip(p, t.project, '▶ 開く: '));
+    else touched.push(p); // ソースは成果物ではない(さわったもの)
+  }
+  card.appendChild(files);
+  if (touched.length > 0) {
+    const w = document.createElement('div');
+    w.className = 'cwhat';
+    w.textContent = 'さわったもの: ' + touched.join(' / ');
+    card.appendChild(w);
+  }
+  log.appendChild(card);
+  lastGroup = null;
+  trimLog();
   log.scrollTop = log.scrollHeight;
 }
 // ---- 進捗をリアルタイムに保つ ----
