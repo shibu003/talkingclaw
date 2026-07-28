@@ -1809,6 +1809,30 @@ const server = createServer(async (req, res) => {
   // 言い間違いで登録された依頼を画面から片付けられるようにする。動き出したものは触らない。
   if (path === '/task') {
     const action = String(body.action ?? '');
+    // 複数選択の一括操作(消す / まとめる)。まとめる = 選んだ依頼を 1 件に束ねて残りを消す
+    const ids: number[] = Array.isArray(body.taskIds) ? body.taskIds.map(Number).filter(Number.isFinite) : [];
+    if (ids.length > 0) {
+      const picked = officeTasks.filter((x) => ids.includes(x.id));
+      if (picked.length === 0) return json(res, 400, { error: 'その作業は見つかりません' });
+      if (action === 'delete') {
+        const running = picked.find((x) => x.status === 'working');
+        if (running) return json(res, 409, { error: 'いま動いているものが混ざっています(先に取り消してね)' });
+        for (const x of picked) officeTasks.splice(officeTasks.indexOf(x), 1);
+        saveTasks();
+        return json(res, 200, { ok: true, removed: picked.length });
+      }
+      if (action === 'merge') {
+        const mergeable = picked.filter((x) => x.status === 'queued');
+        if (mergeable.length < 2) return json(res, 409, { error: 'まだ始まっていないものを 2 件以上えらんでね' });
+        const head = mergeable[0];
+        head.request = mergeable.map((x) => x.request).join('\nそれと、').slice(0, TEXT_MAX);
+        head.notes.push(`${mergeable.length} 件をまとめた`);
+        for (const x of mergeable.slice(1)) officeTasks.splice(officeTasks.indexOf(x), 1);
+        saveTasks();
+        return json(res, 200, { ok: true, taskId: head.id, merged: mergeable.length });
+      }
+      return json(res, 400, { error: 'まとめてできるのは delete / merge です' });
+    }
     const t = officeTasks.find((x) => x.id === Number(body.taskId));
     if (!t) return json(res, 400, { error: 'その作業は見つかりません' });
     if (action === 'delete') {

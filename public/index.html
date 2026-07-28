@@ -152,6 +152,14 @@
   .tact:hover { border-color: var(--accent); color: var(--text); }
   .tedit { width: 100%; background: var(--surface-2); border: 1px solid var(--accent); color: var(--text);
            border-radius: var(--r-sm); padding: 6px 10px; font-size: var(--fs-small); }
+  /* 選んでまとめて操作する(会話以外の一覧に共通)*/
+  .pick { width: 15px; height: 15px; margin-right: 8px; accent-color: var(--accent); vertical-align: middle; }
+  .pickbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px;
+             padding-top: 10px; border-top: 1px solid var(--surface-2);
+             font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
+  /* 在室チップに「今なにをしているか」を出す */
+  .chip .busy { margin-left: 6px; padding: 1px 7px; border-radius: 999px;
+                background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 700; }
   .task .tmeta { color: var(--muted); font-size: var(--fs-small); margin-left: 6px; }
   .task .tbar { display: block; height: 4px; margin-top: 7px; border-radius: 999px; background: #2c2440; overflow: hidden; }
   .task .tbar i { display: block; height: 100%; width: 100%; border-radius: 999px; }
@@ -273,10 +281,10 @@
   @media (min-width: 1100px) {
     body { max-width: none; display: grid;
            grid-template-columns: 264px minmax(0, 1fr) minmax(320px, 34%);
-           grid-template-rows: auto auto auto 1fr auto;
-           grid-template-areas: "nav head side" "nav note side" "nav plan side"
-                                "nav log side"  "nav foot side"; }
-    header { grid-area: head; } #notice { grid-area: note; } #plan { grid-area: plan; }
+           grid-template-rows: auto auto auto auto 1fr auto;
+           grid-template-areas: "nav head side" "nav room side" "nav note side"
+                                "nav plan side" "nav log side"  "nav foot side"; }
+    header { grid-area: head; } #rooms { grid-area: room; } #notice { grid-area: note; } #plan { grid-area: plan; }
     #log { grid-area: log; } footer { grid-area: foot; }
     /* 右レーンは常設しない。プレビューを開いた時と 📋 で呼んだ時だけ現れる */
     body { grid-template-columns: 264px minmax(0, 1fr) 0; }
@@ -286,13 +294,12 @@
     .lane.side { grid-area: side; border-left: 1px solid var(--line); display: none; }
     body.side-open .lane.side { display: flex; }
     .lane > * { margin: 0 var(--pad); width: auto; max-height: none; flex-shrink: 0; }
-    .lane #rooms, .lane #tasks, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
+    .lane #tasks, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
+    #rooms { margin: 10px var(--pad) 0; max-height: 44dvh; overflow-y: auto; }
     #roster { padding: 0; }
     .lane.side #board { max-height: 55%; overflow-y: auto; flex-shrink: 0; }
     #preview { height: auto; flex: 1; min-height: 220px; }
     /* 部屋一覧と作業ボードが常設 = ヘッダのボタンは役目を終える(狭い画面では残る) */
-    #roomBtn { display: none; }   /* 部屋一覧は左に常設 */
-    .lane #rooms .tnote { display: none; }  /* 音声ヒントは狭い画面だけ(縦を詰める) */
     .lane.nav .task .tnote { display: none; }  /* 実況は進捗の帯に出るので繰り返さない */
   }
 
@@ -311,14 +318,6 @@
     <button id="settingsBtn" class="hbtn" title="設定" aria-expanded="false">⚙</button>
   </div>
 </header>
-<div id="notice"></div>
-<div id="plan"></div>
-<!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
-     display:contents になり、今までどおり会話の上に積まれる -->
-<div class="lane nav">
-<button id="progress" title="進行中の作業を開く"></button>
-<div id="tasks" class="panel"><h2>進行中</h2><div id="boardList"></div></div>
-<div id="roster"></div>
 <div id="rooms" class="panel">
   <h2>部屋</h2>
   <div id="roomList"></div>
@@ -331,6 +330,14 @@
   </div>
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
+<div id="notice"></div>
+<div id="plan"></div>
+<!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
+     display:contents になり、今までどおり会話の上に積まれる -->
+<div class="lane nav">
+<button id="progress" title="進行中の作業を開く"></button>
+<div id="tasks" class="panel"><h2>進行中</h2><div id="boardList"></div></div>
+<div id="roster"></div>
 <div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
 </div>
 <!-- 右レーン: 作業スペース(何ができたか)。中央の会話とは場所を取り合わない -->

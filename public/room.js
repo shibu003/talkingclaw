@@ -452,6 +452,7 @@ micBtn.addEventListener('click', () => {
 
 // ---- 在室リスト + 相手選択(4A-2)----
 const rosterEl = document.getElementById('roster');
+let lastBoardRows = []; // 在室チップに「何をしているか」を出すための直近の作業状況
 let selectedPid = null;
 const pidNames = new Map();
 async function refreshRoster() {
@@ -476,7 +477,15 @@ async function refreshRoster() {
       pidNames.set(p.participantId, p.name);
       const chip = document.createElement('span');
       chip.className = 'chip ' + (p.presence === 'gone' ? 'gone' : 'active') + (p.participantId === selectedPid ? ' selected' : '');
+      const job = lastBoardRows.find((t) => t.status === 'working' && t.agentName === p.name);
       chip.textContent = p.name + (p.voice !== 'ready' ? '(声なし)' : '');
+      if (job) {
+        const busy = document.createElement('span');
+        busy.className = 'busy';
+        busy.textContent = '作業中';
+        chip.appendChild(busy);
+        chip.title = job.request ?? '';
+      }
       chip.onclick = async () => {
         const next = selectedPid === p.participantId ? null : p.participantId;
         await post('/select', { participantId: next });
@@ -588,7 +597,9 @@ for (const [key, p] of Object.entries(panels)) {
   };
 }
 // 幅が変わってレーン ⇄ 1 カラムを跨いだら、開閉状態を揃え直す(レイアウト自体は CSS が持つ)
-wideQuery.addEventListener('change', () => { openPanel(null); void refreshBoard(); });
+wideQuery.addEventListener('change', () => { openPanel(null); void renderSideAlways(); void refreshBoard(); });
+// 広い画面ではパネルを開かなくても見えている = 開いた時だけ描く作りでは中身が空になる
+function renderSideAlways() { if (wideLayout()) { void renderRooms(); void renderSettings(); } }
 
 document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel);
 document.getElementById('archiveBtn').onclick = () => window.open('/archives.md?token=' + TOKEN);
@@ -679,6 +690,9 @@ async function enterRoom(next) {
   lastGroup = null;
   audioQueue.length = 0;
   await showHistory(next); // 切り替えた部屋の直近の会話を読み込む(白紙にしない)
+  void refreshRoster();    // 誰がいるか
+  boardSoon(50);           // 何をしているか
+  void renderRooms();      // 部屋の名前(一覧とヘッダの表示)
 }
 
 // 部屋に入った時、その部屋で話していた内容を読み直す(音は鳴らさない)
@@ -1029,8 +1043,10 @@ function renderHistory(rows) {
       if (path && isViewable(path)) files.appendChild(fileChip(path, t.project, artifactKind(path) === 'image' ? '🖼 ' : '▶ '));
     }
     if (files.children.length > 0) div.appendChild(files);
+    h.prepend(pickBox(t.id, () => boardSoon(0)));
     historyEl.appendChild(div);
   }
+  pickBar(historyEl, () => boardSoon(0));
 }
 
 // 右レーンの成果物一覧(新しい順)。画像はサムネを付けて「何ができたか」を見せる
@@ -1078,6 +1094,7 @@ function threadCard(t) {
   const div = document.createElement('div');
   div.className = 'thread' + (t.unread ? ' unread' : '');
   const h = document.createElement('h3');
+  h.appendChild(pickBox(t.id, () => refreshInbox()));
   const stat = document.createElement('span');
   stat.className = 'tstat ' + (t.status ?? 'done');
   stat.textContent = STAT_LABEL[t.status] ?? '✔ 完了';
@@ -1159,6 +1176,7 @@ async function refreshInbox() {
       return;
     }
     for (const t of d.threads.slice(0, THREADS_SHOWN)) inboxEl.appendChild(threadCard(t));
+    pickBar(inboxEl, () => refreshInbox());
     if (d.threads.length > THREADS_SHOWN) {
       const more = document.createElement('div');
       more.className = 'tnote';
@@ -1175,6 +1193,7 @@ async function refreshBoard() {
     const r = await post('/tasks', {});
     const d = await r.json();
     const rows = [...(d.tasks ?? []), ...(d.open ?? [])];
+    lastBoardRows = rows;
     renderProgress(rows);          // 帯はボードを開いていなくても常に最新に
     renderPlan(d.plan ?? null);    // 相談中の案(あれば)
     checkAutoPreview(d);           // 出来たものは会話に成果物カードで出す
@@ -1218,9 +1237,10 @@ async function refreshBoard() {
         note.textContent = '実況: ' + t.notes[t.notes.length - 1];
         div.appendChild(note);
       }
-      if (t.id) div.appendChild(taskActions(t));
+      if (t.id) { stat.before(pickBox(t.id, () => boardSoon(0))); div.appendChild(taskActions(t)); }
       boardEl.appendChild(div); // 成果物は右レーンの一覧に出るので、ここでは繰り返さない
     }
+    pickBar(boardEl, () => boardSoon(0));
     if (live.length > TASKS_SHOWN) {
       const more = document.createElement('div');
       more.className = 'tnote';
@@ -1232,6 +1252,49 @@ async function refreshBoard() {
     scheduleBoard(); // 次の更新を状況に合わせて予約(作業中は速く)
   }
 }
+// ---- 選んでまとめて操作する(会話以外の一覧に共通)----
+// チェックを付けた分だけ「まとめる」「消す」が効く。選んでいない時は何も出さない
+const picked = new Set();
+function pickBox(id, onChange) {
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.className = 'pick';
+  box.checked = picked.has(id);
+  box.onclick = (e) => e.stopPropagation();
+  box.onchange = () => { box.checked ? picked.add(id) : picked.delete(id); onChange?.(); };
+  return box;
+}
+// 選択中の操作バー。空なら描かない(画面を無駄に使わない)
+function pickBar(host, onDone) {
+  if (picked.size === 0) return;
+  const bar = document.createElement('div');
+  bar.className = 'pickbar';
+  const label = document.createElement('span');
+  label.textContent = `${picked.size} 件えらんでるよ`;
+  bar.appendChild(label);
+  const run = async (action) => {
+    const r = await post('/task', { action, taskIds: [...picked] });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) addSys(d.error ?? 'できなかった');
+    else if (action === 'merge') addSys(`${d.merged} 件を 1 つにまとめたよ`);
+    picked.clear();
+    onDone();
+  };
+  for (const [text, action] of [['まとめる', 'merge'], ['消す', 'delete']]) {
+    const b = document.createElement('button');
+    b.className = 'tact';
+    b.textContent = text;
+    b.onclick = () => void run(action);
+    bar.appendChild(b);
+  }
+  const clear = document.createElement('button');
+  clear.className = 'tact';
+  clear.textContent = 'えらび直す';
+  clear.onclick = () => { picked.clear(); onDone(); };
+  bar.appendChild(clear);
+  host.appendChild(bar);
+}
+
 // 自分で片付けるためのボタン。まだ始まっていない依頼は直せる / いつでも消せる
 function taskActions(t) {
   const box = document.createElement('div');
@@ -1398,4 +1461,5 @@ async function renderSettings() {
 }
 
 connect();
+void renderSideAlways();          // 常設パネル(部屋・設定)の中身を最初から描いておく
 void showHistory(currentChannel); // リロード直後も直近の会話が見えるように
