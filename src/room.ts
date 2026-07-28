@@ -85,6 +85,7 @@ function putAudio(wav: Buffer, isProtected = false): string {
 
 // ---- EngineManager(S5): daemon が engine を保有・監視。kill は自分の子(handle 基準)のみ ----
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import * as pathMod from 'node:path';
 import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 import { existsSync } from 'node:fs';
@@ -872,6 +873,40 @@ function confirmPlan(): { ok: true; taskId: number; summary: string } | { ok: fa
   return { ok: true, taskId: task.id, summary: p.summary };
 }
 
+// >>> collectArtifacts(pure に近い: test/check-artifacts.mjs から取り出して検査する)
+// 成果物の行から path を拾う。複数書かれる事があるので全部拾い、実在するものだけ board に載せる
+// (存在しない path をリンクにすると開いた時 not found になる = 今回のバグ)
+function collectArtifacts(result: string, cwd: string): string[] {
+  const line = result.match(/成果物[:：]([^\n]+)/)?.[1];
+  if (!line) return [];
+  const out: string[] = [];
+  for (const raw of line.split(/[,、\s]+/)) {
+    const rel = raw.replace(/^[`'"(（]+/, '').replace(/[`'")）。、,.]+$/, '').trim();
+    if (!rel || rel.startsWith('http')) continue;
+    const found = resolveArtifact(rel, cwd);
+    if (found) out.push(found);
+    else console.error(`成果物が見つからないので board に載せない: ${rel}(cwd ${cwd})`);
+  }
+  return out;
+}
+
+// 作業係は「workspace からの相対」で書くよう指示されているが、project 作業では
+// project 名を頭に付けてくる事がある(talkingclaw/src/room.ts)。両方の読み方を試す。
+function resolveArtifact(rel: string, cwd: string): string | null {
+  const { resolve, sep, basename } = pathMod;
+  const root = resolve(cwd);
+  const candidates = [rel];
+  const prefix = basename(root) + '/';
+  if (rel.startsWith(prefix)) candidates.push(rel.slice(prefix.length));
+  for (const c of candidates) {
+    const target = resolve(root, c);
+    if (target !== root && !target.startsWith(root + sep)) continue; // 作業先の外は載せない
+    if (existsSync(target)) return c;
+  }
+  return null;
+}
+// <<< collectArtifacts
+
 // board の元データ(/tasks と /screen で共有)
 function boardSnapshot(): { tasks: OfficeTask[]; open: { agent: string; agentName: string; request: string; status: string; notes: string[]; artifacts: string[] }[]; plan: Plan | null; consultMode: boolean } {
   const open = [...turns.values()]
@@ -1112,8 +1147,7 @@ function startChloe(): void {
         return;
       }
       task.status = 'done';
-      const m = String(result).match(/成果物[:：]\s*(\S+)/);
-      if (m) task.artifacts.push(m[1].replace(/[、。`]+$/, '').replace(/^`/, ''));
+      task.artifacts.push(...collectArtifacts(String(result), cwd));
       await gitAutoCommit(task, cwd, workerSay(task)); // 出来上がりを git に残す(既定はローカル commit まで)
       // W10-4: まとめてでなく、終わったものから個別に報告する
       const head = task.request.slice(0, 24);
@@ -1474,7 +1508,10 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && (path === '/files' || path.startsWith('/files/'))) {
     if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' }); // 無認証ゾーンより前に置かれているため明示検証
     const { resolve, sep } = await import('node:path');
-    const root = resolve(config.agent.cwd);
+    // 成果物は task の作業先(project)に出来る。既定は workspace
+    const projects = loadProjects();
+    const wanted = url.searchParams.get('project') ?? '';
+    const root = resolve(projects[wanted] ?? config.agent.cwd);
     const rel = decodeURIComponent(path.slice('/files'.length)).replace(/^\/+/, '');
     const target = resolve(root, rel);
     if (target !== root && !target.startsWith(root + sep)) return json(res, 404, { error: 'not found' }); // traversal 拒否

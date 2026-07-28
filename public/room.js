@@ -446,10 +446,12 @@ const previewFrame = document.getElementById('previewFrame');
 const previewTitle = document.getElementById('previewTitle');
 const previewOpen = document.getElementById('previewOpen');
 document.getElementById('previewClose').onclick = () => { previewEl.classList.remove('open'); previewFrame.src = 'about:blank'; };
-function showPreview(relPath) {
+// project = その作業がどのフォルダで行われたか(成果物はそこに出来る。既定は workspace)
+function showPreview(relPath, project) {
   void post('/ui-state', { preview: relPath, board: boardOpen }); // W10-2: クロエが画面を把握できるように
-  const url = '/files/' + encodeURIComponent(relPath).replace(/%2F/g, '/') + '?token=' + TOKEN;
-  previewTitle.textContent = relPath;
+  const url = '/files/' + encodeURIComponent(relPath).replace(/%2F/g, '/')
+    + '?token=' + TOKEN + (project ? '&project=' + encodeURIComponent(project) : '');
+  previewTitle.textContent = relPath + (project ? `(${project})` : '');
   previewOpen.href = url;
   previewFrame.src = url;
   previewEl.classList.add('open');
@@ -720,7 +722,7 @@ async function showLatestArtifact() {
     const rows = [...(d.tasks ?? []), ...(d.open ?? [])].filter((t) => (t.artifacts ?? []).length > 0);
     const last = rows[rows.length - 1];
     if (!last) { addSys('まだ成果物は無いよ'); return; }
-    showPreview(last.artifacts[last.artifacts.length - 1]);
+    showPreview(last.artifacts[last.artifacts.length - 1], last.project);
   } catch { addSys('成果物を取れなかった'); }
 }
 
@@ -911,7 +913,7 @@ async function refreshBoard() {
         const link = document.createElement('a');
         link.href = '#';
         link.textContent = ' 📦 ' + a;
-        link.onclick = (e) => { e.preventDefault(); showPreview(a); };
+        link.onclick = (e) => { e.preventDefault(); showPreview(a, t.project); };
         div.appendChild(link);
       }
       boardEl.appendChild(div);
@@ -925,7 +927,7 @@ function checkAutoPreview(d) {
   for (const t of d.tasks ?? []) {
     if (t.id && t.status === 'done' && (t.artifacts ?? []).length > 0 && !previewedTasks.has(t.id)) {
       previewedTasks.add(t.id);
-      offerPreview(t.artifacts[0]);
+      offerPreview(t.artifacts[0], t.project);
     }
   }
 }
@@ -933,15 +935,15 @@ function checkAutoPreview(d) {
 // 厳格ルール: ユーザーの会話を邪魔してまで成果物を開かない。
 // 話している / 読み上げ中 / 直近 10 秒に発話があった時は、押せる案内だけ出す。
 let lastUserSpokeAt = 0;
-function offerPreview(relPath) {
+function offerPreview(relPath, project) {
   const busy = playing || gateActive() || performance.now() - lastUserSpokeAt < 10_000;
-  if (!busy) { showPreview(relPath); return; }
+  if (!busy) { showPreview(relPath, project); return; }
   const div = document.createElement('div');
   div.className = 'sys';
   const a = document.createElement('a');
   a.href = '#';
   a.textContent = `📦 ${relPath} — 押すと開くよ`;
-  a.onclick = (e) => { e.preventDefault(); showPreview(relPath); };
+  a.onclick = (e) => { e.preventDefault(); showPreview(relPath, project); };
   div.appendChild(a);
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
