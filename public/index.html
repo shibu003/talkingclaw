@@ -9,15 +9,16 @@
 <title>talkingclaw — 声の部屋</title>
 <style>
   /* 声の部屋のデザイン。読みやすさ優先 —
-     ① 文字は本文 16px / 行間 1.8 / 和文に少し字間、② 1 行は 32em 以内、
-     ③ 階層は「大きさ」より「余白と色」で作る。色・寸法はこの変数だけ触れば全体が揃う */
+     ① 文字は本文 17px / 補助 13.5px 下限 / 行間 1.8、② 1 行は 30em 以内、
+     ③ コントラストは本文 7:1・補助 5.5:1 以上(npm test で検査)、
+     ④ 階層は「大きさ」より「余白と色」で作る。色・寸法はこの変数だけ触れば全体が揃う */
   :root {
     color-scheme: dark;
-    --bg: #14101c; --surface: #1d1729; --surface-2: #251e35; --line: #3a3052;
-    --text: #f1edf8; --muted: #ab9fc9; --accent: #c3a4ff; --accent-ink: #1a1426; --hot: #f0688f;
+    --bg: #14101c; --surface: #1f1930; --surface-2: #2a2240; --line: #453a63;
+    --text: #f6f3fb; --muted: #c9c0e2; --accent: #cdb2ff; --accent-ink: #17111f; --hot: #ff7fa2;
     --r-sm: 8px; --r-md: 14px; --r-lg: 20px; --pad: 18px;
-    --fs-body: 16px; --fs-ui: 14px; --fs-small: 12.5px;
-    --measure: 32em;   /* 1 行の最大文字数(和文で読み疲れない幅) */
+    --fs-body: 17px; --fs-ui: 15px; --fs-small: 13.5px;
+    --measure: 30em;   /* 1 行の最大文字数(和文で読み疲れない幅) */
   }
   * { box-sizing: border-box; margin: 0; }
   body { font-family: "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
@@ -34,10 +35,10 @@
            padding: 12px var(--pad); border-bottom: 1px solid var(--line); }
   #roomBtn { display: flex; align-items: baseline; gap: 8px; max-width: 58vw;
              padding: 8px 16px; border-radius: 999px; border: 1px solid var(--line);
-             background: var(--surface-2); font-size: 17px; font-weight: 700; line-height: 1.3; }
+             background: var(--surface-2); font-size: 19px; font-weight: 700; line-height: 1.3; }
   #roomBtn:hover { border-color: var(--accent); }
   #roomBtn .rname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #roomBtn .caret { color: var(--muted); font-size: 10px; }
+  #roomBtn .caret { color: var(--muted); font-size: 12px; }
   #status { font-size: var(--fs-small); line-height: 1.5; color: var(--muted); margin-left: auto; text-align: right; }
   .tools { display: flex; gap: 2px; }
   .hbtn { background: transparent; border: 1px solid transparent; color: var(--muted);
@@ -50,6 +51,7 @@
 
   /* ---- 話す相手 ---- */
   #roster { display: flex; gap: 6px; padding: 10px var(--pad) 0; flex-wrap: wrap; align-items: center; }
+  #roster.hidden { display: none; }
   #roster .label { font-size: var(--fs-small); color: var(--muted); margin-right: 2px; }
   .chip { padding: 5px 13px; border-radius: 999px; background: var(--surface-2); color: var(--muted);
           font-size: var(--fs-small); line-height: 1.5; cursor: pointer; border: 1px solid var(--line); user-select: none; }
@@ -74,10 +76,16 @@
           font-size: 15px; font-weight: 600; line-height: 1.5; }
   .room:hover { border-color: var(--accent); }
   .room.here { border-color: var(--accent); background: #322850; }
-  .room .here-mark { margin-left: auto; flex-shrink: 0; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+  .room .here-mark { margin-left: auto; flex-shrink: 0; font-size: 12.5px; font-weight: 700; letter-spacing: .06em;
                      color: var(--accent-ink); background: var(--accent); border-radius: 999px; padding: 2px 9px; }
   #roomsExtra:empty { display: none; }   /* 新規作成・名前変更 UI のマウント先 */
   #roomsExtra { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--surface-2); }
+  /* この部屋の記録(ログ・アーカイブ)は部屋の道具なので、ヘッダでなくここに置く */
+  .rlinks { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px;
+            border-top: 1px solid var(--surface-2); }
+  .linkbtn { background: var(--surface-2); border: 1px solid var(--line); color: var(--text);
+             border-radius: 999px; padding: 7px 14px; font-size: var(--fs-small); }
+  .linkbtn:hover { border-color: var(--accent); }
 
   /* ---- 相談中の案(合意するまで作業は始まらない)---- */
   #plan { display: none; margin: 10px var(--pad) 0; padding: 13px 15px; background: var(--surface);
@@ -101,7 +109,7 @@
   /* 状態の色は帯・凡例・タスク行で共通(同じ色 = 同じ意味) */
   .s-done { background: #4c9e68; } .s-working { background: var(--accent); }
   .s-queued { background: #4d4270; } .s-failed { background: #b0455f; }
-  .pbar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: #2c2440; }
+  .pbar { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: #2c2440; }
   .pbar i { display: block; height: 100%; transition: width .35s ease; } /* 件数が変わると滑らかに伸縮 */
   .pbar .s-working {
     background-image: linear-gradient(115deg, rgba(255,255,255,.34) 25%, transparent 25%, transparent 50%,
@@ -112,14 +120,14 @@
              font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
   .plegend span { display: inline-flex; align-items: center; gap: 5px; }
   .plegend b { color: var(--text); font-weight: 700; }
-  .plegend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .plegend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .pnote { display: block; margin-top: 7px; font-size: var(--fs-small); line-height: 1.6; color: var(--muted);
            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* 作業ボード: 状態 → 依頼 → 実況 の順に読ませる */
   .task { padding: 11px 0; border-bottom: 1px solid var(--surface-2); font-size: var(--fs-ui); line-height: 1.7; }
   .task:last-child { border-bottom: 0; }
-  .task .tstat { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  .task .tstat { display: inline-block; font-size: 12.5px; font-weight: 700; letter-spacing: .04em;
                  padding: 2px 9px; border-radius: 999px; background: #3a3052; margin-right: 8px; }
   .task .tstat.done { background: #2f6440; } .task .tstat.failed { background: #7a3345; }
   .task .tnote { display: block; margin: 4px 0 0 4px; padding-left: 10px; border-left: 2px solid var(--line);
@@ -141,16 +149,16 @@
   #settings .tnote { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--surface-2); }
 
   /* ---- 会話ログ ---- */
-  #log { flex: 1; overflow-y: auto; padding: 16px var(--pad); scroll-padding-bottom: 16px;
-         display: flex; flex-direction: column; gap: 12px; }
-  .msg { max-width: min(84%, var(--measure)); padding: 12px 16px; border-radius: var(--r-lg);
-         line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .user { align-self: flex-end; background: #453a63; border-bottom-right-radius: 5px; }
+  #log { flex: 1; overflow-y: auto; padding: 18px var(--pad); scroll-padding-bottom: 16px;
+         display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: min(86%, var(--measure)); padding: 13px 17px; border-radius: var(--r-lg);
+         line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .user { align-self: flex-end; background: #4d3f7a; border-bottom-right-radius: 5px; }
   .agent { align-self: flex-start; background: var(--surface-2); border-bottom-left-radius: 5px; }
   .agent.speaking { box-shadow: 0 0 0 1px var(--accent), 0 0 20px -6px var(--accent); }
-  .agent .who { display: block; margin-bottom: 4px; font-size: var(--fs-small); font-weight: 700;
+  .agent .who { display: block; margin-bottom: 5px; font-size: var(--fs-ui); font-weight: 700;
                 letter-spacing: .04em; color: var(--accent); line-height: 1.4; }
-  .user .to { display: block; margin-top: 4px; font-size: 11px; color: var(--muted); text-align: right; line-height: 1.4; }
+  .user .to { display: block; margin-top: 5px; font-size: 12.5px; color: var(--muted); text-align: right; line-height: 1.4; }
   /* システム行 = 話者の発言ではない案内。区切りとして左右に線を引く */
   .sys { align-self: center; display: flex; align-items: center; gap: 10px; width: 100%;
          margin: 2px 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.6; text-align: center; }
@@ -198,8 +206,6 @@
   <div class="tools">
     <button id="boardBtn" class="hbtn" title="作業ボード" aria-expanded="false">📋</button>
     <button id="settingsBtn" class="hbtn" title="設定" aria-expanded="false">⚙</button>
-    <button id="logBtn" class="hbtn" title="この部屋の会話ログ">📄</button>
-    <button id="archiveBtn" class="hbtn" title="アーカイブ一覧">🗄</button>
   </div>
 </header>
 <div id="notice"></div>
@@ -212,6 +218,10 @@
   <!-- 部屋の作成 / 名前変更の操作部品はここに載せる。音声ナビからも押せるよう
        data-voice="create-room" / "rename-room" / "room-name-input" を付けること -->
   <div id="roomsExtra"></div>
+  <div class="rlinks">
+    <button id="logBtn" class="linkbtn">📄 この部屋の会話ログ</button>
+    <button id="archiveBtn" class="linkbtn">🗄 アーカイブ一覧</button>
+  </div>
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
 <div id="board" class="panel"><h2>作業ボード</h2><div id="boardList"></div></div>

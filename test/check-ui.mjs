@@ -52,19 +52,29 @@ const ratio = (a, b) => {
   const [x, y] = [lum(a) + 0.05, lum(b) + 0.05].sort((p, q) => q - p);
   return x / y;
 };
+// 本文は AAA 相当(7:1)、補助文字も 5.5:1 を下限にする(4.5 は「読める」の下限で、
+// 実際に見づらいというフィードバックが出たので基準を上げた)
 const pairs = [
-  ['本文', varOf('text'), varOf('bg')],
-  ['本文(吹き出し上)', varOf('text'), varOf('surface-2')],
-  ['補助文字', varOf('muted'), varOf('bg')],
-  ['補助文字(パネル上)', varOf('muted'), varOf('surface')],
-  ['話者名', varOf('accent'), varOf('surface-2')],
-  ['選択チップ', varOf('accent-ink'), varOf('accent')],
+  ['本文', varOf('text'), varOf('bg'), 7],
+  ['本文(吹き出し上)', varOf('text'), varOf('surface-2'), 7],
+  ['補助文字', varOf('muted'), varOf('bg'), 5.5],
+  ['補助文字(パネル上)', varOf('muted'), varOf('surface'), 5.5],
+  ['話者名', varOf('accent'), varOf('surface-2'), 5.5],
+  ['選択チップ', varOf('accent-ink'), varOf('accent'), 5.5],
 ];
-for (const [name, fg, bg] of pairs) {
+for (const [name, fg, bg, min] of pairs) {
   if (!fg || !bg) { console.log(`  ❌ 色の変数が見つからない: ${name}`); fail = 1; continue; }
   const r = ratio(fg, bg);
-  if (r < 4.5) { console.log(`  ❌ ${name} のコントラストが ${r.toFixed(1)}:1(4.5 未満)`); fail = 1; }
+  if (r < min) { console.log(`  ❌ ${name} のコントラストが ${r.toFixed(1)}:1(${min} 未満)`); fail = 1; }
 }
-if (fail === 0) console.log('  ✅ 文字と背景のコントラストは全部 4.5:1 以上');
+// 本文が小さすぎないか(和文は 16px 未満だと一気に読みづらい)
+const bodyPx = Number(html.match(/--fs-body:\s*([\d.]+)px/)?.[1] ?? 0);
+const smallPx = Number(html.match(/--fs-small:\s*([\d.]+)px/)?.[1] ?? 0);
+if (bodyPx < 16) { console.log(`  ❌ 本文が ${bodyPx}px(16px 未満)`); fail = 1; }
+if (smallPx < 13) { console.log(`  ❌ 補助文字が ${smallPx}px(13px 未満)`); fail = 1; }
+if (/font-size:\s*(?:[0-9]|1[0-1])(?:\.\d+)?px/.test(html)) {
+  console.log('  ❌ 12px 未満の文字が残ってる'); fail = 1;
+}
+if (fail === 0) console.log(`  ✅ 本文 ${bodyPx}px / 補助 ${smallPx}px、コントラストは本文 7:1・補助 5.5:1 以上`);
 
 process.exit(fail);

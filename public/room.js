@@ -411,6 +411,8 @@ async function refreshRoster() {
     selectedPid = d.selected;
     if (d.channel && d.channel !== currentChannel) { currentChannel = d.channel; updateRoomBtn(); }
     rosterEl.replaceChildren();
+    // 相手が 1 人(クロエだけ)の時は選ぶ余地が無いので、行ごと隠して画面を軽くする
+    rosterEl.classList.toggle('hidden', d.participants.length <= 1 && selectedPid === null);
     const label = document.createElement('span');
     label.className = 'label';
     label.textContent = '話す相手:';
