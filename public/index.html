@@ -81,6 +81,19 @@
   #roomsExtra:empty { display: none; }   /* 新規作成・名前変更 UI のマウント先 */
   #roomsExtra { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--surface-2); }
 
+  /* ---- 相談中の案(合意するまで作業は始まらない)---- */
+  #plan { display: none; margin: 10px var(--pad) 0; padding: 13px 15px; background: var(--surface);
+          border: 1px solid var(--accent); border-radius: var(--r-md); }
+  #plan.on { display: block; }
+  #plan h3 { font-size: var(--fs-small); font-weight: 700; letter-spacing: .08em; color: var(--accent); margin-bottom: 6px; }
+  #plan .psummary { font-size: 15px; line-height: 1.7; }
+  #plan ol { margin: 8px 0 0 1.3em; padding: 0; color: var(--muted); font-size: var(--fs-ui); line-height: 1.8; }
+  #plan .pacts { display: flex; gap: 8px; margin-top: 12px; }
+  #plan button { padding: 9px 16px; border-radius: 999px; border: 1px solid var(--line);
+                 background: var(--surface-2); font-size: var(--fs-ui); font-weight: 600; }
+  #plan button.go { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  #plan button:hover { border-color: var(--accent); }
+
   /* ---- 進捗の帯(常に見える。押すと作業ボードが開く)---- */
   #progress { display: none; width: calc(100% - var(--pad) * 2); margin: 10px var(--pad) 0;
               padding: 11px 14px; text-align: left; background: var(--surface);
@@ -192,6 +205,7 @@
   </div>
 </header>
 <div id="notice"></div>
+<div id="plan"></div>
 <button id="progress" title="作業ボードを開く"></button>
 <div id="roster"></div>
 <div id="rooms" class="panel">

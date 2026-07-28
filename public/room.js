@@ -720,6 +720,47 @@ function progressSummary(rows) {
 }
 // <<< progressSummary
 
+// ---- 相談モード: まとまるまで作業は始まらない。案は画面に出して合図を待つ ----
+// 音声からの確定も同じ道を通す: post('/plan', { action: 'confirm' })
+const planEl = document.getElementById('plan');
+function renderPlan(p) {
+  planEl.classList.toggle('on', !!p);
+  if (!p) return;
+  planEl.replaceChildren();
+  const head = document.createElement('h3');
+  head.textContent = '相談中の案(まだ始めてないよ)';
+  const sum = document.createElement('div');
+  sum.className = 'psummary';
+  sum.textContent = p.summary;
+  planEl.append(head, sum);
+  if ((p.steps ?? []).length > 0) {
+    const ol = document.createElement('ol');
+    for (const s of p.steps) { const li = document.createElement('li'); li.textContent = s; ol.appendChild(li); }
+    planEl.appendChild(ol);
+  }
+  const acts = document.createElement('div');
+  acts.className = 'pacts';
+  const go = document.createElement('button');
+  go.className = 'go';
+  go.textContent = 'これで始める';
+  go.onclick = () => void planAction('confirm');
+  const stop = document.createElement('button');
+  stop.textContent = 'やめる';
+  stop.onclick = () => void planAction('cancel');
+  acts.append(go, stop);
+  planEl.appendChild(acts);
+}
+async function planAction(action) {
+  try {
+    const r = await post('/plan', { action });
+    const d = await r.json();
+    if (!r.ok) { addSys(d.error ?? '案を動かせなかった'); return; }
+    renderPlan(null);
+    addSys(action === 'confirm' ? 'この案で始めるね' : '案は取り下げたよ');
+    boardSoon(100);
+  } catch { addSys('サーバに繋がらないみたい'); }
+}
+
 const progressEl = document.getElementById('progress');
 progressEl.onclick = () => showPanelForce('board');
 function renderProgress(rows) {
@@ -770,6 +811,7 @@ async function refreshBoard() {
     const d = await r.json();
     const rows = [...(d.tasks ?? []), ...(d.open ?? [])];
     renderProgress(rows);          // 帯はボードを開いていなくても常に最新に
+    renderPlan(d.plan ?? null);    // 相談中の案(あれば)
     checkAutoPreview(d);           // 完成した成果物はその場で開く
     if (!boardOpen) return;
     boardEl.replaceChildren();
@@ -876,6 +918,10 @@ async function renderSettings() {
   }
   chatEffortSel.onchange = () => void post('/settings', { chatEffort: chatEffortSel.value });
   mk('会話 effort:', chatEffortSel);
+  const consult = document.createElement('input');
+  consult.type = 'checkbox'; consult.checked = d.consultMode !== false;
+  consult.onchange = () => void post('/settings', { consultMode: consult.checked });
+  mk('相談してから着手する(すぐ始めない):', consult);
   const skills = document.createElement('input');
   skills.type = 'checkbox'; skills.checked = !!d.useUserSettings;
   skills.onchange = () => void post('/settings', { useUserSettings: skills.checked });

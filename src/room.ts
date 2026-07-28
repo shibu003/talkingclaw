@@ -676,12 +676,17 @@ function loadProjects(): Record<string, string> {
 
 // ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
 const SETTINGS_PATH = join(homedir(), '.talkingclaw', 'settings.json');
-type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string };
+type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string; consultMode: boolean };
 function loadSettings(): WorkerSettings {
+  const defaults: WorkerSettings = {
+    workerModel: config.agent.model, workerEffort: '', useUserSettings: false,
+    chatModel: config.model, chatEffort: '',
+    consultMode: true, // 既定は相談モード: いきなり着手せず、まず進め方を相談して合意してから登録する
+  };
   try {
-    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false, chatModel: config.model, chatEffort: '', ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) };
+    return { ...defaults, ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) };
   } catch {
-    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false, chatModel: config.model, chatEffort: '' };
+    return defaults;
   }
 }
 let workerSettings = loadSettings();
@@ -717,8 +722,30 @@ store.onAppend((ev) => {
   }
 });
 
+// ---- 相談モード: 依頼が来てもいきなり着手せず、まず進め方を相談して合意してから登録する ----
+// 案は部屋に 1 つだけ(作業係が 1 人なので、同時に複数の相談を走らせない)。
+// 合意の入口は 2 つ: クロエの confirm_plan ツールと、画面/音声からの POST /plan {action:'confirm'}。
+type Plan = { summary: string; steps: string[]; project?: string; at: string };
+// ponytail: 相談中の案は in-memory(daemon 再起動で消える)。まとまった案はタスク台帳に残るので、
+// 永続化は「相談の途中で落ちるのが実際に困る」と分かってからでいい
+let plan: Plan | null = null;
+let planDelegate: ((description: string, project?: string) => OfficeTask) | null = null;
+
+function planText(p: Plan): string {
+  return p.summary + (p.steps.length > 0 ? '\n進め方:\n' + p.steps.map((s, i) => `${i + 1}. ${s}`).join('\n') : '');
+}
+function confirmPlan(): { ok: true; taskId: number; summary: string } | { ok: false; error: string } {
+  if (!plan) return { ok: false, error: 'まだ相談中の案がないよ' };
+  if (!planDelegate) return { ok: false, error: '作業係の準備がまだできていないよ' };
+  const p = plan;
+  plan = null; // 先に空にする(二重登録防止)
+  const task = planDelegate(planText(p), p.project);
+  store.append({ type: 'system', from: 'room', text: `相談まとまり → 作業に登録したよ: ${p.summary.slice(0, 60)}`, channel: 'work' });
+  return { ok: true, taskId: task.id, summary: p.summary };
+}
+
 // board の元データ(/tasks と /screen で共有)
-function boardSnapshot(): { tasks: OfficeTask[]; open: { agent: string; agentName: string; request: string; status: string; notes: string[]; artifacts: string[] }[] } {
+function boardSnapshot(): { tasks: OfficeTask[]; open: { agent: string; agentName: string; request: string; status: string; notes: string[]; artifacts: string[] }[]; plan: Plan | null; consultMode: boolean } {
   const open = [...turns.values()]
     .filter((t) => !t.responded && !t.noticeSent && t.target !== chloePid)
     .slice(-10)
@@ -727,7 +754,7 @@ function boardSnapshot(): { tasks: OfficeTask[]; open: { agent: string; agentNam
       request: t.text, status: t.delivered ? 'working' : 'queued',
       notes: agentNotes.get(t.target) ?? [], artifacts: [],
     }));
-  return { tasks: [...officeTasks].reverse().slice(0, 20), open };
+  return { tasks: [...officeTasks].reverse().slice(0, 20), open, plan, consultMode: workerSettings.consultMode };
 }
 
 // 画面状態(/screen): 発話中/待機中の participant を、再生完了通知(/played)がまだ来ていない
@@ -794,6 +821,7 @@ function startChloe(): void {
     void pumpTasks();
     return task;
   }
+  planDelegate = delegate; // 相談がまとまった時の登録先(confirm_plan / POST /plan から使う)
 
   chloeResetChat = () => {
     for (const c of CHANNELS) {
@@ -804,7 +832,7 @@ function startChloe(): void {
         cs.needsContext = true; // 記憶 + 直近ログを次の ask で再注入
       });
     }
-    store.append({ type: 'system', from: 'room', text: `会話モデルを ${workerSettings.chatModel} に切り替えたよ` });
+    store.append({ type: 'system', from: 'room', text: `会話の設定を切り替えたよ(モデル ${workerSettings.chatModel} / 相談モード ${workerSettings.consultMode ? 'あり' : 'なし'})` });
   };
 
   chloeResetWorker = () => {
@@ -921,6 +949,8 @@ function startChloe(): void {
           return { content: [{ type: 'text', text: JSON.stringify({
             note: '作業係は 1 人だけで、タスクは 1 件ずつ順番に処理される(並行実行はしていない)。この事実に反することを言わないこと。',
             workerBusyWith: officeTasks.find((t) => t.status === 'working')?.request?.slice(0, 60) ?? null,
+            consultMode: workerSettings.consultMode,
+            planUnderDiscussion: plan, // 相談中の案(まだ着手していない)
             tasks, people, userScreen: uiState, engine: engineState, activeChannel,
           }, null, 1) }] };
         },
@@ -932,6 +962,27 @@ function startChloe(): void {
         async ({ note }) => {
           appendMemory(note);
           return { content: [{ type: 'text', text: '覚えた。ユーザーには「覚えとくね」等と短く伝えるだけでいい。' }] };
+        },
+      ),
+      tool(
+        'propose_plan',
+        '相談モードでの進め方の案。まだ着手はしない。summary は 1 行の要約、steps は具体的な手順 2〜5 個。出したらそのまま声で読み上げて「これでいい?」と確認すること。直しの要望が来たら、直した案でもう一度呼ぶ。',
+        { summary: z.string(), steps: z.array(z.string()).optional(), project: z.string().optional() },
+        async ({ summary, steps, project }) => {
+          plan = { summary, steps: (steps ?? []).slice(0, 8), project, at: new Date().toISOString() };
+          store.append({ type: 'system', from: 'room', text: `相談中の案: ${summary.slice(0, 80)}`, channel: 'work' });
+          return { content: [{ type: 'text', text: `案を画面に出した。この内容を声で短く伝えて「これで進めていい?」と聞くこと。まだ作業は始まっていない。\n${planText(plan)}` }] };
+        },
+      ),
+      tool(
+        'confirm_plan',
+        'ユーザーが進め方に同意したら呼ぶ。ここで初めて作業係にタスクとして登録され、着手される。同意なしに呼ばないこと。',
+        {},
+        async () => {
+          const r = confirmPlan();
+          return { content: [{ type: 'text', text: r.ok
+            ? `task ${r.taskId} として登録した。ユーザーには短く「じゃあ始めるね」と伝えるだけでいい。`
+            : `登録できなかった: ${r.error}。先に propose_plan で案を出すこと。` }] };
         },
       ),
       tool(
@@ -947,21 +998,38 @@ function startChloe(): void {
   });
   // 部屋分割: 会話 Brain は channel ごとに別インスタンス(記憶が独立 = 雑談部屋に作業の文脈が漏れない)。
   // 雑談部屋は delegate_task を使わない(雑談専用。作業依頼が来たら作業部屋に誘導する)
+  // 相談モードの作法(work 部屋のみ)。ツール構成もここで切り替える:
+  // 相談モード = propose_plan / confirm_plan、直行モード = delegate_task
+  const CONSULT_PROMPT = `
+
+(相談モード)作業の依頼が来ても、いきなり作業係に登録しない。まず会話で「何を・どうやって・どこまでやるか」を短く詰める。
+前提が曖昧なら 1 つずつ聞く(まとめて何個も聞かない)。方向が見えたら propose_plan で案を出し、声で短く読み上げて「これで進めていい?」と確認する。
+同意が取れたら confirm_plan を呼ぶ。ここで初めてタスクとして登録される。直したいと言われたら propose_plan をやり直す。同意なしに confirm_plan を呼ばないこと。
+一言で済む雑談や質問には相談を挟まず普通に答えていい。`;
+
   function makeConvBrainOpts(channel: Channel) {
+    const consulting = channel === 'work' && workerSettings.consultMode;
+    const workTools = consulting
+      ? ['mcp__office__propose_plan', 'mcp__office__confirm_plan']
+      : ['mcp__office__delegate_task'];
     return {
-      systemPrompt: config.systemPrompt + config.rooms[channel], model: workerSettings.chatModel,
+      systemPrompt: config.systemPrompt + config.rooms[channel] + (consulting ? CONSULT_PROMPT : ''),
+      model: workerSettings.chatModel,
       ...(workerSettings.chatEffort ? { effort: workerSettings.chatEffort } : {}),
       mcpServers: { office: officeServer } as Record<string, unknown>,
       allowedTools: channel === 'work'
-        ? ['mcp__office__delegate_task', 'mcp__office__remember', 'mcp__office__room_status']
+        ? [...workTools, 'mcp__office__remember', 'mcp__office__room_status']
         : ['mcp__office__remember', 'mcp__office__room_status'],
       maxTurns: 8, // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
       // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
       canUseTool: async (name: string, input: Record<string, unknown>) => {
-        if (name === 'mcp__office__remember') return { behavior: 'allow' as const, updatedInput: input };
-        if (channel === 'work' && name === 'mcp__office__delegate_task') return { behavior: 'allow' as const, updatedInput: input };
-        if (name === 'mcp__office__delegate_task') return { behavior: 'deny' as const, message: 'ここは雑談部屋。作業の依頼は作業部屋でしてねと伝えて' };
-        return { behavior: 'deny' as const, message: 'あなたは会話係。実作業は delegate_task ツールに依頼内容を渡して任せること' };
+        if (name === 'mcp__office__remember' || name === 'mcp__office__room_status') return { behavior: 'allow' as const, updatedInput: input };
+        if (channel === 'work' && workTools.includes(name)) return { behavior: 'allow' as const, updatedInput: input };
+        if (name === 'mcp__office__delegate_task' && channel === 'work') {
+          return { behavior: 'deny' as const, message: '相談モード中。まず propose_plan で進め方の案を出して、同意を得てから confirm_plan で登録して' };
+        }
+        if (name.startsWith('mcp__office__')) return { behavior: 'deny' as const, message: 'ここは雑談部屋。作業の相談・依頼は作業部屋でしてねと伝えて' };
+        return { behavior: 'deny' as const, message: 'あなたは会話係。実作業はツール経由で作業係に任せること' };
       },
     };
   }
@@ -1316,13 +1384,15 @@ const server = createServer(async (req, res) => {
     if (typeof body.workerModel === 'string' && allowedModels.includes(body.workerModel)) workerSettings.workerModel = body.workerModel;
     if (typeof body.workerEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.workerEffort)) workerSettings.workerEffort = body.workerEffort;
     if (typeof body.useUserSettings === 'boolean') workerSettings.useUserSettings = body.useUserSettings;
+    const beforeConsult = workerSettings.consultMode;
+    if (typeof body.consultMode === 'boolean') workerSettings.consultMode = body.consultMode;
     const beforeChat = `${workerSettings.chatModel}/${workerSettings.chatEffort}`;
     if (typeof body.chatModel === 'string' && allowedModels.includes(body.chatModel)) workerSettings.chatModel = body.chatModel;
     if (typeof body.chatEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.chatEffort)) workerSettings.chatEffort = body.chatEffort;
     saveSettings();
     chloeResetWorker?.(); // 次の task から新設定(実行中の task は続行)
-    if (beforeChat !== `${workerSettings.chatModel}/${workerSettings.chatEffort}`) {
-      chloeResetChat?.(); // 会話中でも安全なタイミングで作り直す(記憶と直近ログは再注入)
+    if (beforeChat !== `${workerSettings.chatModel}/${workerSettings.chatEffort}` || beforeConsult !== workerSettings.consultMode) {
+      chloeResetChat?.(); // 会話中でも安全なタイミングで作り直す(記憶と直近ログは再注入)。相談モードは使えるツールが変わるので作り直しが要る
     }
     const ext = loadWorkerMcp();
     return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers), projects: Object.keys(loadProjects()) });
@@ -1336,6 +1406,21 @@ const server = createServer(async (req, res) => {
 
   if (path === '/tasks') {
     return json(res, 200, boardSnapshot());
+  }
+
+  if (path === '/plan') {
+    // 相談中の案の操作。画面のボタンからも、音声の合図(別機能)からもここに来る
+    const action = String(body.action ?? 'get');
+    if (action === 'confirm') {
+      const r = confirmPlan();
+      return r.ok ? json(res, 200, { ok: true, taskId: r.taskId }) : json(res, 400, { error: r.error });
+    }
+    if (action === 'cancel') {
+      if (plan) store.append({ type: 'system', from: 'room', text: '相談中の案はいったん取り下げたよ', channel: 'work' });
+      plan = null;
+      return json(res, 200, { ok: true, plan: null });
+    }
+    return json(res, 200, { plan, consultMode: workerSettings.consultMode });
   }
 
   if (path === '/transcript') {
