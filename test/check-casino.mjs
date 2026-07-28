@@ -1,7 +1,8 @@
 // 「言葉 → 手」の翻訳と 1 手ぶんの進行の検査(daemon 不要)。
 // 会話に紛れて誤爆しないこと、遊べる一通りの流れが通ることを見る。
-import { parseCommand, start, apply } from '../src/casino.ts';
+import { parseCommand, start, apply, brief, view } from '../src/casino.ts';
 import { shanten as mjShanten, tileName as mjTileName } from '../src/mahjong.ts';
+import { doraOf } from '../src/mahjongGame.ts';
 
 // 自分が 1 枚も持っていない牌の名前(読み上げに混ざっていないか見るため)
 function tileOfOther(g) {
@@ -80,7 +81,7 @@ console.log('[6] ポーカーを一通り遊ぶ(AI が勝手に打って、自�
   let r = apply(s, { type: 'deal', bet: 0 });
   const t = s.table;
   ok(t.street !== 'done' ? t.seats[t.toAct].id === 'you' : true, '自分の番まで進めて止まる');
-  ok(r.say.some((l) => l.includes('あなたの手は')), '自分の手札を教えてくれる');
+  ok((r.show ?? []).some((l) => l.includes('あなたの手')), '自分の手札は画面に出す(読み上げない = 相手のログに残さない)');
   ok(!r.say.join('').includes(t.seats[1].hole.map((c) => '♠♥♦♣'[c.suit]).join('')) || true, '相手の手札は伏せたまま');
   // 何手か回して、反則が起きないこと・チップが湧かないことを見る
   // 盤上の総額 = 手元 + ポット。配った直後はブラインドが既にポットにあるので両方数える
@@ -161,6 +162,106 @@ function mahjongCanTsumo(g) {
     && shantenOf(me.hand) === -1;
 }
 function shantenOf(hand) { return mjShanten(hand); }
+
+console.log('[9] クロエに渡す説明に、こちらの手札・手牌が混ざらない');
+{
+  // ポーカー: 同じ卓の相手なので、こちらの 2 枚は見えてはいけない
+  const p = start('poker', 31337, [{ id: 'c', name: 'クロエ', style: 0.7 }]).session;
+  apply(p, { type: 'deal', bet: 0 });
+  const pb = brief(p);
+  const mine = p.table.seats.find((s) => s.id === 'you').hole.map((c) => '♠♥♦♣'[c.suit] + ({11:'J',12:'Q',13:'K',14:'A'}[c.rank] ?? c.rank));
+  const leaked = mine.filter((c) => pb.includes(c));
+  ok(leaked.length === 0, `ポーカー: こちらの手札が説明に出ない(${mine.join(' ')} → 漏れ ${leaked.length})`);
+  ok(pb.includes('ポット'), 'ポーカー: ポットは伝える');
+  ok(pb.includes('見えない'), 'ポーカー: 見えないと明示している');
+  ok(pb.includes('ホールデム') || pb.includes('ブラインド'), 'ポーカー: ルールを伝える');
+
+  // 麻雀: 手牌 13〜14 枚のどれも出てはいけない
+  const m = start('mahjong', 4242, [{ id: 'c', name: 'クロエ', style: 0.7 }]).session;
+  apply(m, { type: 'deal', bet: 0 });
+  const mb = brief(m);
+  const me = m.game.players[0];
+  const names = [];
+  for (let t = 0; t < 34; t++) if (me.hand[t] > 0) names.push(mjTileName(t));
+  // 捨て牌やドラ表示と重なる牌は「見えてよい」ので、まだ誰も捨てていない配牌直後で見る
+  const river = new Set(m.game.players.flatMap((pl) => pl.discards.map(mjTileName)));
+  const doraInd = mjTileName(m.game.doraIndicator);
+  const hidden = names.filter((n) => !river.has(n) && n !== doraInd);
+  const leak2 = hidden.filter((n) => mb.includes(n));
+  ok(leak2.length === 0, `麻雀: こちらの手牌が説明に出ない(${hidden.length} 種 → 漏れ ${leak2.length}${leak2.length ? ': ' + leak2.join(' ') : ''})`);
+  ok(mb.includes('東1局'), '麻雀: 局を伝える');
+  ok(mb.includes('見えない'), '麻雀: 見えないと明示している');
+
+  // ブラックジャック: こちらの手は表向きなので見せる。伏せ札は明かさない
+  const b = start('blackjack', 7, []).session;
+  apply(b, { type: 'deal', bet: 100 });
+  const bb = brief(b);
+  const g = b.game;
+  const suit = (c) => '♠♥♦♣'[c.suit] + ({1:'A',11:'J',12:'Q',13:'K'}[c.rank] ?? c.rank);
+  ok(g.player.every((c) => bb.includes(suit(c))), 'ブラックジャック: こちらの手は表向きなので伝える');
+  if (g.phase === 'player') ok(!bb.includes(suit(g.dealer[1])), 'ブラックジャック: 伏せ札は明かさない');
+  else ok(true, 'ブラックジャック: 伏せ札は明かさない(即決着で判定省略)');
+  ok(brief(null) === '', '遊んでいない時は何も渡さない');
+}
+
+console.log('[9-2] 読み上げに手牌を混ぜない(進行役の発言として記録に残るため)');
+{
+  const m = start('mahjong', 4242, [{ id: 'c', name: 'クロエ' }]).session;
+  let r = apply(m, { type: 'deal', bet: 0 });
+  const me = m.game.players[0];
+  const names = [];
+  for (let t = 0; t < 34; t++) if (me.hand[t] > 0) names.push(mjTileName(t));
+  // 捨て牌とドラは全員に見えるので、読み上げても漏れではない
+  const river = new Set(m.game.players.flatMap((p) => p.discards.map(mjTileName)));
+  const dora = mjTileName(doraOf(m.game.doraIndicator));
+  const hidden = names.filter((n) => !river.has(n) && n !== dora);
+  const spoken = (r.say ?? []).join(' ');
+  const leak = hidden.filter((n) => spoken.includes(n));
+  ok(leak.length === 0, `麻雀: 読み上げ(say)に手牌が出ない(漏れ ${leak.length}${leak.length ? ': ' + leak.join(' ') : ''})`);
+  ok((r.show ?? []).join(' ').length > 0, '手牌は show(画面だけ)に入る');
+
+  const p = start('poker', 31337, [{ id: 'c', name: 'クロエ' }]).session;
+  r = apply(p, { type: 'deal', bet: 0 });
+  const mine = p.table.seats.find((s) => s.id === 'you').hole
+    .map((c) => '♠♥♦♣'[c.suit] + ({ 11: 'J', 12: 'Q', 13: 'K', 14: 'A' }[c.rank] ?? c.rank));
+  const spoken2 = (r.say ?? []).join(' ');
+  ok(mine.every((c) => !spoken2.includes(c)), `ポーカー: 読み上げに手札が出ない(${mine.join(' ')})`);
+  ok((r.show ?? []).join(' ').includes(mine[0]), 'ポーカー: 手札は show に入る');
+}
+
+console.log('[10] 画面用の卓(札と牌)');
+{
+  const b = start('blackjack', 7, []).session;
+  apply(b, { type: 'deal', bet: 100 });
+  const bv = view(b);
+  const dealerRow = bv.table.find((r) => r.label.includes('ディーラー'));
+  ok(bv.table.length === 2 && dealerRow, '2 段(ディーラー / あなた)で出る');
+  if (b.game.phase === 'player') {
+    ok(dealerRow.faces.some((f) => f.hidden), '手の途中は伏せ札が hidden で出る');
+  } else ok(true, '手の途中は伏せ札が hidden(即決着で判定省略)');
+  ok(bv.table.every((r) => r.kind === 'card'), 'ブラックジャックは札として出す');
+
+  const p = start('poker', 31337, [{ id: 'c', name: 'クロエ' }]).session;
+  apply(p, { type: 'deal', bet: 0 });
+  const pv = view(p);
+  const board = pv.table.find((r) => r.label.includes('場'));
+  ok(board && board.faces.length === 5, `場は常に 5 枚ぶん(未公開は裏)= ${board?.faces.length}`);
+  ok(board.faces.filter((f) => f.hidden).length === 5, 'プリフロップは 5 枚とも裏');
+
+  const m = start('mahjong', 4242, [{ id: 'c', name: 'クロエ' }]).session;
+  apply(m, { type: 'deal', bet: 0 });
+  const mv = view(m);
+  const hand = mv.table.find((r) => r.label.includes('手牌'));
+  ok(hand && hand.kind === 'tile', '麻雀は牌として出す');
+  ok(hand.faces.length === 14, `親の手牌は 14 枚(${hand?.faces.length})`);
+  ok(hand.faces.every((f) => f.move), '自分の番なので全部押して切れる');
+  ok(hand.faces[hand.faces.length - 1].red === true, 'ツモ牌は離して目立たせる');
+  // 立直中はツモ切りだけ
+  m.game.players[0].riichi = true;
+  const rv = view(m);
+  const rhand = rv.table.find((r) => r.label.includes('手牌'));
+  ok(rhand.faces.filter((f) => f.move).length === 1, `立直中はツモ牌だけ押せる(${rhand.faces.filter((f) => f.move).length})`);
+}
 
 console.log(fail === 0 ? '\nカジノ: ALL PASS' : '\nカジノ: FAIL あり');
 process.exit(fail);

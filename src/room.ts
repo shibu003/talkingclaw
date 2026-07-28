@@ -668,6 +668,11 @@ function tryGame(text: string): number | null {
   else gameSessions.delete(activeChannel);
   saveGames();
   if (reply.hand) store.append({ type: 'system', from: 'room', text: reply.hand, channel: activeChannel });
+  // あなただけに見せる情報は system として画面に出すだけ。読み上げないし記録にも残さない
+  // (進行役の発言として残すと、同じ卓にいる相手の文脈に手牌が戻ってしまう)
+  for (const line of reply.show ?? []) {
+    store.append({ type: 'system', from: 'room', text: line, channel: activeChannel });
+  }
   const name = registry.get(chloePid)?.assignedName ?? config.character.name;
   for (const line of reply.say) speakSentences(chloePid, name, line, turnId, activeChannel);
   return ev.id;

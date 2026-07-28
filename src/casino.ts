@@ -83,7 +83,9 @@ export function parseCommand(text: string, session: Session | null): Cmd | null 
 }
 // <<< parseCommand
 
-export type Reply = { say: string[]; session: Session | null; hand?: string };
+// say = みんなに聞こえる進行(記録に残る) / show = あなただけに見せる情報(読み上げず記録もしない)
+// 手牌や手札を say に入れると、進行役の発言としてログに残り、対戦相手の文脈に戻ってしまう
+export type Reply = { say: string[]; show?: string[]; session: Session | null; hand?: string };
 
 // キャラごとの打ち方。強気なほど、勝率が微妙でも乗るしブラフも打つ
 const STYLE: Record<string, number> = { クロエ: 0.72, コハク: 0.3, まい: 0.55, 作業係: 0.45 };
@@ -178,7 +180,7 @@ function applyPoker(session: Session & { kind: 'poker' }, cmd: Cmd): Reply {
 
   if (cmd.type === 'status') {
     const rows = t.seats.map((s) => `${s.name} ${s.chips}`).join('、');
-    return { say: [`${pk.describe(t, session.meId)}`, `チップは ${rows}。`], session, hand: board() };
+    return { say: [`チップは ${rows}。`], show: [pk.describe(t, session.meId)], session, hand: board() };
   }
   if (cmd.type === 'refill') {
     me.chips += 1000;
@@ -402,8 +404,8 @@ function applyMahjong(session: Session & { kind: 'mahjong' }, cmd: Cmd): Reply {
   const me = g.players[seat];
 
   if (cmd.type === 'status') {
-    return { say: [mg.describe(g, session.meId), `点数は ${g.players.map((p) => `${p.name} ${p.points}`).join('、')}。`],
-      session, hand: mg.handDisplay(g, session.meId) };
+    return { say: [`点数は ${g.players.map((p) => `${p.name} ${p.points}`).join('、')}。`],
+      show: [mg.describe(g, session.meId)], session, hand: mg.handDisplay(g, session.meId) };
   }
   if (cmd.type === 'refill') return { say: ['麻雀では点棒は足せないよ。飛んだら終わりね。'], session };
   if (cmd.type === 'deal') {
@@ -435,7 +437,7 @@ function applyMahjong(session: Session & { kind: 'mahjong' }, cmd: Cmd): Reply {
     const before = g.log.length;
     const r = mg.discard(g, seat, tile, cmd.riichi);
     if (!r.ok) return { say: [r.error], session, hand: mg.handDisplay(g, session.meId) };
-    return runMahjongAi(g, session, [`${mj.tileName(tile)} を切ったよ。`, ...g.log.slice(before)]);
+    return runMahjongAi(g, session, [...g.log.slice(before)]);
   }
   return { say: ['それは麻雀では使えないよ。切る牌を言うか、ツモ・ロン・リーチだよ。'], session };
 }
@@ -443,6 +445,7 @@ function applyMahjong(session: Session & { kind: 'mahjong' }, cmd: Cmd): Reply {
 // 自分の番が来るまで他家に打たせる。ロンできる場面では止めて聞く
 function runMahjongAi(g: mg.Game, session: Session & { kind: 'mahjong' }, say: string[]): Reply {
   const seat = g.players.findIndex((p) => p.id === session.meId);
+  const show: string[] = [];
   let guard = 0;
   while (guard++ < 200) {
     if (g.phase === 'done' || g.phase === 'over') {
@@ -471,8 +474,8 @@ function runMahjongAi(g: mg.Game, session: Session & { kind: 'mahjong' }, say: s
     if (g.phase === 'discard') {
       if (g.turn === seat) {
         const t = mg.canTsumo(g, seat);
-        if (t) say.push(`${mj.tileName(g.players[seat].drawn!)} をツモった。和了れるよ! ツモする?`);
-        say.push(mg.describe(g, session.meId));
+        if (t) say.push('和了れるよ! ツモする?');   // 何をツモったかは読み上げない(画面で見る)
+        show.push(mg.describe(g, session.meId));
         break;
       }
       const s = g.turn;
@@ -486,7 +489,7 @@ function runMahjongAi(g: mg.Game, session: Session & { kind: 'mahjong' }, say: s
     }
     break;
   }
-  return { say: dedupe(say), session, hand: mg.handDisplay(g, session.meId) };
+  return { say: dedupe(say), show, session, hand: mg.handDisplay(g, session.meId) };
 }
 
 // 人間の番が来るまで AI に打たせる。1 手ごとの出来事をそのまま読み上げ文にする
@@ -503,10 +506,10 @@ function runAi(t: pk.Table, session: Session & { kind: 'poker' }, say: string[])
     say.push(...t.log.slice(-3).filter((l) => l.includes('獲得')));
     const me = t.seats.find((s) => s.id === session.meId)!;
     say.push(`あなたのチップは ${me.chips} 枚。次いく?`);
-  } else {
-    say.push(pk.describe(t, session.meId));
   }
-  return { say: dedupe(say), session };
+  // 自分の手札が入る説明は読み上げない(画面で見る)
+  const show = t.street === 'done' ? [] : [pk.describe(t, session.meId)];
+  return { say: dedupe(say), show, session };
 }
 
 // 同じ行を二重に読まない(log の切り出しが重なることがある)

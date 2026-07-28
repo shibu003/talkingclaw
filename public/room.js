@@ -245,6 +245,15 @@ function playAckNow(url, bubble, eventId, text) {
   audio.play().catch(advance);
 }
 
+// 読み上げを止める。声で割り込んだ時とボタンで押した時で同じ後始末を通す
+// (画面の行は消さない。消えるのは音だけ)
+function stopSpeaking() {
+  if (currentAudio) currentAudio.pause();
+  audioQueue.length = 0;
+  playing = false;
+  document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
+}
+
 // ---- SSE ----
 let es = null;
 function connect() {
@@ -392,6 +401,11 @@ async function attachFiles(files) {
 }
 
 document.getElementById('attachBtn').onclick = () => fileInput.click();
+document.getElementById('stopBtn').onclick = () => {
+  stopSpeaking();
+  resumeMic();
+  setStatus('止めたよ');
+};
 fileInput.onchange = () => { void attachFiles(fileInput.files); fileInput.value = ''; };
 for (const type of ['dragenter', 'dragover']) {
   document.addEventListener(type, (e) => { e.preventDefault(); composerEl.classList.add('drop'); });
@@ -535,10 +549,7 @@ async function ensureVad() {
             currentAudio.volume = 1;
             return;
           }
-          currentAudio.pause();           // 再生中 = pause(S11)
-          audioQueue.length = 0;          // 未再生 = 破棄
-          playing = false;
-          document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
+          stopSpeaking();                 // 再生中は pause、未再生は破棄(S11)
           void post('/metrics', { kind: 'barge_in', ms: 0 });
           setStatus('どうぞ');
           resumeMic();                    // 発話を拾いに行く
@@ -840,6 +851,8 @@ async function enterRoom(next) {
   boardSoon(50);           // 何をしているか
   void renderRooms();      // 部屋の名前(一覧とヘッダの表示)
   void refreshGame();      // 部屋ごとに別のゲームなので取り直す
+  // 遊ぶための部屋なので、入ったら卓を出す(他の部屋では右レーンを開かない)
+  if (next === 'game' && wideLayout()) switchBoardTab('game');
 }
 
 // 部屋に入った時、その部屋で話していた内容を読み直す(音は鳴らさない)
