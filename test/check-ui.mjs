@@ -18,6 +18,27 @@ if (/\.style\.display\s*=/.test(js.replace(/noticeEl\.style\.display\s*=\s*'bloc
   console.log('  ❌ パネルの開閉が style.display 直書きに戻ってる(openPanel に一本化して)'); fail = 1;
 } else console.log('  ✅ パネル開閉は openPanel に一本化されてる');
 
+// 進捗の帯: 件数から作る割合が壊れてないか(純関数を room.js から取り出す)
+{
+  const body = js.slice(js.indexOf('// >>> progressSummary'), js.indexOf('// <<< progressSummary'));
+  const progressSummary = new Function(`${body}; return progressSummary;`)();
+  const s = progressSummary([
+    { status: 'done', notes: [] }, { status: 'done', notes: [] },
+    { status: 'working', agentName: 'コハク', notes: ['テスト書いてる'] },
+    { status: 'queued', notes: [] },
+  ]);
+  const seg = (k) => s.bar.find((b) => b.key === k)?.pct ?? 0;
+  if (s.total !== 4 || seg('done') !== 50 || seg('working') !== 25 || seg('queued') !== 25) {
+    console.log(`  ❌ 進捗の割合がおかしい: ${JSON.stringify(s.bar)}`); fail = 1;
+  } else if (s.note !== 'コハク: テスト書いてる') {
+    console.log(`  ❌ 実況の取り出しがおかしい: ${s.note}`); fail = 1;
+  } else if (progressSummary([]).total !== 0 || progressSummary([]).bar.length !== 0) {
+    console.log('  ❌ 作業ゼロ件で帯が出てしまう'); fail = 1;
+  } else if (progressSummary([{ status: 'interrupted', notes: [] }]).bar[0].key !== 'failed') {
+    console.log('  ❌ 中断(interrupted)が帯に出ない'); fail = 1;
+  } else console.log('  ✅ 進捗の帯は件数どおりに出る(0 件なら出ない)');
+}
+
 // 読みやすさ: 文字と背景のコントラストが WCAG AA(4.5:1)を割ってないか
 const varOf = (name) => html.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, 'i'))?.[1];
 const lum = (hex) => {

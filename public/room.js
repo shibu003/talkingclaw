@@ -681,13 +681,93 @@ function addSysLink(text, href) {
   log.scrollTop = log.scrollHeight;
 }
 updateRoomBtn();
+const STAT_LABEL = { queued: '待機', working: '⚙ 作業中', done: '✔ 完了', failed: '✖ 失敗', interrupted: '⏸ 中断' };
+// 経過時間(進捗率は誰も知らないので、代わりに「どれだけ経ったか」を出す)
+function elapsed(iso) {
+  const ms = Date.now() - new Date(iso ?? '').getTime();
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return `${Math.max(1, Math.floor(ms / 1000))}秒`;
+  if (min < 60) return `${min}分`;
+  return `${Math.floor(min / 60)}時間${min % 60}分`;
+}
+
+// >>> progressSummary(pure: test/check-ui.mjs から取り出して単体で検査する)
+// 進捗の帯の元データ。割合は「件数」の実測だけで作る(作業中の進み具合は誰も知らないので
+// 率をでっち上げず、帯は動くストライプ・タスク行は経過時間で表す)
+function progressSummary(rows) {
+  const counts = { working: 0, queued: 0, done: 0, failed: 0, interrupted: 0 };
+  let note = '';
+  for (const t of rows || []) {
+    const s = counts[t.status] === undefined ? 'queued' : t.status;
+    counts[s]++;
+    if (s === 'working' && (t.notes ?? []).length > 0) note = `${t.agentName}: ${t.notes[t.notes.length - 1]}`;
+  }
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  const pct = (n) => (total === 0 ? 0 : Math.round((n / total) * 100));
+  return {
+    counts, total, note,
+    // 帯の並び順 = 済んだもの → 動いているもの → これから
+    bar: [
+      { key: 'done', pct: pct(counts.done) },
+      { key: 'failed', pct: pct(counts.failed + counts.interrupted) },
+      { key: 'working', pct: pct(counts.working) },
+      { key: 'queued', pct: pct(counts.queued) },
+    ].filter((s) => s.pct > 0),
+  };
+}
+// <<< progressSummary
+
+const progressEl = document.getElementById('progress');
+progressEl.onclick = () => showPanelForce('board');
+function renderProgress(rows) {
+  const s = progressSummary(rows);
+  progressEl.classList.toggle('on', s.total > 0);
+  if (s.total === 0) return;
+  progressEl.replaceChildren();
+  const bar = document.createElement('span');
+  bar.className = 'pbar';
+  for (const seg of s.bar) {
+    const i = document.createElement('i');
+    i.className = 's-' + seg.key;
+    i.style.width = seg.pct + '%';
+    bar.appendChild(i);
+  }
+  progressEl.appendChild(bar);
+  const legend = document.createElement('span');
+  legend.className = 'plegend';
+  const items = [
+    ['working', '作業中', s.counts.working], ['queued', '待機', s.counts.queued],
+    ['done', '完了', s.counts.done], ['failed', '止まった', s.counts.failed + s.counts.interrupted],
+  ];
+  for (const [key, label, n] of items) {
+    if (n === 0 && key !== 'working') continue;
+    const item = document.createElement('span');
+    const dot = document.createElement('i');
+    dot.className = 's-' + key;
+    const b = document.createElement('b');
+    b.textContent = String(n);
+    item.append(dot, document.createTextNode(label), b);
+    legend.appendChild(item);
+  }
+  progressEl.appendChild(legend);
+  if (s.note) {
+    const note = document.createElement('span');
+    note.className = 'pnote';
+    note.textContent = '実況: ' + s.note;
+    progressEl.appendChild(note);
+  }
+}
+
 async function refreshBoard() {
   try {
     const r = await post('/tasks', {});
     const d = await r.json();
-    if (!boardOpen) { checkAutoPreview(d); return; }
-    boardEl.replaceChildren();
     const rows = [...(d.tasks ?? []), ...(d.open ?? [])];
+    renderProgress(rows);          // 帯はボードを開いていなくても常に最新に
+    checkAutoPreview(d);           // 完成した成果物はその場で開く
+    if (!boardOpen) return;
+    boardEl.replaceChildren();
     if (rows.length === 0) {
       const e = document.createElement('div'); e.className = 'tnote'; e.textContent = 'いまは作業なし'; boardEl.appendChild(e);
     }
@@ -696,11 +776,24 @@ async function refreshBoard() {
       div.className = 'task';
       const stat = document.createElement('span');
       stat.className = 'tstat ' + t.status;
-      stat.textContent = { queued: '待機', working: '⚙ 作業中', done: '✔ 完了', failed: '✖ 失敗' }[t.status] ?? t.status;
+      stat.textContent = STAT_LABEL[t.status] ?? t.status;
       div.appendChild(stat);
       const req = document.createElement('span');
       req.textContent = `${t.agentName}: ${(t.request ?? '').slice(0, 60)}`;
       div.appendChild(req);
+      const ago = elapsed(t.at);
+      if (ago) {
+        const meta = document.createElement('span');
+        meta.className = 'tmeta';
+        meta.textContent = t.status === 'working' ? `経過 ${ago}` : `受付 ${ago}前`;
+        div.appendChild(meta);
+      }
+      const bar = document.createElement('span');
+      bar.className = 'tbar';
+      const fill = document.createElement('i');
+      fill.className = 's-' + ({ working: 'working', done: 'done', failed: 'failed', interrupted: 'failed' }[t.status] ?? 'queued');
+      bar.appendChild(fill);
+      div.appendChild(bar);
       if (t.notes && t.notes.length > 0) {
         const note = document.createElement('span');
         note.className = 'tnote';
@@ -713,10 +806,6 @@ async function refreshBoard() {
         link.textContent = ' 📦 ' + a;
         link.onclick = (e) => { e.preventDefault(); showPreview(a); };
         div.appendChild(link);
-      }
-      if (t.id && t.status === 'done' && (t.artifacts ?? []).length > 0 && !previewedTasks.has(t.id)) {
-        previewedTasks.add(t.id);
-        showPreview(t.artifacts[0]); // 完成したらその場で開く
       }
       boardEl.appendChild(div);
     }

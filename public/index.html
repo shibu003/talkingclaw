@@ -81,6 +81,30 @@
   #roomsExtra:empty { display: none; }   /* 新規作成・名前変更 UI のマウント先 */
   #roomsExtra { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--surface-2); }
 
+  /* ---- 進捗の帯(常に見える。押すと作業ボードが開く)---- */
+  #progress { display: none; width: calc(100% - var(--pad) * 2); margin: 10px var(--pad) 0;
+              padding: 11px 14px; text-align: left; background: var(--surface);
+              border: 1px solid var(--line); border-radius: var(--r-md); }
+  #progress.on { display: block; }
+  #progress:hover { border-color: var(--accent); }
+  /* 状態の色は帯・凡例・タスク行で共通(同じ色 = 同じ意味) */
+  .s-done { background: #4c9e68; } .s-working { background: var(--accent); }
+  .s-queued { background: #4d4270; } .s-failed { background: #b0455f; }
+  .pbar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: #2c2440; }
+  .pbar i { display: block; height: 100%; }
+  .pbar .s-working {
+    background-image: linear-gradient(115deg, rgba(255,255,255,.34) 25%, transparent 25%, transparent 50%,
+                                       rgba(255,255,255,.34) 50%, rgba(255,255,255,.34) 75%, transparent 75%);
+    background-size: 16px 16px; animation: flow 1s linear infinite; }
+  @keyframes flow { to { background-position: 16px 0; } }
+  .plegend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px;
+             font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
+  .plegend span { display: inline-flex; align-items: center; gap: 5px; }
+  .plegend b { color: var(--text); font-weight: 700; }
+  .plegend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .pnote { display: block; margin-top: 7px; font-size: var(--fs-small); line-height: 1.6; color: var(--muted);
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
   /* 作業ボード: 状態 → 依頼 → 実況 の順に読ませる */
   .task { padding: 11px 0; border-bottom: 1px solid var(--surface-2); font-size: var(--fs-ui); line-height: 1.7; }
   .task:last-child { border-bottom: 0; }
@@ -89,6 +113,12 @@
   .task .tstat.done { background: #2f6440; } .task .tstat.failed { background: #7a3345; }
   .task .tnote { display: block; margin: 4px 0 0 4px; padding-left: 10px; border-left: 2px solid var(--line);
                  color: var(--muted); font-size: var(--fs-small); line-height: 1.7; }
+  .task .tmeta { color: var(--muted); font-size: var(--fs-small); margin-left: 6px; }
+  .task .tbar { display: block; height: 4px; margin-top: 7px; border-radius: 999px; background: #2c2440; overflow: hidden; }
+  .task .tbar i { display: block; height: 100%; width: 100%; border-radius: 999px; }
+  .task .tbar .s-working { width: 40%; animation: slide 1.6s ease-in-out infinite; }
+  .task .tbar .s-queued { width: 12%; }
+  @keyframes slide { 0% { margin-left: 0 } 50% { margin-left: 60% } 100% { margin-left: 0 } }
   .task a { color: var(--accent); }
   .tnote { color: var(--muted); font-size: var(--fs-small); line-height: 1.7; }
 
@@ -162,6 +192,7 @@
   </div>
 </header>
 <div id="notice"></div>
+<button id="progress" title="作業ボードを開く"></button>
 <div id="roster"></div>
 <div id="rooms" class="panel">
   <h2>部屋</h2>
