@@ -9,6 +9,9 @@ const textInput = document.getElementById('text');
 
 let lastEventId = 0;
 let replayBoundary = 0;   // hello の lastId 以前は replay(S1: 音声 enqueue しない)
+// ---- 部屋分割: 作業部屋 / 雑談部屋(表示・音声は今いる部屋の分だけ。切替は #roomBtn)----
+let currentChannel = 'work';
+const ROOM_LABEL = { work: '🛠 作業部屋', chat: '💬 雑談部屋' };
 let handsfree = false;
 let listening = false;
 let playing = false;
@@ -119,7 +122,13 @@ function enqueueAudio(url, bubble, eventId, turnId, filler, text) {
   if (!playing) playNext();
 }
 
-// 相槌の即時再生(queue を経由しない。終了後に通常 queue を再開)
+// 相槌の即時再生(queue を経由しない。終了後に通常 queue を再開)。
+// 発話中(gateActive)なら解除待ちで少し保留し、それでも既に何か再生中なら諦める(即時性が価値の filler なので遅延して出す意味は薄い)。
+function maybePlayAck(url, bubble, eventId, text) {
+  if (playing) return;
+  if (gateActive()) { setTimeout(() => maybePlayAck(url, bubble, eventId, text), 250); return; }
+  playAckNow(url, bubble, eventId, text);
+}
 function playAckNow(url, bubble, eventId, text) {
   playing = true;
   pauseMic(); // マイク方針は SP3 の実測で確定(現状は保守的に停止)
@@ -164,6 +173,9 @@ function connect() {
 
 function render(ev) {
   const isReplay = ev.id <= replayBoundary;
+  // 部屋分割: 会話系(user_speech/agent_speech)は今いる部屋の分だけ表示・再生。
+  // 実況/system・presence は channel を持たず常時表示(部屋切替の告知等は見えていてほしい)
+  if ((ev.type === 'user_speech' || ev.type === 'agent_speech') && ev.channel && ev.channel !== currentChannel) return;
   if (ev.type === 'user_speech') {
     if (!isReplay) audioQueue.length = 0; // stale drop: 自分が話したら溜まった読み上げは捨てる(再生中のみ完了させる)
     const b = addBubble('user', ev.text ?? '');
@@ -179,7 +191,7 @@ function render(ev) {
     const b = agentBubble(ev.from, ev.name, ev.text ?? '');
     if (ev.audio && !isReplay) {
       // S6: 相槌(ack)は FIFO に入れない独立即時スロット — 再生中なら即スキップ
-      if (ev.filler === 'ack') { if (!playing) playAckNow(ev.audio, b.div, ev.id, ev.text); }
+      if (ev.filler === 'ack') maybePlayAck(ev.audio, b.div, ev.id, ev.text);
       else enqueueAudio(ev.audio, b.div, ev.id, ev.turnId, ev.filler, ev.text);
       // 6B: 本応答が来たら同 turn の未再生 filler を破棄(キャンセル 3 層目)
       if (!ev.filler && ev.turnId) {
@@ -240,6 +252,13 @@ let interimEl = null;
 let speechEndAt = 0;
 let interimUpdatedAt = 0; // interim ゲート(S6): 本応答の再生開始を保留(ack は対象外)
 let interimStartedAt = 0;
+// ユーザーが今話しているかを room daemon に報告する(単一の状態源 userSpeaking / server: room.ts)。
+// 会話 Brain・外部 MCP agent 等、他参加者の音声出力はこれを見て発話中は先に進めない。
+let lastSpeakingPingAt = 0;
+function reportSpeaking(speaking) {
+  lastSpeakingPingAt = performance.now();
+  void post('/speech-state', { speaking });
+}
 function gateActive() {
   const now = performance.now();
   if (!interimUpdatedAt) return false;
@@ -268,6 +287,7 @@ if (!SR) {
   recognition.onend = () => {
     listening = false;
     interimUpdatedAt = 0;
+    reportSpeaking(false); // final を経ずに終わる(no-speech 等)場合の保険
     micBtn.classList.remove('listening');
     interimEl?.remove(); interimEl = null;
     if (!handsfree || playing) return;
@@ -292,6 +312,8 @@ if (!SR) {
       const now = performance.now();
       if (!interimUpdatedAt || now - interimUpdatedAt > 1500) interimStartedAt = now;
       interimUpdatedAt = now;
+      // 発話継続中は 800ms 間隔で refresh(server 側の自動失効 4s より十分短い)
+      if (now - lastSpeakingPingAt > 800) reportSpeaking(true);
       if (!interimEl) { interimEl = document.createElement('div'); interimEl.className = 'interim'; }
       interimEl.textContent = interim + '…';
       log.appendChild(interimEl);
@@ -300,6 +322,7 @@ if (!SR) {
     if (finalText) {
       sttFails = 0;
       interimUpdatedAt = 0; // final で即クリア(S6)
+      reportSpeaking(false);
       if (isEcho(finalText)) {
         interimEl?.remove(); interimEl = null;
         addSys('(自分の声っぽいので無視したよ)');
@@ -376,6 +399,7 @@ async function refreshRoster() {
     const r = await fetch('/participants?token=' + TOKEN);
     const d = await r.json();
     selectedPid = d.selected;
+    if (d.channel && d.channel !== currentChannel) { currentChannel = d.channel; updateRoomBtn(); }
     rosterEl.replaceChildren();
     const label = document.createElement('span');
     label.className = 'label';
@@ -426,7 +450,23 @@ document.getElementById('boardBtn').onclick = () => {
   boardEl.style.display = boardOpen ? 'block' : 'none';
   if (boardOpen) void refreshBoard();
 };
-document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN);
+document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel);
+document.getElementById('archiveBtn').onclick = () => window.open('/archives.md?token=' + TOKEN);
+
+// ---- 部屋分割: 作業部屋 / 雑談部屋の切替 ----
+const roomBtn = document.getElementById('roomBtn');
+function updateRoomBtn() { roomBtn.textContent = ROOM_LABEL[currentChannel] ?? currentChannel; }
+roomBtn.onclick = async () => {
+  const next = currentChannel === 'work' ? 'chat' : 'work';
+  await post('/channel', { channel: next });
+  currentChannel = next;
+  updateRoomBtn();
+  // 部屋を跨ぐ古い吹き出しは残さず、新しい部屋のライブ表示だけにする(履歴は 📄 会話ログで別途見られる)
+  log.replaceChildren();
+  bubbles.clear();
+  audioQueue.length = 0;
+};
+updateRoomBtn();
 async function refreshBoard() {
   try {
     const r = await post('/tasks', {});

@@ -8,7 +8,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
-import { EventStore, Registry, kanaNormalize, type RoomEvent } from './roomcore.ts';
+import { archiveIndexTail, archiveRead, archiveSession, markArchiveBaseline } from './archive.ts';
+import { EventStore, Registry, kanaNormalize, type Channel, type RoomEvent } from './roomcore.ts';
 import { Voice, splitSentences } from './voice.ts';
 
 const PORT = Number(process.env.PORT ?? 3300);
@@ -19,6 +20,16 @@ const BODY_MAX = 64 * 1024;
 const store = new EventStore();
 const registry = new Registry();
 const voice = new Voice(config.tts);
+
+// ---- 部屋分割(会話コンテキストの分離): 作業部屋 / 雑談部屋 ----
+// 単一の EventStore は共有したまま、event に channel を付け会話の記憶(Brain)と transcript だけを隔てる。
+// 「今どちらの部屋にいるか」は単一の activeChannel(部屋全体で 1 つ。/channel で切替)。
+const CHANNELS = ['work', 'chat'] as const;
+const ROOM_LABEL: Record<Channel, string> = { work: '作業部屋', chat: '雑談部屋' };
+let activeChannel: Channel = 'work';
+function isChannel(v: unknown): v is Channel {
+  return v === 'work' || v === 'chat';
+}
 
 // ---- audio 置き場(相槌プールは evict 対象外)----
 const audioStore = new Map<number, Buffer>();
@@ -40,7 +51,7 @@ function putAudio(wav: Buffer, isProtected = false): string {
 }
 
 // ---- EngineManager(S5): daemon が engine を保有・監視。kill は自分の子(handle 基準)のみ ----
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 
 let engineState: 'starting' | 'ready' | 'down' = 'starting';
@@ -49,12 +60,14 @@ let engineSpawnedAt = 0;
 const engineSpawnLog: number[] = [];
 let synthFailStreak = 0;
 
-async function engineAlive(): Promise<boolean> {
+// W9-0: 生死判定は 3 値。timeout(= 合成でビジーの可能性)と refused(= 本当に死亡)を区別する
+type EngineProbe = 'ok' | 'busy' | 'refused';
+async function engineProbe(): Promise<EngineProbe> {
   try {
-    const r = await fetch(`${config.tts.url}/version`, { signal: AbortSignal.timeout(2000) });
-    return r.ok;
-  } catch {
-    return false;
+    const r = await fetch(`${config.tts.url}/version`, { signal: AbortSignal.timeout(6000) });
+    return r.ok ? 'ok' : 'busy'; // HTTP エラーでも応答はある = 生きている
+  } catch (error) {
+    return (error as Error).name === 'TimeoutError' ? 'busy' : 'refused';
   }
 }
 
@@ -75,13 +88,38 @@ function spawnEngine(): void {
     env: { ...process.env, HF_HUB_DISABLE_IMPLICIT_TOKEN: '1', HF_TOKEN: '' },
   });
   engineChild.unref();
+  const startedAt = Date.now();
+  engineChild.on('exit', (code) => {
+    // 起動直後の即死(= 既に別インスタンスが port を握っている)は rate-limit から返却する
+    if (Date.now() - startedAt < 10_000 && code !== 0) {
+      const i = engineSpawnLog.lastIndexOf(now);
+      if (i >= 0) engineSpawnLog.splice(i, 1);
+      store.append({ type: 'system', from: 'room', text: '音声エンジンは既に動いてるみたい(二重起動を取り消したよ)' });
+    }
+  });
   console.error('AivisSpeech engine を起動中…');
+}
+
+let probeFailStreak = 0;
+
+function enginePortOccupied(): boolean {
+  const port = new URL(config.tts.url).port || '10101';
+  try {
+    return execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' }).trim().length > 0;
+  } catch {
+    return false; // lsof が無い/該当なし → 空きとみなす
+  }
 }
 
 async function engineLoop(): Promise<void> {
   for (;;) {
-    const alive = await engineAlive();
-    if (alive) {
+    await new Promise((r) => setTimeout(r, 5000));
+    // 合成中は判定しない — 単一ロックでビジーなだけの生きたエンジンを殺さない(W9-0)
+    if (pumping) { probeFailStreak = 0; continue; }
+
+    const probe = await engineProbe();
+    if (probe === 'ok') {
+      probeFailStreak = 0;
       if (engineState !== 'ready') {
         engineState = 'ready';
         synthFailStreak = 0;
@@ -89,22 +127,34 @@ async function engineLoop(): Promise<void> {
         store.append({ type: 'system', from: 'room', text: '声の準備ができたよ' });
         await onEngineReady();
       }
-    } else if (engineState === 'ready') {
+      continue;
+    }
+
+    probeFailStreak++;
+    if (probeFailStreak < 3) continue; // 連続 3 回(≈15-20s)までは様子見
+
+    if (probe === 'busy') {
+      // 応答が遅いだけ = 生きている。原則 spawn しない。ただし 2 分超の完全無応答は wedged
+      if (probeFailStreak >= 24 && Date.now() - engineSpawnedAt > 150_000) {
+        console.error('AivisSpeech が長時間無応答 → 自分の子のみ再起動');
+        if (engineChild && engineChild.exitCode === null) { engineChild.kill('SIGTERM'); engineChild = null; }
+        probeFailStreak = 0;
+        spawnEngine();
+      }
+      continue;
+    }
+
+    // refused でも port を誰かが握っているなら soft 扱い(起動途中 / 別アプリ)— ultraplan 精製
+    if (enginePortOccupied()) { continue; }
+
+    // 接続拒否 かつ port 空き = 本当に死んだ
+    if (engineState === 'ready') {
       engineState = 'down';
       store.append({ type: 'system', from: 'room', text: '音声エンジンが落ちたみたい。しばらく文字だけで続けるね' });
-      spawnEngine(); // 消滅検出 → rate-limit 付き再 spawn(S5)
-    } else {
-      const grace = Date.now() - engineSpawnedAt < 150_000; // SP5 実測 ×1.5
-      if (!grace) {
-        // wedged: 自分の子(handle 基準)のみ SIGTERM → 再 spawn。他所有 engine は触らない
-        if (engineChild && engineChild.exitCode === null) {
-          engineChild.kill('SIGTERM');
-          engineChild = null;
-        }
-        if (engineState === 'down' || engineState === 'starting') spawnEngine();
-      }
     }
-    await new Promise((r) => setTimeout(r, 5000));
+    if (Date.now() - engineSpawnedAt < 150_000) continue; // 起動猶予(SP5 実測 ×1.5)
+    probeFailStreak = 0;
+    spawnEngine();
   }
 }
 void engineLoop();
@@ -136,6 +186,26 @@ async function onEngineReady(): Promise<void> {
   }
 }
 
+// ---- UserSpeechState: 「ユーザーが今話しているか」の単一の状態源 ----
+// ブラウザの STT interim 結果を /speech-state で報告させて保持する。AI 側の音声出力(TtsScheduler の
+// pump / filler escalation)はこれを見て、ユーザーが話し終わるまで先に進めない。/participants で読めるので
+// 画面状態を認知したい他機能からも再利用できる。client からの更新が途切れても STALE_MS で自動解除(deadlock 防止)。
+let userSpeaking = false;
+let userSpeakingAt = 0;
+const USER_SPEAKING_STALE_MS = 4_000;
+function isUserSpeaking(): boolean {
+  return userSpeaking && Date.now() - userSpeakingAt < USER_SPEAKING_STALE_MS;
+}
+function waitUntilUserDone(): Promise<void> {
+  return new Promise((resolve) => {
+    const check = (): void => {
+      if (!isUserSpeaking()) return resolve();
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+
 // ---- FillerEngine(S6): 相槌は事前合成プールのみ。動的合成は本応答だけ ----
 const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
 const ackPools = new Map<string, string[]>();
@@ -154,7 +224,7 @@ function buildNarrationPool(): void {
   void resolveVoice('まお/ノーマル').then((speaker) => {
     if (speaker === null) return;
     for (const [key, text] of Object.entries(NARRATION_TEXTS)) {
-      enqueueJob({ pid: `__narration_${key}__`, priority: 3, kind: 'ack-pool', text, speaker });
+      enqueueJob({ pid: `__narration_${key}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work' }); // ack-pool は事前合成のみ・channel は不使用
     }
   });
 }
@@ -166,8 +236,8 @@ const contextPools = new Map<string, string[]>();
 function buildAckPool(pid: string, speaker: number): void {
   if (ackPools.has(pid)) return;
   ackPools.set(pid, []);
-  for (const text of ACK_TEXTS) enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker });
-  for (const text of CONTEXT_TEXTS) enqueueJob({ pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker });
+  for (const text of ACK_TEXTS) enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work' }); // ack-pool は事前合成のみ・channel は不使用
+  for (const text of CONTEXT_TEXTS) enqueueJob({ pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work' });
 }
 
 function fireAck(target: string, turnId: string | undefined, utterance = ''): void {
@@ -181,7 +251,7 @@ function fireAck(target: string, turnId: string | undefined, utterance = ''): vo
   ackRotate += 1 + Math.floor(Math.random() * ACK_TEXTS.length); // 機械的ローテを崩す
   const text = ACK_TEXTS[ackRotate % ACK_TEXTS.length];
   const audio = pool[ackRotate % pool.length];
-  const ackEv = store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId });
+  const ackEv = store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId, channel: turnChannel(turnId) });
   metric('ack_emitted', { turnId, eventId: ackEv.id });
 }
 
@@ -189,7 +259,7 @@ function fireAck(target: string, turnId: string | undefined, utterance = ''): vo
 // stale drop: user 発話ごとに speechEpoch を進め、古い epoch の speech job は合成せず text-only で流す。
 // テキストは transcript に残る(不喪失)が、遅れた読み上げで会話がズレるのを防ぐ。
 let speechEpoch = 0;
-type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string; epoch?: number };
+type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string; epoch?: number; channel: Channel };
 const jobQueues = new Map<string, SynthJob[]>();
 const rrOrder: string[] = [];
 let pumping = false;
@@ -198,7 +268,7 @@ function enqueueJob(job: SynthJob): void {
   const q = jobQueues.get(job.pid) ?? [];
   if (job.kind === 'speech' && q.filter((j) => j.kind === 'speech').length >= 20) {
     const p = registry.get(job.pid);
-    store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio: null, turnId: job.turnId });
+    store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio: null, turnId: job.turnId, channel: job.channel });
     return; // per-participant 上限: 古い順でなく新規を text-only(FIFO 順序を保つ)
   }
   q.push(job);
@@ -223,7 +293,7 @@ async function runJob(job: SynthJob): Promise<void> {
   const p = registry.get(job.pid);
   const speaker = job.speaker ?? p?.voice.resolvedSpeaker ?? null;
   const emitSpeech = (audio: string | null) => {
-    if (job.kind === 'speech') store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio, turnId: job.turnId });
+    if (job.kind === 'speech') store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio, turnId: job.turnId, channel: job.channel });
   };
   if (job.kind === 'speech' && job.epoch !== speechEpoch) return emitSpeech(null); // stale drop: 新 user 発話より前の未合成分
   if (engineState !== 'ready' || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
@@ -269,6 +339,7 @@ async function pump(): Promise<void> {
     for (;;) {
       const job = pickNext();
       if (!job) break;
+      await waitUntilUserDone(); // ユーザー発話中は AI 側の音声(本応答・filler 問わず)を先に進めない
       await runJob(job);
     }
   } finally {
@@ -276,10 +347,10 @@ async function pump(): Promise<void> {
   }
 }
 
-function speakSentences(from: string, name: string, text: string, turnId: string | undefined): void {
+function speakSentences(from: string, name: string, text: string, turnId: string | undefined, channel: Channel): void {
   const sentences = splitSentences(text);
   sentences.forEach((sentence, i) => {
-    enqueueJob({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch });
+    enqueueJob({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch, channel });
   });
 }
 
@@ -301,8 +372,9 @@ function resolveListen(pid: string, after: number): object | null {
 }
 
 store.onAppend((ev) => {
-  if (ev.type === 'user_speech') transcriptAppend('あなた', ev.text ?? '');
-  else if (ev.type === 'agent_speech' && !ev.filler && ev.text) transcriptAppend(ev.name ?? ev.from, ev.text);
+  const ch = ev.channel ?? 'work';
+  if (ev.type === 'user_speech') transcriptAppend(ch, 'あなた', ev.text ?? '');
+  else if (ev.type === 'agent_speech' && !ev.filler && ev.text) transcriptAppend(ch, ev.name ?? ev.from, ev.text);
   if (ev.type === 'agent_speech' && !ev.filler && ev.audio === null && ev.from !== 'room') floorAdvance(ev.from); // S4
   if (!ev.targets && !ev.broadcast) return;
   for (const [pid, waiter] of waiters) {
@@ -324,15 +396,22 @@ let selectedPid: string | null = null;
 let floorOwner: string | null = null;
 let lastResponder: string | null = null;
 
-type Turn = { turnId: string; target: string; text: string; delivered: boolean; responded: boolean; noticeSent: boolean };
+type Turn = { turnId: string; target: string; text: string; delivered: boolean; responded: boolean; noticeSent: boolean; channel: Channel };
 const turns = new Map<string, Turn>();
 
-function trackTurn(turnId: string, target: string, text = ''): void {
+function trackTurn(turnId: string, target: string, text: string, channel: Channel): void {
   for (const t of turns.values()) {
     if (t.target === target && !t.responded) cancelEscalation(t.turnId); // 新 turn が旧 escalation を supersede
   }
-  turns.set(turnId, { turnId, target, text, delivered: false, responded: false, noticeSent: false });
+  turns.set(turnId, { turnId, target, text, delivered: false, responded: false, noticeSent: false, channel });
   if (turns.size > 200) turns.delete(turns.keys().next().value as string);
+}
+
+// turn に紐づく channel(ack/filler/未達通知/外部 participant の返信など、turn 経由で発話する箇所が参照)。
+// turn が無い(turnId 'none'/未指定 = 実況等の unprompted 発話)は常に 'work' 扱い(部屋分割の既定: 雑談部屋に実況を漏らさない)
+function turnChannel(turnId: string | undefined): Channel {
+  const t = turnId ? turns.get(turnId) : undefined;
+  return t?.channel ?? 'work';
 }
 
 // speak の turnId 省略時: 配送済み・未応答の最古 turn(無ければ最新の自分宛 turn)— S4
@@ -392,31 +471,32 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
 }
 
 function userSpeech(text: string): RoomEvent {
+  userSpeaking = false; // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
   // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う
   if (pendingPermission) {
     const t = text.trim();
     if (PERM_YES.test(t)) {
-      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' } });
+      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
       finishPermission(true, 'おっけー、許可したよ。続けるね。');
       return ev;
     }
     if (PERM_NO.test(t)) {
-      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' } });
+      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
       finishPermission(false, 'わかった、それはやめておくね。');
       return ev;
     }
   }
   if (process.env.ROOM_TEST_HOOKS === '1' && text === '__askperm__') {
     void askUserPermission('テスト機能').then((ok) => store.append({ type: 'system', from: 'room', text: `perm:${ok}` }));
-    return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' } });
+    return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
   }
   speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
   const { targets, routing } = routeTargets(text);
   const turnId = `T${++turnSeq}`;
-  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing });
+  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel: activeChannel });
   metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
-    trackTurn(turnId, targets[0], text);
+    trackTurn(turnId, targets[0], text, activeChannel);
     fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
     scheduleEscalation(turnId, targets[0], 1, 3_500); // /played で前倒し、無ければ fallback
     scheduleUndeliveredNotice(turnId, targets[0]);
@@ -436,7 +516,7 @@ function askUserPermission(desc: string): Promise<boolean> {
     store.append({ type: 'system', from: 'room', text: `許可待ち: ${desc}(「いいよ」/「だめ」で答えてね)` });
     if (chloePid) {
       speechEpoch++; // 直前の読み上げ待ちより優先して届ける
-      enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', epoch: speechEpoch });
+      enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', epoch: speechEpoch, channel: 'work' });
     }
   });
 }
@@ -446,7 +526,7 @@ function finishPermission(ok: boolean, say: string): void {
   clearTimeout(pendingPermission.timer);
   pendingPermission.resolve(ok);
   pendingPermission = null;
-  if (chloePid) enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', epoch: speechEpoch });
+  if (chloePid) enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', epoch: speechEpoch, channel: 'work' });
 }
 
 const PERM_YES = /^(はい|うん|いいよ|いいですよ|おっけ|オッケー|ok|オーケー|許可|どうぞ|やって|承認)/i;
@@ -474,6 +554,7 @@ function scheduleEscalation(turnId: string, target: string, stage: number, delay
   cancelEscalation(turnId);
   const timer = setTimeout(() => {
     escalations.delete(turnId);
+    if (isUserSpeaking()) return scheduleEscalation(turnId, target, stage, 500); // ユーザーが話し続けてる間は先送り
     const t = turns.get(turnId);
     if (!t || t.responded || !t.delivered) return; // 応答済み/未配送(未達経路が担当)は終了
     const p = registry.get(target);
@@ -482,14 +563,14 @@ function scheduleEscalation(turnId: string, target: string, stage: number, delay
       const ev = store.append({
         type: 'agent_speech', from: target, name: p?.assignedName,
         text: CONTEXT_TEXTS[statusRotate % CONTEXT_TEXTS.length],
-        audio: pool[statusRotate % Math.max(1, pool.length)] ?? null, filler: 'context', turnId,
+        audio: pool[statusRotate % Math.max(1, pool.length)] ?? null, filler: 'context', turnId, channel: t.channel,
       });
       metric('filler_emitted', { turnId, stage, eventId: ev.id });
       scheduleEscalation(turnId, target, 2, 8_000); // /played が来れば前倒し(下の onPlayed 経由)
     } else if (stage <= 3) {
       const ev = store.append({
         type: 'agent_speech', from: 'room', name: 'ナレーション',
-        text: NARRATION_TEXTS.status, audio: narrationAudio.get('status') ?? null, filler: 'status', turnId,
+        text: NARRATION_TEXTS.status, audio: narrationAudio.get('status') ?? null, filler: 'status', turnId, channel: t.channel,
       });
       metric('filler_emitted', { turnId, stage, eventId: ev.id });
       if (stage < 3) scheduleEscalation(turnId, target, stage + 1, 8_000);
@@ -527,11 +608,28 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
     store.append({
       type: 'agent_speech', from: 'room', name: 'ナレーション',
       text: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
-      audio: narrationPool[0] ?? null, filler: 'status', turnId,
+      audio: narrationPool[0] ?? null, filler: 'status', turnId, channel: t.channel,
     });
     if (floorOwner === target) floorOwner = null;
   }, 12_000);
   timer.unref();
+}
+
+// ---- W9-2: クロエの長期記憶(daemon 再起動・Brain 再生成を跨いで残る)----
+const MEMORY_PATH = join(homedir(), '.talkingclaw', 'chloe-memory.md');
+const MEMORY_MAX_LINES = 100; // 肥大化対策(ultraplan 精製): 末尾 100 行だけ注入
+function readMemory(): string {
+  try {
+    const lines = readFileSync(MEMORY_PATH, 'utf8').trim().split('\n');
+    return lines.slice(-MEMORY_MAX_LINES).join('\n');
+  } catch { return ''; }
+}
+function appendMemory(note: string): void {
+  const line = `- ${new Date().toISOString().slice(0, 10)} ${note.trim().replace(/\n/g, ' ')}\n`;
+  try {
+    mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+    appendFileSync(MEMORY_PATH, line, { mode: 0o600 });
+  } catch { /* 記憶できなくても会話は続ける */ }
 }
 
 // ---- W8-8: projects レジストリ(worker の作業先。talkingclaw 自身も登録)----
@@ -590,6 +688,30 @@ store.onAppend((ev) => {
     agentNotes.set(ev.from, notes);
   }
 });
+
+// board の元データ(/tasks と /screen で共有)
+function boardSnapshot(): { tasks: OfficeTask[]; open: { agent: string; agentName: string; request: string; status: string; notes: string[]; artifacts: string[] }[] } {
+  const open = [...turns.values()]
+    .filter((t) => !t.responded && !t.noticeSent && t.target !== chloePid)
+    .slice(-10)
+    .map((t) => ({
+      agent: t.target, agentName: registry.get(t.target)?.assignedName ?? t.target,
+      request: t.text, status: t.delivered ? 'working' : 'queued',
+      notes: agentNotes.get(t.target) ?? [], artifacts: [],
+    }));
+  return { tasks: [...officeTasks].reverse().slice(0, 20), open };
+}
+
+// 画面状態(/screen): 発話中/待機中の participant を、再生完了通知(/played)がまだ来ていない
+// audio 付き agent_speech から近似する(ブラウザの実再生タイミングは daemon から見えないため)
+function pendingSpeechSnapshot(): { participantId: string; name: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const ev of store.since(Math.max(0, store.lastId - 200))) {
+    if (ev.type !== 'agent_speech' || !ev.audio || playedIds.has(ev.id)) continue;
+    counts.set(ev.from, (counts.get(ev.from) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([pid, count]) => ({ participantId: pid, name: registry.get(pid)?.assignedName ?? pid, count }));
+}
 
 // ---- 内蔵クロエ(3C): Brain を in-process participant として部屋に接続 ----
 import { Brain } from './brain.ts';
@@ -663,7 +785,8 @@ function startChloe(): void {
   const workerSay = (task: OfficeTask) => (sentence: string): void => {
     task.notes.push(sentence);
     while (task.notes.length > 20) task.notes.shift();
-    enqueueJob({ pid: chloePid!, priority: 2, kind: 'speech', text: sentence, turnId: 'none', epoch: speechEpoch });
+    // 実況(進捗報告)は常に作業部屋。雑談部屋にいる間は文脈に混ざらない(channel フィルタで隔離)
+    enqueueJob({ pid: chloePid!, priority: 2, kind: 'speech', text: sentence, turnId: 'none', epoch: speechEpoch, channel: 'work' });
   };
 
   async function runTask(task: OfficeTask): Promise<void> {
@@ -704,7 +827,7 @@ function startChloe(): void {
         const grace = await Promise.race([askP.catch(() => ''), timeoutMarker(15_000)]);
         if (grace === TIMEOUT) { void worker.close().catch(() => {}); worker = null; }
         task.status = 'failed';
-        store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業が長引きすぎたから一旦止めたよ。', audio: null, turnId: 'none' });
+        store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業が長引きすぎたから一旦止めたよ。', audio: null, turnId: 'none', channel: 'work' });
         return;
       }
       task.status = 'done';
@@ -713,7 +836,7 @@ function startChloe(): void {
     } catch (error) {
       task.status = 'failed';
       task.notes.push(`エラー: ${(error as Error).message}`);
-      store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業でエラーが出ちゃった。もう一回頼んでみて。', audio: null, turnId: 'none' });
+      store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業でエラーが出ちゃった。もう一回頼んでみて。', audio: null, turnId: 'none', channel: 'work' });
     }
   }
 
@@ -721,6 +844,15 @@ function startChloe(): void {
     name: 'office',
     version: '1.0.0',
     tools: [
+      tool(
+        'remember',
+        'ユーザーとの約束・好み・「今後こうして」という恒久ルールを書き留める。再起動しても思い出せる。短く 1 行で。',
+        { note: z.string() },
+        async ({ note }) => {
+          appendMemory(note);
+          return { content: [{ type: 'text', text: '覚えた。ユーザーには「覚えとくね」等と短く伝えるだけでいい。' }] };
+        },
+      ),
       tool(
         'delegate_task',
         `開発・作成・修正などの実作業を作業係に任せる。依頼内容を具体的に 1〜2 文で渡す。project は作業先(${Object.keys(loadProjects()).join(' / ')}。省略時 workspace)。talkingclaw 自体の開発は project: "talkingclaw"。`,
@@ -732,80 +864,103 @@ function startChloe(): void {
       ),
     ],
   });
-  const convBrainOpts = {
-    systemPrompt: config.systemPrompt, model: config.model,
-    mcpServers: { office: officeServer } as Record<string, unknown>,
-    allowedTools: ['mcp__office__delegate_task'], maxTurns: 4,
-    // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
-    canUseTool: async (name: string, input: Record<string, unknown>) => {
-      if (name === 'mcp__office__delegate_task') return { behavior: 'allow' as const, updatedInput: input };
-      return { behavior: 'deny' as const, message: 'あなたは会話係。実作業は delegate_task ツールに依頼内容を渡して任せること' };
-    },
-  };
-
-  let brain = new Brain(convBrainOpts);
-  const inbox: RoomEvent[] = [];
-  let busy = false;
-  let needsContext = true; // W8-1: boot/再生成後の最初の ask に直近ログを注入
-
-  function contextPrefix(): string {
-    const rows = transcriptTail(30);
-    if (rows.length === 0) return '';
-    const log = rows.map((r) => `${r.who}: ${r.text}`).join('\n');
-    return `(参考: 部屋の直近の会話ログ。文脈の続きとして自然に振る舞って)\n${log}\n---\n`;
+  // 部屋分割: 会話 Brain は channel ごとに別インスタンス(記憶が独立 = 雑談部屋に作業の文脈が漏れない)。
+  // 雑談部屋は delegate_task を使わない(雑談専用。作業依頼が来たら作業部屋に誘導する)
+  function makeConvBrainOpts(channel: Channel) {
+    return {
+      systemPrompt: config.systemPrompt + config.rooms[channel], model: config.model,
+      mcpServers: { office: officeServer } as Record<string, unknown>,
+      allowedTools: channel === 'work'
+        ? ['mcp__office__delegate_task', 'mcp__office__remember']
+        : ['mcp__office__remember'],
+      maxTurns: 8, // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
+      // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
+      canUseTool: async (name: string, input: Record<string, unknown>) => {
+        if (name === 'mcp__office__remember') return { behavior: 'allow' as const, updatedInput: input };
+        if (channel === 'work' && name === 'mcp__office__delegate_task') return { behavior: 'allow' as const, updatedInput: input };
+        if (name === 'mcp__office__delegate_task') return { behavior: 'deny' as const, message: 'ここは雑談部屋。作業の依頼は作業部屋でしてねと伝えて' };
+        return { behavior: 'deny' as const, message: 'あなたは会話係。実作業は delegate_task ツールに依頼内容を渡して任せること' };
+      },
+    };
   }
 
-  const speakStreamed = (turnId: string | undefined): ((sentence: string) => void) => {
+  type ChannelState = { brain: Brain; inbox: RoomEvent[]; busy: boolean; needsContext: boolean };
+  const channelState: Record<Channel, ChannelState> = Object.fromEntries(
+    CHANNELS.map((c) => [c, { brain: new Brain(makeConvBrainOpts(c)), inbox: [], busy: false, needsContext: true }]),
+  ) as Record<Channel, ChannelState>; // W8-1: boot/再生成後の最初の ask に直近ログを注入(channel ごと)
+
+  // W9-2: 記憶忘れの根治 — memory 全文 + 直近ログを Brain 生成のたびに注入する
+  function contextPrefix(channel: Channel): string {
+    const parts: string[] = [];
+    const memo = readMemory();
+    if (memo) parts.push(`(あなたが書き留めた大事なこと。必ず踏まえて)\n${memo}`);
+    const rows = transcriptTail(channel, 60);
+    if (rows.length > 0) parts.push(`(この部屋の直近の会話ログ。文脈の続きとして自然に振る舞って)\n${rows.map((r) => `${r.who}: ${r.text}`).join('\n')}`);
+    return parts.length > 0 ? `${parts.join('\n\n')}\n---\n` : '';
+  }
+
+  const speakStreamed = (channel: Channel, turnId: string | undefined): ((sentence: string) => void) => {
     let first = true;
     return (sentence) => {
       if (first && turnId) markResponded(turnId);
-      enqueueJob({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch });
+      enqueueJob({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch, channel });
       first = false;
     };
   };
 
   // ask を 60s で見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
-  async function askGuarded(text: string, turnId: string | undefined): Promise<void> {
+  async function askGuarded(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
+    const cs = channelState[channel];
     const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
-    if (needsContext) { text = contextPrefix() + text; needsContext = false; }
-    const ask = hang ? new Promise<string>(() => {}) : brain.ask(text, speakStreamed(turnId));
-    if ((await Promise.race([ask, timeoutMarker(60_000)])) !== TIMEOUT) return;
-    console.error('クロエの応答が 60s 超過 → interrupt');
-    if (!hang) await brain.interrupt().catch(() => {});
+    if (cs.needsContext) { text = contextPrefix(channel) + text; cs.needsContext = false; }
+    const ask = hang ? new Promise<string>(() => {}) : cs.brain.ask(text, speakStreamed(channel, turnId));
+    if ((await Promise.race([ask, timeoutMarker(180_000)])) !== TIMEOUT) return; // W9-2: 長 turn を誤殺しない
+    console.error(`クロエ(${channel})の応答が 180s 超過 → interrupt`);
+    if (!hang) await cs.brain.interrupt().catch(() => {});
     if ((await Promise.race([ask.catch(() => ''), timeoutMarker(10_000)])) !== TIMEOUT) return;
-    void brain.close().catch(() => {});
-    brain = new Brain(convBrainOpts);
-    needsContext = true; // 再生成 = 文脈喪失 → 次の ask でログ注入
-    store.append({ type: 'system', from: 'room', text: 'クロエの接続を作り直したよ。少し前の話は忘れちゃったかも' });
-    store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId });
+    void cs.brain.close().catch(() => {});
+    cs.brain = new Brain(makeConvBrainOpts(channel));
+    cs.needsContext = true; // 再生成 = 文脈喪失 → 次の ask でログ注入
+    store.append({ type: 'system', from: 'room', text: 'クロエの接続を作り直したよ。少し前の話は忘れちゃったかも', channel });
+    store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId, channel });
   }
 
-  async function drain(): Promise<void> {
-    if (busy) return;
-    busy = true;
+  async function drain(channel: Channel): Promise<void> {
+    const cs = channelState[channel];
+    if (cs.busy) return;
+    cs.busy = true;
     try {
-      while (inbox.length > 0) {
-        const ev = inbox.shift()!;
-        await askGuarded(ev.text ?? '', ev.turnId).catch((e: Error) => {
-          store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: `ごめん、エラーが出ちゃった。${e.message}`, audio: null, turnId: ev.turnId });
+      while (cs.inbox.length > 0) {
+        const ev = cs.inbox.shift()!;
+        await askGuarded(channel, ev.text ?? '', ev.turnId).catch((e: Error) => {
+          // W9-2(P3): 生エラー文字列は読み上げない — 画面には残し、声は友好文に
+          store.append({ type: 'system', from: 'room', text: `クロエのエラー: ${e.message}`, channel });
+          store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと考えすぎちゃった。もう一回言ってくれる?', audio: null, turnId: ev.turnId, channel });
         });
       }
     } finally {
-      busy = false;
+      cs.busy = false;
     }
   }
 
   store.onAppend((ev) => {
     if (ev.type === 'user_speech' && ev.targets?.includes(chloePid!)) {
       if (ev.turnId) { const t = turns.get(ev.turnId); if (t) t.delivered = true; } // in-process = 即配送
-      inbox.push(ev);
-      void drain();
+      const channel = ev.channel ?? 'work';
+      channelState[channel].inbox.push(ev);
+      void drain(channel);
     }
   });
 
-  // greeting = Brain warmup(初回コールドスタートを起動時に消化)
-  void askGuarded('(ユーザーが声の部屋に来られるようになった。あなたらしく短く一言で挨拶して)', undefined)
-    .then(() => console.error('クロエ warmup 完了'));
+  // greeting = Brain warmup(初回コールドスタートを起動時に消化。channel ごとに 1 回)
+  const GREETING: Record<Channel, string> = {
+    work: '(ユーザーが声の部屋(作業部屋)に来られるようになった。あなたらしく短く一言で挨拶して)',
+    chat: '(ユーザーが雑談部屋に来られるようになった。作業の話はせず、あなたらしく短く気楽に一言だけ挨拶して)',
+  };
+  for (const channel of CHANNELS) {
+    void askGuarded(channel, GREETING[channel], undefined)
+      .then(() => console.error(`クロエ(${channel}) warmup 完了`));
+  }
 }
 
 if (process.env.NO_CHLOE !== '1') startChloe();
@@ -815,16 +970,20 @@ const token = randomBytes(24).toString('hex');
 const stateDir = join(homedir(), '.talkingclaw');
 const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了記録
 
-// W8-1: 会話ログの永続化(共有記憶の正)。user 発話 + 非 filler 本応答を追記
-const TRANSCRIPT = join(homedir(), '.talkingclaw', 'transcript.jsonl');
-function transcriptAppend(who: string, text: string): void {
+// W8-1: 会話ログの永続化(共有記憶の正)。user 発話 + 非 filler 本応答を追記。
+// 部屋分割: channel ごとに別ファイル(work = 既存 transcript.jsonl のまま・後方互換)
+const TRANSCRIPT_PATH: Record<Channel, string> = {
+  work: join(homedir(), '.talkingclaw', 'transcript.jsonl'),
+  chat: join(homedir(), '.talkingclaw', 'transcript-chat.jsonl'),
+};
+function transcriptAppend(channel: Channel, who: string, text: string): void {
   try {
-    appendFileSync(TRANSCRIPT, JSON.stringify({ at: new Date().toISOString(), who, text }) + '\n', { mode: 0o600 });
+    appendFileSync(TRANSCRIPT_PATH[channel], JSON.stringify({ at: new Date().toISOString(), who, text }) + '\n', { mode: 0o600 });
   } catch { /* ログ欠落は本流を止めない */ }
 }
-function transcriptTail(lines: number): { at: string; who: string; text: string }[] {
+function transcriptTail(channel: Channel, lines: number): { at: string; who: string; text: string }[] {
   try {
-    const all = readFileSync(TRANSCRIPT, 'utf8').trim().split('\n');
+    const all = readFileSync(TRANSCRIPT_PATH[channel], 'utf8').trim().split('\n');
     return all.slice(-lines).map((l) => JSON.parse(l));
   } catch {
     return [];
@@ -944,8 +1103,30 @@ const server = createServer(async (req, res) => {
 
   if (req.method === 'GET' && path === '/transcript.md') {
     if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' }); // 会話ログは秘匿
-    const rows = transcriptTail(Math.min(Number(url.searchParams.get('lines') ?? 500) || 500, 2000));
-    const md = '# 声の部屋 会話ログ\n\n' + rows.map((r) => `- ${r.at.slice(0, 16).replace('T', ' ')} **${r.who}**: ${r.text}`).join('\n') + '\n';
+    const channel = isChannel(url.searchParams.get('channel')) ? (url.searchParams.get('channel') as Channel) : 'work';
+    const rows = transcriptTail(channel, Math.min(Number(url.searchParams.get('lines') ?? 500) || 500, 2000));
+    const md = `# 声の部屋 会話ログ(${ROOM_LABEL[channel]})\n\n` + rows.map((r) => `- ${r.at.slice(0, 16).replace('T', ' ')} **${r.who}**: ${r.text}`).join('\n') + '\n';
+    res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    return res.end(md);
+  }
+
+  // アーカイブ: セッション単位(daemon 起動〜終了、または一定期間ごと)で保存した会話ログの一覧・参照
+  if (req.method === 'GET' && path === '/archives.md') {
+    if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' });
+    const idx = archiveIndexTail(Math.min(Number(url.searchParams.get('limit') ?? 50) || 50, 200));
+    const rows = idx.map((a) =>
+      `- [${a.startedAt.slice(0, 16).replace('T', ' ')} 〜 ${a.endedAt.slice(0, 16).replace('T', ' ')}]` +
+      `(/archive.md?token=${token}&file=${encodeURIComponent(a.file)})(${a.source} / ${a.lines} 件 / ${a.reason})`);
+    const md = '# 声の部屋 アーカイブ一覧\n\n' + (rows.length > 0 ? rows.join('\n') : '(まだアーカイブなし)') + '\n';
+    res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    return res.end(md);
+  }
+
+  if (req.method === 'GET' && path === '/archive.md') {
+    if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' });
+    const rows = archiveRead(url.searchParams.get('file') ?? '');
+    if (!rows) return json(res, 404, { error: 'アーカイブが見つかりません' });
+    const md = `# 声の部屋 アーカイブ\n\n` + rows.map((r) => `- ${r.at.slice(0, 16).replace('T', ' ')} **${r.who}**: ${r.text}`).join('\n') + '\n';
     res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     return res.end(md);
   }
@@ -970,6 +1151,8 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && path === '/participants') {
     return json(res, 200, {
       selected: selectedPid,
+      userSpeaking: isUserSpeaking(),
+      channel: activeChannel,
       participants: registry.all().map((p) => ({
         participantId: p.participantId,
         name: p.assignedName,
@@ -1039,20 +1222,36 @@ const server = createServer(async (req, res) => {
   }
 
   if (path === '/tasks') {
-    const open = [...turns.values()]
-      .filter((t) => !t.responded && !t.noticeSent && t.target !== chloePid)
-      .slice(-10)
-      .map((t) => ({
-        agent: t.target, agentName: registry.get(t.target)?.assignedName ?? t.target,
-        request: t.text, status: t.delivered ? 'working' : 'queued',
-        notes: agentNotes.get(t.target) ?? [], artifacts: [],
-      }));
-    return json(res, 200, { tasks: [...officeTasks].reverse().slice(0, 20), open });
+    return json(res, 200, boardSnapshot());
   }
 
   if (path === '/transcript') {
     const lines = Math.min(Number(body.lines ?? 40) || 40, 200);
-    return json(res, 200, { lines: transcriptTail(lines) });
+    const channel = isChannel(body.channel) ? (body.channel as Channel) : 'work'; // 既定 'work': recall する外部 agent は基本作業係
+    return json(res, 200, { channel, lines: transcriptTail(channel, lines) });
+  }
+
+  if (path === '/screen') {
+    // W8-9: コハク(声の部屋の画面を持たない外部 agent)が今の表示状態を能動的に取得するための endpoint。
+    // 在室者・誰と話しているか(routing)・発話中/待機中・作業ボード・直近ログを 1 回でまとめて返す
+    return json(res, 200, {
+      bootId: store.bootId,
+      userSpeaking: isUserSpeaking(), // ユーザーの現在の発話状態(単一の状態源。UserSpeechState 参照)
+      participants: registry.all().map((p) => ({
+        participantId: p.participantId,
+        name: p.assignedName,
+        presence: registry.presence(p, waiters.has(p.participantId)),
+        voice: p.voice.status,
+      })),
+      routing: {
+        selected: selectedPid ? (registry.get(selectedPid)?.assignedName ?? selectedPid) : null,
+        floor: floorOwner ? (registry.get(floorOwner)?.assignedName ?? floorOwner) : null,
+        lastResponder: lastResponder ? (registry.get(lastResponder)?.assignedName ?? lastResponder) : null,
+      },
+      speaking: pendingSpeechSnapshot(),
+      board: boardSnapshot(),
+      recentLog: transcriptTail('work', 15),
+    });
   }
 
   if (path === '/metrics') {
@@ -1072,6 +1271,21 @@ const server = createServer(async (req, res) => {
     selectedPid = pid;
     store.append({ type: 'system', from: 'room', text: pid ? `話し相手を ${registry.get(pid)!.assignedName} にしたよ` : '話し相手の指定を外したよ' });
     return json(res, 200, { ok: true, selected: selectedPid });
+  }
+
+  if (path === '/channel') {
+    // 部屋分割: 今いる部屋(作業部屋/雑談部屋)を切替。以後のデフォルト発話・クロエの記憶がこちらに切り替わる
+    if (!isChannel(body.channel)) return json(res, 400, { error: '不明な部屋です(work / chat)' });
+    activeChannel = body.channel;
+    store.append({ type: 'system', from: 'room', text: `部屋を${ROOM_LABEL[activeChannel]}に切り替えたよ`, channel: activeChannel });
+    return json(res, 200, { ok: true, channel: activeChannel });
+  }
+
+  if (path === '/speech-state') {
+    // ブラウザ側の STT interim/final から「ユーザーが今話しているか」を報告させる。認証はトークンのみ(participant 不問)。
+    userSpeaking = body.speaking === true;
+    userSpeakingAt = Date.now();
+    return json(res, 200, { ok: true, userSpeaking });
   }
 
   if (path === '/played') {
@@ -1118,7 +1332,8 @@ const server = createServer(async (req, res) => {
       seenSpeakSeqs.set(p.participantId, seen);
     }
     const resolvedTurn = attributeTurn(p.participantId, body.turnId ? String(body.turnId) : undefined);
-    speakSentences(p.participantId, p.assignedName, text, resolvedTurn === 'none' ? undefined : resolvedTurn);
+    const speakTurnId = resolvedTurn === 'none' ? undefined : resolvedTurn;
+    speakSentences(p.participantId, p.assignedName, text, speakTurnId, turnChannel(speakTurnId));
     return json(res, 200, { status: engineState === 'ready' && p.voice.status === 'ready' ? 'ok' : 'text_only' });
   }
 
@@ -1165,3 +1380,16 @@ server.on('error', (e: NodeJS.ErrnoException) => {
   }
   throw e;
 });
+
+// ---- アーカイブ: セッション単位(daemon 起動〜終了、または一定期間ごと)で会話ログを保存 ----
+// 会話ログの正は transcript*.jsonl のまま(切り詰めない)。archive.ts が増分だけ複製保存する。
+markArchiveBaseline(); // この起動より前の行は今回のセッションの対象外
+const ARCHIVE_INTERVAL_MS = Number(process.env.ARCHIVE_INTERVAL_MS ?? 6 * 3600_000); // 既定 6h ごとに区切る
+setInterval(() => archiveSession(store.bootId, 'interval'), ARCHIVE_INTERVAL_MS).unref();
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    archiveSession(store.bootId, 'shutdown'); // 部屋を閉じた時点までの分を残す
+    process.exit(0);
+  });
+}
+

@@ -3,6 +3,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 export type FillerKind = 'ack' | 'context' | 'status';
+// 部屋分割(会話コンテキストの分離): 'work' = 作業部屋(既定・後方互換)、'chat' = 雑談部屋。
+// user_speech / agent_speech に付与し、transcript の保存先・クロエの Brain(記憶)を隔てる。
+export type Channel = 'work' | 'chat';
 export type RoomEvent = {
   id: number;
   at: string;
@@ -16,6 +19,7 @@ export type RoomEvent = {
   targets?: string[];
   broadcast?: true;
   routing?: { method: 'name' | 'selection' | 'floor' | 'last_responder' | 'default'; matchedAlias?: string };
+  channel?: Channel; // 未指定は 'work' 扱い(既存 event との後方互換)
 };
 
 const MAX_LOG = 1000;

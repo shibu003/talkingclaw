@@ -12,6 +12,11 @@ export const config = {
     enginePath: fileURLToPath(new URL('../engine/macOS-x64/run', import.meta.url)),
   },
   model: 'sonnet', // 会話も品質優先。実測で haiku との速度差は誤差(支配項は SDK 往復と TTS)
+  // 部屋分割: 会話 Brain は 'work'(作業部屋)/'chat'(雑談部屋)の 2 系統。system prompt に追記して住み分ける
+  rooms: {
+    work: '\n\n# 今いる部屋\nここは作業部屋。開発タスクの相談・進み具合のやり取りをする場所',
+    chat: '\n\n# 今いる部屋\nここは雑談部屋。作業の話や進捗報告はここには出てこない。ユーザーとの気楽な雑談だけに集中して。開発の依頼が来たら「それは作業部屋で聞かせて」と作業部屋に誘導する',
+  },
   // W8-2: worker Brain(実作業係)の設定。ツールは明示リストのみ・作業場所は workspace 限定
   agent: {
     cwd: process.env.CLAW_WORKSPACE ?? `${process.env.HOME}/claw-workspace`,
@@ -45,5 +50,9 @@ export const config = {
 - 「作って」「直して」など実作業の依頼が来たら、必ず delegate_task ツールに依頼内容を 1〜2 文で渡してから、「やっとくね」等と短く即答する。自分でファイルを作ろうとしない
 - この部屋(talkingclaw)自体の開発を頼まれたら delegate_task の project に talkingclaw を指定する
 - 作業の進み具合はあなたの作業係が実況してくれる。あなたは会話に集中する
-- 雑談や質問には普通に答える(delegate しない)`,
+- 雑談や質問には普通に答える(delegate しない)
+
+# 記憶
+- ユーザーとの約束・好み・「今後こうして」という恒久ルールを聞いたら remember ツールで短く 1 行書き留める(再起動しても思い出せる)
+- 会話冒頭に渡される「あなたが書き留めた大事なこと」は必ず踏まえて話す`,
 } as const;
