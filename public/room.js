@@ -519,10 +519,27 @@ async function enterRoom(next) {
   await post('/channel', { channel: next });
   currentChannel = next;
   updateRoomBtn();
-  // 部屋を跨ぐ古い吹き出しは残さず、新しい部屋のライブ表示だけにする(履歴は 📄 会話ログで別途見られる)
   log.replaceChildren();
   bubbles.clear();
   audioQueue.length = 0;
+  await showHistory(next); // 切り替えた部屋の直近の会話を読み込む(白紙にしない)
+}
+
+// 部屋に入った時、その部屋で話していた内容を読み直す(音は鳴らさない)
+async function showHistory(channel, lines = 40) {
+  try {
+    const d = await (await post('/transcript', { channel, lines })).json();
+    const rows = d.lines ?? [];
+    if (rows.length === 0) { addSys('この部屋はまだ会話がないよ'); return; }
+    addSys(`— ここまでが ${roomLabel(channel)} の直近の会話 —`);
+    for (const r of rows) {
+      if (r.who === 'あなた') addBubble('user', r.text);
+      else agentBubble('history:' + r.who, r.who, r.text);
+    }
+    bubbles.delete('last'); // 履歴とライブの吹き出しをつなげない
+    addSys('— ここから今 —');
+    log.scrollTop = log.scrollHeight;
+  } catch { addSys('履歴を読めなかった(📄 会話ログから見てね)'); }
 }
 updateRoomBtn();
 async function refreshBoard() {
@@ -623,3 +640,4 @@ async function renderSettings() {
 }
 
 connect();
+void showHistory(currentChannel); // リロード直後も直近の会話が見えるように
