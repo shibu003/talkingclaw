@@ -159,7 +159,8 @@ function waitOf(d: { melds: Meld[]; pair: Tile }, winTile: Tile, _tsumo: boolean
 
 // ---- シャンテン数(あと何枚で聴牌か。-1 = 和了)----
 export function shanten(counts: Counts, openCount = 0): number {
-  return Math.min(shantenRegular(counts.slice(), openCount), shantenChiitoi(counts), shantenKokushi(counts));
+  const safe = counts.map((n) => Math.max(0, n)); // 壊れた手牌でも落ちない(負は 0 として数える)
+  return Math.min(shantenRegular(safe.slice(), openCount), shantenChiitoi(safe), shantenKokushi(safe));
 }
 
 function shantenChiitoi(counts: Counts): number {
@@ -185,7 +186,9 @@ function shantenRegular(counts: Counts, openCount: number): number {
   };
   // 雀頭を決め打つ場合としない場合の両方を見る
   const walk = (i: number, sets: number, partials: number, pairUsed: boolean): void => {
-    while (i < 34 && counts[i] === 0) i++;
+    // <= 0 で読み飛ばす。=== 0 だと、枚数が負の手牌(ツモ牌と手牌が食い違った時など)で
+    // 同じ位置に無限に潜って落ちる
+    while (i < 34 && counts[i] <= 0) i++;
     if (i >= 34) { scan(sets, partials, pairUsed); return; }
     scan(sets, partials, pairUsed); // ここで打ち切る場合
     if (counts[i] >= 3) { counts[i] -= 3; walk(i, sets + 1, partials, pairUsed); counts[i] += 3; }

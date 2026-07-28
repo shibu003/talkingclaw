@@ -152,6 +152,19 @@ console.log('[9] ドラは役の上に足す(ドラだけでは和了れない)'
   ok(withYaku && withYaku.han >= 4, `役ありならドラが翻に乗る(${withYaku?.han} 翻)`);
 }
 
+console.log('[9-1] 壊れた手牌でも落ちない');
+{
+  // 枚数が負になった配列でシャンテンが無限に潜って落ちたことがある
+  const bad = new Array(34).fill(0);
+  bad[0] = -1; bad[5] = 2; bad[9] = 3;
+  let crashed = false;
+  try { shanten(bad); } catch { crashed = true; }
+  ok(!crashed, '負の枚数が混ざっても落ちない');
+  const empty = new Array(34).fill(0);
+  ok(typeof shanten(empty) === 'number', '空の手牌でも数を返す');
+  ok(Array.isArray(waits(bad)), '壊れた手牌でも待ちを聞ける');
+}
+
 console.log('[10] 作った手で辻褄が合うか(ランダム 14 枚はまず和了らないので、和了形を組んで崩す)');
 {
   let seed = 20260728;

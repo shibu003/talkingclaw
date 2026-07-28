@@ -4,6 +4,7 @@ import * as mj from '../src/mahjong.ts';
 import {
   newGame, startHand, discard, pass, win, canTsumo, canRon, chooseDiscard,
   doraOf, remaining, isFuriten, describe, handDisplay,
+  canPon, canKan, chiOptions, pon, chi, kan, callsFor, aiCall,
 } from '../src/mahjongGame.ts';
 
 let fail = 0;
@@ -190,6 +191,96 @@ console.log('[9] 読み上げ文に他家の手牌は出ない');
   }
   ok(leaked === 0, '自分の手牌とツモ以外は読み上げない');
   ok(handDisplay(g, 'you').length > 0, '画面用の手牌が出る');
+}
+
+console.log('[10] 鳴き(ポン・チー・カン)');
+{
+  const g = newGame(4242, seats);
+  startHand(g);
+  // 場を作る: 席 1 に 三萬 を 2 枚持たせ、席 0 が 三萬 を切る
+  const t3 = mj.parseHand('3m')[0];
+  const me = g.players[0];
+  const other = g.players[1];
+  other.hand = new Array(34).fill(0);
+  for (const x of mj.parseHand('33m456p789s11z234s')) other.hand[x]++;
+  if (me.hand[t3] === 0) { const any = me.hand.findIndex((n) => n > 0); me.hand[any]--; me.hand[t3]++; }
+  discard(g, 0, t3);
+  ok(g.phase === 'ron', '切ったら鳴きを聞く場面になる');
+  ok(canPon(g, 1) === true, '2 枚持っていればポンできる');
+  ok(canPon(g, 0) === false, '自分が切った牌はポンできない');
+  ok(canKan(g, 1) === false, '2 枚ではカンできない');
+  const before = other.hand[t3];
+  ok(pon(g, 1).ok === true, 'ポンが通る');
+  ok(other.hand[t3] === before - 2 && other.melds.length === 1, '手牌から 2 枚出て、晒した面子が 1 つ増える');
+  ok(other.melds[0].open === true && other.melds[0].kind === 'triplet', '明刻として晒す');
+  ok(g.players[0].discards.includes(t3) === false, '鳴かれた牌は河から出る');
+  ok(g.turn === 1 && g.phase === 'discard', '鳴いた人の番になって、切る場面になる');
+
+  // チーは下家だけ
+  const h = newGame(99, seats);
+  startHand(h);
+  const t5 = mj.parseHand('5m')[0];
+  h.players[1].hand = new Array(34).fill(0);
+  for (const x of mj.parseHand('34m456p789s11z234s')) h.players[1].hand[x]++;
+  h.players[2].hand = h.players[1].hand.slice();
+  if (h.players[0].hand[t5] === 0) { const any = h.players[0].hand.findIndex((n) => n > 0); h.players[0].hand[any]--; h.players[0].hand[t5]++; }
+  discard(h, 0, t5);
+  ok(chiOptions(h, 1).length > 0, '下家はチーできる');
+  ok(chiOptions(h, 2).length === 0, '下家以外はチーできない');
+  const low = chiOptions(h, 1)[0];
+  ok(chi(h, 1, low).ok === true, 'チーが通る');
+  ok(h.players[1].melds[0].kind === 'run', '順子として晒す');
+  ok(h.turn === 1, 'チーした人の番になる');
+
+  // 鳴いたら立直できない
+  const r = discard(h, 1, h.players[1].hand.findIndex((n) => n > 0), true);
+  ok(r.ok === false && r.error.includes('鳴いてる'), '鳴いた後は立直できない');
+}
+
+console.log('[11] 鳴いた手でも点棒が合う(200 局まわす)');
+{
+  const g = newGame(555, seats);
+  const start = g.players.reduce((n, p) => n + p.points, 0);
+  let hands = 0, calls = 0, guard = 0;
+  while (g.phase !== 'over' && guard++ < 60) {
+    if (!startHand(g).ok) break;
+    hands++;
+    let steps = 0;
+    while (g.phase !== 'done' && g.phase !== 'over' && steps++ < 400) {
+      if (g.phase === 'draw') { if (!pass(g).ok) break; continue; }
+      if (g.phase === 'discard') {
+        const seat = g.turn;
+        if (canTsumo(g, seat)) { win(g, seat, true); break; }
+        const { tile, riichi } = chooseDiscard(g, seat);
+        const d = discard(g, seat, tile, riichi);
+        if (!d.ok) { ok(false, `打牌が通らない: ${d.error}`); steps = 999; break; }
+        continue;
+      }
+      if (g.phase === 'ron') {
+        let acted = false;
+        for (let i = 1; i <= 3; i++) {
+          const s2 = (g.lastDiscard.from + i) % 4;
+          if (canRon(g, s2)) { win(g, s2, false); acted = true; break; }
+        }
+        if (acted) break;
+        for (let i = 1; i <= 3 && !acted; i++) {
+          const s2 = (g.lastDiscard.from + i) % 4;
+          const c = aiCall(g, s2);
+          if (c) { (c === 'kan' ? kan : pon)(g, s2); calls++; acted = true; }
+        }
+        if (acted) continue;
+        if (!pass(g).ok) break;
+        continue;
+      }
+      break;
+    }
+    const now = g.players.reduce((n, p) => n + p.points, 0) + g.riichiSticks * 1000;
+    if (now !== start) { ok(false, `点棒がずれた(${now} ≠ ${start})`); break; }
+  }
+  const total = g.players.reduce((n, p) => n + p.points, 0) + g.riichiSticks * 1000;
+  ok(total === start, `${hands} 局まわして合計 ${total} 点(鳴き ${calls} 回)`);
+  ok(calls > 0, `AI も鳴いている(${calls} 回)`);
+  ok(g.players.every((p) => p.melds.length <= 4), '晒す面子は 4 つまで');
 }
 
 console.log(fail === 0 ? '\n麻雀の対局: ALL PASS' : '\n麻雀の対局: FAIL あり');

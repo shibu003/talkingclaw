@@ -664,7 +664,7 @@ function tryGame(text: string): number | null {
   if (!chloePid) return null; // 進行役がいない部屋では遊べない
 
   const reply = cmd.type === 'start'
-    ? casino.start(cmd.game, (Date.now() ^ (store.lastId * 2654435761)) | 0, gameOpponents())
+    ? casino.start(cmd.game, (Date.now() ^ (store.lastId * 2654435761)) | 0, gameOpponents(), cmd.blind)
     : casino.apply(session!, cmd);
 
   // 発話は残す(会話の記録として)。targets を空にしてあるので Brain は起こさない

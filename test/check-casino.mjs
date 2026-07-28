@@ -2,7 +2,8 @@
 // 会話に紛れて誤爆しないこと、遊べる一通りの流れが通ることを見る。
 import { parseCommand, start, apply, brief, view } from '../src/casino.ts';
 import { shanten as mjShanten, tileName as mjTileName } from '../src/mahjong.ts';
-import { doraOf } from '../src/mahjongGame.ts';
+import { doraOf, discard as mgDiscard, callsFor } from '../src/mahjongGame.ts';
+import * as mjlib from '../src/mahjong.ts';
 
 // 自分が 1 枚も持っていない牌の名前(読み上げに混ざっていないか見るため)
 function tileOfOther(g) {
@@ -227,6 +228,46 @@ console.log('[9-2] 読み上げに手牌を混ぜない(進行役の発言とし
   const spoken2 = (r.say ?? []).join(' ');
   ok(mine.every((c) => !spoken2.includes(c)), `ポーカー: 読み上げに手札が出ない(${mine.join(' ')})`);
   ok((r.show ?? []).join(' ').includes(mine[0]), 'ポーカー: 手札は show に入る');
+}
+
+console.log('[9-1] 鳴ける場面では必ず止まって聞く(機械的に流さない)');
+{
+  const s = start('mahjong', 2024, [{ id: 'c', name: 'クロエ' }]).session;
+  apply(s, { type: 'deal', bet: 0 });
+  const g = s.game;
+  // 自分(席 0)がポンできる形を作る: 席 3(上家)が切る牌を 2 枚持たせる
+  const t = mjlib.parseHand('5p')[0];
+  g.players[0].hand = new Array(34).fill(0);
+  for (const x of mjlib.parseHand('55p123m456m789m11z')) g.players[0].hand[x]++;
+  g.turn = 3;
+  g.phase = 'discard';
+  g.players[3].hand[t] = Math.max(1, g.players[3].hand[t]);
+  g.players[3].drawn = t;
+  mgDiscard(g, 3, t);
+  ok(callsFor(g, 0).pon === true, '場としてポンできる');
+  const v = view(s);
+  const labels = v.moves.map((m) => m.label);
+  ok(labels.some((l) => l.includes('ポン')), `ポンのボタンが出る(${labels.join(' / ')})`);
+  ok(labels.some((l) => l.includes('スルー')), 'スルーのボタンも出る');
+  // ポンすると自分の番になり、晒した面子が卓に出る
+  const r = apply(s, { type: 'pon' });
+  ok(g.players[0].melds.length === 1 && g.turn === 0, 'ポンしたら自分の番になる');
+  const b2 = view(s).board;
+  ok(b2.seats[0].melds.length === 1, '晒した面子が卓に出る');
+  ok(r.say.join('').includes('ポン'), '何をしたか読み上げる');
+}
+
+console.log('[9-3] ポーカーのレートを選べる');
+{
+  const low = start('poker', 1, [{ id: 'c', name: 'クロエ' }], 10).session;
+  const high = start('poker', 1, [{ id: 'c', name: 'クロエ' }], 100).session;
+  ok(low.table.blind === 10 && high.table.blind === 100, 'ブラインドが変わる');
+  ok(low.table.seats[0].chips === 1000 && high.table.seats[0].chips === 10000,
+    `持ち点はレートの 100 倍(${low.table.seats[0].chips} / ${high.table.seats[0].chips})`);
+  ok(parseCommand('レート50でポーカーやろう', null)?.blind === 50, '声でレートを言える');
+  ok(parseCommand('ポーカーやろう', null)?.blind === undefined, '言わなければ既定');
+  const capped = start('poker', 1, [{ id: 'c', name: 'クロエ' }], 99999).session;
+  ok(capped.table.blind === 500, `高すぎるレートは頭打ち(${capped.table.blind})`);
 }
 
 console.log('[10] 画面用の卓(札と牌)');

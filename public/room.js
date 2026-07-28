@@ -1351,6 +1351,24 @@ function renderMahjongBoard(b) {
     wrap.className = 'mjriverbox';
     wrap.appendChild(river);
     cell.appendChild(wrap);
+
+    // 晒した面子(鳴いたもの)は誰にでも見えるので河のそばに出す
+    if ((s.melds ?? []).length > 0) {
+      const box = document.createElement('div');
+      box.className = 'mjmelds';
+      for (const meld of s.melds) {
+        const set = document.createElement('span');
+        set.className = 'mjmeld';
+        for (const name of meld) {
+          const el = document.createElement('span');
+          el.className = 'rtile open';
+          el.textContent = name;
+          set.appendChild(el);
+        }
+        box.appendChild(set);
+      }
+      cell.appendChild(box);
+    }
     t.appendChild(cell);
   }
 
