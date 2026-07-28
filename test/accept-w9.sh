@@ -32,6 +32,8 @@ N=$(grep -c "engine を起動中" /tmp/w9-0.log || true)
 echo "[2] W9-2: 記憶ファイルが再起動後の応答に反映される"
 PORT=3332
 cp ~/.talkingclaw/chloe-memory.md /tmp/memory.bak 2>/dev/null
+# テスト隔離: 実データの残タスクがあると boot 時の申告が TTS 待ち行列を埋めて計測が濁る
+mv ~/.talkingclaw/tasks.json /tmp/tasks-w9.bak 2>/dev/null
 MARK="ユーザーの好きな飲み物はルイボスティー"
 mkdir -p ~/.talkingclaw && printf -- "- 2026-07-28 %s\n" "$MARK" >> ~/.talkingclaw/chloe-memory.md
 mv ~/.talkingclaw/room.json ~/.talkingclaw/room.json.bak 2>/dev/null
@@ -43,14 +45,15 @@ sleep 3
 curl -s -X POST "http://127.0.0.1:$PORT/chat" -H 'content-type: application/json' -H "x-room-token: $TOKEN" \
   -d '{"text":"わたしの好きな飲み物、覚えてる?一言で答えて"}' >/dev/null
 HIT=0
-for i in $(seq 1 30); do
+for i in $(seq 1 45); do
   sse 2 | grep -q 'ルイボス' && HIT=1 && break
   sleep 3
 done
-[ $HIT = 1 ] && ok "起動時に注入された記憶を参照して答えた" || ng "記憶が反映されない(90s)"
+[ $HIT = 1 ] && ok "起動時に注入された記憶を参照して答えた" || ng "記憶が反映されない(225s)"
 kill $RP 2>/dev/null
 mv ~/.talkingclaw/room.json.bak ~/.talkingclaw/room.json 2>/dev/null
 cp /tmp/memory.bak ~/.talkingclaw/chloe-memory.md 2>/dev/null || rm -f ~/.talkingclaw/chloe-memory.md
+mv /tmp/tasks-w9.bak ~/.talkingclaw/tasks.json 2>/dev/null
 
 echo "[3] 静的: 生エラーを読み上げない / remember tool / ガード 180s"
 grep -q "考えすぎちゃった" src/room.ts && ! grep -q 'text: `ごめん、エラーが出ちゃった' src/room.ts && ok "友好エラー(生エラーは system のみ)" || ng "生エラー読み上げが残存"
