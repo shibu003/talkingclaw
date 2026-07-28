@@ -11,6 +11,7 @@ import { config } from './config.ts';
 import { archiveIndexTail, archiveRead, archiveSession, markArchiveBaseline } from './archive.ts';
 import { EventStore, Registry, kanaNormalize, type Channel, type RoomEvent } from './roomcore.ts';
 import { Voice, splitSentences } from './voice.ts';
+import * as casino from './casino.ts';
 
 const PORT = Number(process.env.PORT ?? 3300);
 const LISTEN_MAX_S = 48; // S2: server 内部 deadline 上限
@@ -30,6 +31,7 @@ const ROOMS_PATH = join(homedir(), '.talkingclaw', 'rooms.json');
 const DEFAULT_ROOMS: { id: Channel; label: string }[] = [
   { id: 'work', label: '作業部屋' },
   { id: 'chat', label: '雑談部屋' },
+  { id: 'game', label: 'ゲーム部屋' },
 ];
 function loadRooms(): { id: Channel; label: string }[] {
   try {
@@ -39,6 +41,7 @@ function loadRooms(): { id: Channel; label: string }[] {
   } catch { return DEFAULT_ROOMS; }
 }
 let rooms = loadRooms();
+if (!rooms.some((r) => r.id === 'game')) rooms.push({ id: 'game', label: 'ゲーム部屋' }); // 遊ぶ場所は最初から用意しておく
 function saveRooms(): void {
   try {
     mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
@@ -604,6 +607,66 @@ function looksIncomplete(text: string): boolean {
 }
 
 // 確定待ちに積む。確定したら userSpeech を呼ぶ。戻り値は「今すぐ確定したか」
+// ---- 遊び(ブラックジャック / ポーカー)----
+// 判定は casino/blackjack/poker の決定的なコードが持つ。LLM は審判をしない。
+// 「引く」と言ってから LLM を待つと遊べないので、会話の手前で拾って即返す。
+const GAMES_PATH = pathMod.join(homedir(), '.talkingclaw', 'games.json');
+const gameSessions = new Map<Channel, casino.Session>();
+function loadGames(): void {
+  try {
+    const rows = JSON.parse(readFileSync(GAMES_PATH, 'utf8')) as Record<string, casino.Session>;
+    for (const [ch, sess] of Object.entries(rows)) if (sess?.kind) gameSessions.set(ch as Channel, sess);
+  } catch { /* 無ければ何もしない */ }
+}
+function saveGames(): void {
+  try {
+    mkdirSync(pathMod.join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+    const tmp = `${GAMES_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(gameSessions)), { mode: 0o600 });
+    renameSync(tmp, GAMES_PATH);
+  } catch (e) { console.error('遊びの状態を保存できなかった:', (e as Error).message); }
+}
+loadGames();
+
+// この部屋で遊べる相手(クロエ + 同じ部屋にいる agent。作業係は誘わない)
+function gameOpponents(): { id: string; name: string; style: number }[] {
+  const out: { id: string; name: string; style: number }[] = [];
+  for (const p of registry.all()) {
+    if (p.assignedName === config.workerParticipant.name) continue;
+    const room = p.participantId === chloePid ? activeChannel : (participantRoom.get(p.participantId) ?? 'work');
+    if (room !== activeChannel) continue;
+    out.push({ id: p.participantId, name: p.assignedName, style: casino.styleOf(p.assignedName) });
+  }
+  return out;
+}
+
+/** ゲームの手なら、その場で判定して読み上げまでやる。ゲームでなければ null(いつもの会話へ) */
+function tryGame(text: string): number | null {
+  const session = gameSessions.get(activeChannel) ?? null;
+  const cmd = casino.parseCommand(text, session);
+  if (!cmd) return null;
+  if (!session && cmd.type !== 'start') return null;
+  if (!chloePid) return null; // 進行役がいない部屋では遊べない
+
+  const reply = cmd.type === 'start'
+    ? casino.start(cmd.game, (Date.now() ^ (store.lastId * 2654435761)) | 0, gameOpponents())
+    : casino.apply(session!, cmd);
+
+  // 発話は残す(会話の記録として)。targets を空にしてあるので Brain は起こさない
+  const turnId = `G${++turnSeq}`;
+  const ev = store.append({
+    type: 'user_speech', from: 'user', text, turnId, targets: [],
+    routing: { method: 'default' }, channel: activeChannel,
+  });
+  if (reply.session) gameSessions.set(activeChannel, reply.session);
+  else gameSessions.delete(activeChannel);
+  saveGames();
+  if (reply.hand) store.append({ type: 'system', from: 'room', text: reply.hand, channel: activeChannel });
+  const name = registry.get(chloePid)?.assignedName ?? config.character.name;
+  for (const line of reply.say) speakSentences(chloePid, name, line, turnId, activeChannel);
+  return ev.id;
+}
+
 // 添付(画像・ファイル)は /chat と一緒に来る。次の user_speech に載せて、Brain には実パスを渡す
 let pendingFiles: string[] = [];
 const uploadDir = (): string => pathMod.join(homedir(), '.talkingclaw', 'uploads');
@@ -1819,6 +1882,9 @@ const server = createServer(async (req, res) => {
   if (path === '/chat') {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
+    // 遊びの手は会話に流さず即判定(待たされるゲームは遊べない)
+    const gameEvent = tryGame(text);
+    if (gameEvent !== null) return json(res, 200, { ok: true, eventId: gameEvent, game: true });
     // 添付は次の user_speech に載せる(送信の直前に確定するので pending で持つ)
     if (Array.isArray(body.files)) {
       pendingFiles = body.files.map(String).map((f) => pathMod.basename(f)).filter(Boolean).slice(0, 8);
