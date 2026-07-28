@@ -245,6 +245,9 @@ async function send(text) {
 textInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.isComposing) { void send(textInput.value); textInput.value = ''; }
 });
+document.getElementById('send').onclick = () => {
+  void send(textInput.value); textInput.value = ''; textInput.focus();
+};
 
 // ---- 音声認識 + STT 計測(S10 gate ①: speechend→final Δt)----
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -449,22 +452,70 @@ function showPreview(relPath) {
 }
 const previewedTasks = new Set();
 
-// ---- W8-3: 作業ボード(誰が何をどこまで)----
-const boardEl = document.getElementById('board');
+// ---- パネル(部屋 / 作業ボード / 設定)。開くのは同時に 1 枚だけ ----
+const boardEl = document.getElementById('boardList');
 let boardOpen = false;
-document.getElementById('boardBtn').onclick = () => {
-  boardOpen = !boardOpen;
-  boardEl.style.display = boardOpen ? 'block' : 'none';
-  if (boardOpen) void refreshBoard();
+const panels = {
+  rooms: { el: document.getElementById('rooms'), btn: document.getElementById('roomBtn'), render: renderRooms },
+  board: { el: document.getElementById('board'), btn: document.getElementById('boardBtn'), render: refreshBoard },
+  settings: { el: document.getElementById('settings'), btn: document.getElementById('settingsBtn'), render: renderSettings },
 };
+let openedPanel = null;
+function openPanel(name) {
+  openedPanel = openedPanel === name ? null : name;
+  for (const [key, p] of Object.entries(panels)) {
+    const on = key === openedPanel;
+    p.el.classList.toggle('open', on);
+    p.btn.setAttribute('aria-expanded', String(on));
+  }
+  boardOpen = openedPanel === 'board';
+  if (openedPanel) void panels[openedPanel].render();
+}
+for (const [key, p] of Object.entries(panels)) p.btn.onclick = () => openPanel(key);
+
 document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel);
 document.getElementById('archiveBtn').onclick = () => window.open('/archives.md?token=' + TOKEN);
 
-// ---- 部屋分割: 作業部屋 / 雑談部屋の切替 ----
-const roomBtn = document.getElementById('roomBtn');
-function updateRoomBtn() { roomBtn.textContent = ROOM_LABEL[currentChannel] ?? currentChannel; }
-roomBtn.onclick = async () => {
-  const next = currentChannel === 'work' ? 'chat' : 'work';
+// ---- 部屋の一覧と切替 ----
+// 一覧は /channels があればそれを、無いサーバ(現行)は組み込みの 2 部屋で動く。
+// 新規作成 / 名前変更の UI は #roomsExtra にぶら下げる。
+const roomBtnName = document.querySelector('#roomBtn .rname');
+let roomList = [{ channel: 'work', label: ROOM_LABEL.work }, { channel: 'chat', label: ROOM_LABEL.chat }];
+function roomLabel(ch) { return roomList.find((r) => r.channel === ch)?.label ?? ROOM_LABEL[ch] ?? ch; }
+function updateRoomBtn() { roomBtnName.textContent = roomLabel(currentChannel); }
+async function fetchRooms() {
+  try {
+    const r = await fetch('/channels?token=' + TOKEN);
+    if (!r.ok) return;
+    const rows = (await r.json()).rooms;
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    roomList = rows.map((c) => (typeof c === 'string'
+      ? { channel: c, label: ROOM_LABEL[c] ?? c }
+      : { channel: c.channel, label: c.label ?? c.name ?? ROOM_LABEL[c.channel] ?? c.channel }));
+  } catch { /* 未対応サーバでは組み込みの 2 部屋のまま */ }
+}
+async function renderRooms() {
+  await fetchRooms();
+  updateRoomBtn();
+  const list = document.getElementById('roomList');
+  list.replaceChildren();
+  for (const room of roomList) {
+    const btn = document.createElement('button');
+    btn.className = 'room' + (room.channel === currentChannel ? ' here' : '');
+    btn.textContent = room.label;
+    if (room.channel === currentChannel) {
+      const mark = document.createElement('span');
+      mark.className = 'here-mark';
+      mark.textContent = 'いまここ';
+      btn.appendChild(mark);
+    }
+    btn.onclick = () => void enterRoom(room.channel);
+    list.appendChild(btn);
+  }
+}
+async function enterRoom(next) {
+  openPanel(null);
+  if (next === currentChannel) return;
   await post('/channel', { channel: next });
   currentChannel = next;
   updateRoomBtn();
@@ -472,7 +523,7 @@ roomBtn.onclick = async () => {
   log.replaceChildren();
   bubbles.clear();
   audioQueue.length = 0;
-};
+}
 updateRoomBtn();
 async function refreshBoard() {
   try {
@@ -526,13 +577,7 @@ function checkAutoPreview(d) {
 setInterval(refreshBoard, 5000);
 
 // ---- W8-7: worker 設定パネル ----
-const settingsEl = document.getElementById('settings');
-let settingsOpen = false;
-document.getElementById('settingsBtn').onclick = async () => {
-  settingsOpen = !settingsOpen;
-  settingsEl.style.display = settingsOpen ? 'block' : 'none';
-  if (settingsOpen) await renderSettings();
-};
+const settingsEl = document.getElementById('settingsBody');
 async function renderSettings() {
   const d = await (await post('/settings', {})).json();
   settingsEl.replaceChildren();

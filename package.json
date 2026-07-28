@@ -10,6 +10,7 @@
     "setup-voice": "node scripts/setup-voice.mjs",
     "metrics": "node scripts/metrics-report.mjs",
     "cli": "node src/cli.ts",
+    "check-ui": "node test/check-ui.mjs",
     "setup-stt": "swiftc -O tools/listen.swift -o tools/claw-listen -framework Speech -framework AVFoundation"
   },
   "repository": {
