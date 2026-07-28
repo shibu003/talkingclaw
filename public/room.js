@@ -543,6 +543,18 @@ async function renderSettings() {
   }
   effortSel.onchange = () => void post('/settings', { workerEffort: effortSel.value });
   mk('effort:', effortSel);
+  const chatSel = document.createElement('select');
+  for (const m of ['haiku', 'sonnet', 'opus', 'fable']) {
+    const o = document.createElement('option'); o.value = m; o.textContent = m; if (d.chatModel === m) o.selected = true; chatSel.appendChild(o);
+  }
+  chatSel.onchange = () => void post('/settings', { chatModel: chatSel.value });
+  mk('会話モデル(雑談・返事):', chatSel);
+  const chatEffortSel = document.createElement('select');
+  for (const e of ['', 'low', 'medium', 'high', 'xhigh', 'max']) {
+    const o = document.createElement('option'); o.value = e; o.textContent = e || '既定'; if (d.chatEffort === e) o.selected = true; chatEffortSel.appendChild(o);
+  }
+  chatEffortSel.onchange = () => void post('/settings', { chatEffort: chatEffortSel.value });
+  mk('会話 effort:', chatEffortSel);
   const skills = document.createElement('input');
   skills.type = 'checkbox'; skills.checked = !!d.useUserSettings;
   skills.onchange = () => void post('/settings', { useUserSettings: skills.checked });

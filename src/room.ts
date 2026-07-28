@@ -674,12 +674,12 @@ function loadProjects(): Record<string, string> {
 
 // ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
 const SETTINGS_PATH = join(homedir(), '.talkingclaw', 'settings.json');
-type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean };
+type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string };
 function loadSettings(): WorkerSettings {
   try {
-    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false, ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) };
+    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false, chatModel: config.model, chatEffort: '', ...JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) };
   } catch {
-    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false };
+    return { workerModel: config.agent.model, workerEffort: '', useUserSettings: false, chatModel: config.model, chatEffort: '' };
   }
 }
 let workerSettings = loadSettings();
@@ -746,6 +746,7 @@ import { z } from 'zod';
 
 let chloePid: string | null = null;
 let chloeResetWorker: (() => void) | null = null;
+let chloeResetChat: (() => void) | null = null;
 // W9-2: 本番は 180s(sonnet + delegate の長 turn を誤殺しない)。テストは短縮して回転を速く
 // テスト時も「通常応答(context 注入込みで 20-40s)は切らず、ハングだけ捕まえる」値にする
 const ASK_GUARD_MS = Number(process.env.ASK_GUARD_MS ?? (process.env.ROOM_TEST_HOOKS === '1' ? 45_000 : 180_000));
@@ -791,6 +792,18 @@ function startChloe(): void {
     void pumpTasks();
     return task;
   }
+
+  chloeResetChat = () => {
+    for (const c of CHANNELS) {
+      const cs = channelState[c];
+      cs.chain = cs.chain.catch(() => {}).then(() => {
+        void cs.brain.close().catch(() => {});
+        cs.brain = new Brain(makeConvBrainOpts(c));
+        cs.needsContext = true; // 記憶 + 直近ログを次の ask で再注入
+      });
+    }
+    store.append({ type: 'system', from: 'room', text: `会話モデルを ${workerSettings.chatModel} に切り替えたよ` });
+  };
 
   chloeResetWorker = () => {
     if (!workerBusy && worker) { void worker.close().catch(() => {}); worker = null; }
@@ -934,7 +947,8 @@ function startChloe(): void {
   // 雑談部屋は delegate_task を使わない(雑談専用。作業依頼が来たら作業部屋に誘導する)
   function makeConvBrainOpts(channel: Channel) {
     return {
-      systemPrompt: config.systemPrompt + config.rooms[channel], model: config.model,
+      systemPrompt: config.systemPrompt + config.rooms[channel], model: workerSettings.chatModel,
+      ...(workerSettings.chatEffort ? { effort: workerSettings.chatEffort } : {}),
       mcpServers: { office: officeServer } as Record<string, unknown>,
       allowedTools: channel === 'work'
         ? ['mcp__office__delegate_task', 'mcp__office__remember', 'mcp__office__room_status']
@@ -1300,8 +1314,14 @@ const server = createServer(async (req, res) => {
     if (typeof body.workerModel === 'string' && allowedModels.includes(body.workerModel)) workerSettings.workerModel = body.workerModel;
     if (typeof body.workerEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.workerEffort)) workerSettings.workerEffort = body.workerEffort;
     if (typeof body.useUserSettings === 'boolean') workerSettings.useUserSettings = body.useUserSettings;
+    const beforeChat = `${workerSettings.chatModel}/${workerSettings.chatEffort}`;
+    if (typeof body.chatModel === 'string' && allowedModels.includes(body.chatModel)) workerSettings.chatModel = body.chatModel;
+    if (typeof body.chatEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.chatEffort)) workerSettings.chatEffort = body.chatEffort;
     saveSettings();
     chloeResetWorker?.(); // 次の task から新設定(実行中の task は続行)
+    if (beforeChat !== `${workerSettings.chatModel}/${workerSettings.chatEffort}`) {
+      chloeResetChat?.(); // 会話中でも安全なタイミングで作り直す(記憶と直近ログは再注入)
+    }
     const ext = loadWorkerMcp();
     return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers), projects: Object.keys(loadProjects()) });
   }

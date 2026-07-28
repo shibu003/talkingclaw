@@ -29,7 +29,19 @@ grep -q "workerCwd !== cwd" src/room.ts && ok "同一 project は worker セッ�
 echo "[4] W10-4: 完了ごとの個別報告"
 grep -q "できたよ。画面に出しておくね" src/room.ts && ok "task done で個別報告" || ng "報告なし"
 
-echo "[5] ブラウザがプレビュー時に画面状態を送る"
+echo "[5] 会話モデル / 会話 effort が設定できる(雑談側も選べる)"
+R=$(curl -s -X POST "$B/settings" -H "$H" -H "$T" -d '{"chatModel":"fable","chatEffort":"high"}')
+echo "$R" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['chatModel']=='fable' and d['chatEffort']=='high', d
+print('ok')" >/dev/null 2>&1 && ok "会話モデル fable / effort high を反映" || ng "$R"
+R=$(curl -s -X POST "$B/settings" -H "$H" -H "$T" -d '{"chatModel":"gpt-5"}')
+echo "$R" | grep -q '"chatModel": *"fable"\|"chatModel":"fable"' && ok "不正な会話モデルは拒否" || ng "$R"
+grep -q "chatSel" public/room.js && ok "⚙ に会話モデルの選択肢" || ng "UI なし"
+curl -s -X POST "$B/settings" -H "$H" -H "$T" -d '{"chatModel":"sonnet","chatEffort":""}' >/dev/null
+
+echo "[6] ブラウザがプレビュー時に画面状態を送る"
 grep -q "post('/ui-state'" public/room.js && ok "showPreview で送信" || ng "未送信"
 grep -vE '^\s*//' public/room.js | grep -qE 'innerHTML|insertAdjacentHTML' && ng "XSS 規律違反" || ok "textContent 規律維持"
 
