@@ -838,6 +838,8 @@ async function renderRooms() {
 }
 async function enterRoom(next) {
   openPanel(null);
+  // 遊ぶための部屋なので、入っている間は卓を出す(既にその部屋に居る時も効かせる)
+  if (next === 'game' && wideLayout() && sideView !== 'game') switchBoardTab('game');
   if (next === currentChannel) return;
   await post('/channel', { channel: next });
   currentChannel = next;
@@ -851,8 +853,6 @@ async function enterRoom(next) {
   boardSoon(50);           // 何をしているか
   void renderRooms();      // 部屋の名前(一覧とヘッダの表示)
   void refreshGame();      // 部屋ごとに別のゲームなので取り直す
-  // 遊ぶための部屋なので、入ったら卓を出す(他の部屋では右レーンを開かない)
-  if (next === 'game' && wideLayout()) switchBoardTab('game');
 }
 
 // 部屋に入った時、その部屋で話していた内容を読み直す(音は鳴らさない)
@@ -1178,6 +1178,61 @@ function switchBoardTab(view) {
   void (sideView === 'inbox' ? refreshInbox() : sideView === 'game' ? refreshGame() : refreshBoard());
 }
 
+// ---- 幅を掴んで動かす(Zed のような仕切り)----
+// 左は px、右は画面幅に対する % で覚える。両端に寄せすぎないよう幅に下限を置く
+function setupGrips() {
+  const saved = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const remember = (k, v) => { try { localStorage.setItem(k, v); } catch { /* 使えなくても動く */ } };
+  const navW = saved('tc-nav-w');
+  const sideW = saved('tc-side-w');
+  if (navW) document.documentElement.style.setProperty('--nav-w', navW);
+  if (sideW) document.documentElement.style.setProperty('--side-w', sideW);
+
+  const make = (lane, onMove, onReset) => {
+    if (!lane) return;
+    const grip = document.createElement('div');
+    grip.className = 'grip';
+    grip.title = 'ドラッグで幅を変える(ダブルクリックで戻す)';
+    grip.onpointerdown = (e) => {
+      e.preventDefault();
+      grip.setPointerCapture(e.pointerId);
+      grip.classList.add('dragging');
+      document.body.style.userSelect = 'none';
+      const move = (ev) => onMove(ev.clientX);
+      const up = () => {
+        grip.classList.remove('dragging');
+        document.body.style.userSelect = '';
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', up);
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', up);
+    };
+    grip.ondblclick = onReset;
+    lane.appendChild(grip);
+  };
+
+  make(document.querySelector('.lane.nav'), (x) => {
+    const w = Math.round(Math.min(Math.max(x, 180), window.innerWidth * 0.4)) + 'px';
+    document.documentElement.style.setProperty('--nav-w', w);
+    remember('tc-nav-w', w);
+  }, () => {
+    document.documentElement.style.removeProperty('--nav-w');
+    remember('tc-nav-w', '');
+  });
+
+  make(document.querySelector('.lane.side'), (x) => {
+    const pct = Math.min(Math.max((window.innerWidth - x) / window.innerWidth * 100, 22), 65);
+    const w = pct.toFixed(1) + '%';
+    document.documentElement.style.setProperty('--side-w', w);
+    remember('tc-side-w', w);
+  }, () => {
+    document.documentElement.style.removeProperty('--side-w');
+    remember('tc-side-w', '');
+  });
+}
+setupGrips();
+
 // ---- ゲーム: 声で言えることは全部ボタンでも押せる ----
 // ボタンは声とまったく同じ言葉を /chat に送るので、判定の入口が二重にならない
 const gameBadgeEl = document.getElementById('gameBadge');
@@ -1201,6 +1256,25 @@ async function refreshGame() {
         st.append(b, document.createElement('br'));
       }
       gameEl.appendChild(st);
+    }
+    document.getElementById('board').classList.toggle('playing', !!v.kind);
+    document.body.classList.toggle('playing', !!v.kind && sideView === 'game');
+    if (v.board) renderMahjongBoard(v.board);
+    if ((v.hand ?? []).length > 0) {
+      const lab = document.createElement('div');
+      lab.className = 'grow-label';
+      lab.textContent = 'あなたの手牌';
+      gameEl.appendChild(lab);
+      const box = document.createElement('div');
+      box.className = 'gtiles';
+      for (const f of v.hand) {
+        const el = document.createElement(f.move ? 'button' : 'span');
+        el.className = 'gtile' + (f.red ? ' drawn' : '') + (f.move ? ' can' : '');
+        el.textContent = f.text;
+        if (f.move) { el.title = '押すと切るよ'; el.onclick = () => void playMove(f.move); }
+        box.appendChild(el);
+      }
+      gameEl.appendChild(box);
     }
     // 札と牌は実物として並べる。押せるもの(麻雀の打牌)はボタンになる
     for (const row of v.table ?? []) {
@@ -1240,6 +1314,60 @@ async function refreshGame() {
     gameEl.appendChild(det);
   } catch { /* 次の更新で */ }
 }
+// 麻雀の卓。自分から見た向きで 4 人ぶんの河を並べる(本物の卓と同じ配置)
+function renderMahjongBoard(b) {
+  const t = document.createElement('div');
+  t.className = 'mjtable';
+
+  for (const s of b.seats) {
+    const cell = document.createElement('div');
+    cell.className = 'mjseat at-' + s.at + (s.turn ? ' turn' : '');
+
+    const who = document.createElement('div');
+    who.className = 'mjwho';
+    const wind = document.createElement('b');
+    wind.className = 'mjwind' + (s.dealer ? ' dealer' : '');
+    wind.textContent = s.wind;
+    who.appendChild(wind);
+    who.append(document.createTextNode(` ${s.name} ${s.points}`));
+    if (s.riichi) {
+      const r = document.createElement('span');
+      r.className = 'mjriichi';
+      r.textContent = 'リーチ';
+      who.appendChild(r);
+    }
+    cell.appendChild(who);
+
+    // 河は 6 枚ずつ 3 段。各家が自分の向きで捨てているので、その向きに回す
+    const river = document.createElement('div');
+    river.className = 'mjriver';
+    for (const name of s.river.slice(-18)) {
+      const el = document.createElement('span');
+      el.className = 'rtile';
+      el.textContent = name;
+      river.appendChild(el);
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'mjriverbox';
+    wrap.appendChild(river);
+    cell.appendChild(wrap);
+    t.appendChild(cell);
+  }
+
+  const center = document.createElement('div');
+  center.className = 'mjcenter';
+  const l1 = document.createElement('b');
+  l1.textContent = `${b.round} ${b.honba}本場`;
+  const l2 = document.createElement('span');
+  l2.textContent = `ドラ ${b.dora}`;
+  const l3 = document.createElement('span');
+  l3.textContent = `残り ${b.left} 枚${b.sticks > 0 ? ` / 供託 ${b.sticks}` : ''}`;
+  center.append(l1, l2, l3);
+  t.appendChild(center);
+
+  gameEl.appendChild(t);
+}
+
 // ボタンを押す = その言葉を言うのと同じ
 async function playMove(text) {
   await post('/chat', { text, immediate: true });
@@ -1281,6 +1409,37 @@ function renderHistory(rows) {
   pickBar(historyEl, () => boardSoon(0));
 }
 
+// 遊べるものも「見て分かる成果物」なので、成果物タブから選んで始められるようにする。
+// 選んだらゲーム部屋へ移動して卓を開く(遊ぶ場所に連れていく)
+function playBox() {
+  const box = document.createElement('div');
+  box.className = 'playbox';
+  const h = document.createElement('b');
+  h.textContent = gameKind ? '遊んでいるゲーム' : '遊ぶ';
+  box.appendChild(h);
+  const row = document.createElement('div');
+  row.className = 'gmoves';
+  for (const [label, text, kind] of [
+    ['🃏 ポーカー', 'ポーカーやろう', 'poker'],
+    ['♠ ブラックジャック', 'ブラックジャックやろう', 'blackjack'],
+    ['🀄 麻雀', '麻雀やろう', 'mahjong'],
+  ]) {
+    const b = document.createElement('button');
+    b.className = 'gmove' + (gameKind === kind ? ' hot' : '');
+    b.textContent = label;
+    b.onclick = async () => {
+      if (currentChannel !== 'game') await enterRoom('game'); // 遊ぶ部屋に移動する
+      switchBoardTab('game');
+      if (gameKind === kind) return;                          // もう遊んでいる = 卓を見せるだけ
+      if (gameKind) { addSys('先に「やめる」で今のゲームを終わらせてね'); return; }
+      await playMove(text);
+    };
+    row.appendChild(b);
+  }
+  box.appendChild(row);
+  return box;
+}
+
 // 右レーンの成果物一覧(新しい順)。画像はサムネを付けて「何ができたか」を見せる
 const ARTIFACT_SHOWN = 8; // レーンをスクロールさせないための上限
 const TASKS_SHOWN = 2;
@@ -1299,6 +1458,7 @@ function renderArtifacts(rows) {
     }
   }
   artifactEl.replaceChildren();
+  artifactEl.appendChild(playBox());
   if (items.length === 0) {
     const e = document.createElement('div');
     e.className = 'tnote';
@@ -1384,6 +1544,14 @@ function threadCard(t) {
     btn.textContent = '既読';
     btn.onclick = async () => { await post('/inbox/read', { threadId: t.id }); void refreshInbox(); };
     actions.appendChild(btn);
+  }
+  // どの部屋で頼まれた作業かに戻れるようにする(そこで会話の続きができる)
+  if (t.channel && t.channel !== currentChannel) {
+    const go = document.createElement('button');
+    go.className = 'tab';
+    go.textContent = `${roomLabel(t.channel)}へ`;
+    go.onclick = async () => { await post('/inbox/read', { threadId: t.id }); await enterRoom(t.channel); };
+    actions.appendChild(go);
   }
   const del = document.createElement('button');
   del.className = 'tab';
@@ -1813,4 +1981,6 @@ async function renderDict() {
 connect();
 void renderSideAlways();          // 常設パネル(部屋・設定)の中身を最初から描いておく
 void refreshGame();               // 遊んでいる途中なら、リロードしてもボタンが戻るように
+// リロードした時もゲーム部屋なら卓を出す(在室の同期で部屋が分かってから)
+setTimeout(() => { if (currentChannel === 'game' && wideLayout()) switchBoardTab('game'); }, 1200);
 void showHistory(currentChannel); // リロード直後も直近の会話が見えるように

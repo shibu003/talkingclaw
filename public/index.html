@@ -21,6 +21,16 @@
     --measure: 30em;   /* 1 行の最大文字数(和文で読み疲れない幅) */
   }
   * { box-sizing: border-box; margin: 0; }
+  /* スクロールバーは動かしている時だけ見せる(いつも出ていると画面が騒がしい)。
+     幅は取り続けるので、出た瞬間に中身がずれることはない */
+  * { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+  *:hover, *:focus-within { scrollbar-color: var(--line) transparent; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: transparent; border-radius: 999px;
+                              border: 2px solid transparent; background-clip: content-box; }
+  :hover::-webkit-scrollbar-thumb { background: var(--line); background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: content-box; }
   body { font-family: "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
          background: var(--bg); color: var(--text);
          font-size: var(--fs-body); line-height: 1.8; letter-spacing: .015em;
@@ -247,6 +257,10 @@
 
   /* ---- ゲーム: 声で言えることは全部ボタンでも押せるようにする ---- */
   #gameList h3 { font-size: var(--fs-ui); font-weight: 700; line-height: 1.6; margin-bottom: 6px; }
+  /* 成果物タブから遊べるようにする(遊べるものも「見て分かる成果物」なので)*/
+  .playbox { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--surface-2); }
+  .playbox > b { display: block; font-size: var(--fs-small); font-weight: 700; color: var(--muted);
+                 letter-spacing: .06em; margin-bottom: 8px; }
   #gameList .gstate { font-size: var(--fs-small); line-height: 1.8; color: var(--muted); margin-bottom: 10px; }
   #gameList .gstate b { color: var(--text); font-weight: 400; }
   .gmoves { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
@@ -264,6 +278,42 @@
   .gcard.red { color: #c62c46; }
   .gcard.back { background: repeating-linear-gradient(45deg, #4a3f74, #4a3f74 5px, #3a3060 5px, #3a3060 10px);
                 border-color: #2a2240; color: transparent; box-shadow: none; }
+  /* ---- 麻雀の卓: 自分から見た向きで 4 人ぶんの河を並べる ----
+     河は 6 枚 3 段。各家が自分の向きに捨てるので、上下左右で回してある。
+     大きさを固定してあるので、どれだけ捨ててもスクロールしない */
+  .mjtable { display: grid; gap: 4px; padding: 10px; margin-bottom: 10px; border-radius: var(--r-md);
+             grid-template-columns: 116px minmax(0, 1fr) 116px;
+             grid-template-rows: 130px minmax(0, 1fr) 130px;
+             background: radial-gradient(ellipse at center, #1d5c40 0%, #123c2a 100%);
+             border: 1px solid #0d2a1d; box-shadow: inset 0 0 30px rgba(0,0,0,.45); }
+  .mjseat { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; }
+  .at-top    { grid-area: 1 / 2; }
+  .at-left   { grid-area: 2 / 1; }
+  .at-right  { grid-area: 2 / 3; }
+  .at-self   { grid-area: 3 / 2; }
+  .mjcenter  { grid-area: 2 / 2; display: flex; flex-direction: column; align-items: center; justify-content: center;
+               gap: 2px; font-size: 12.5px; line-height: 1.5; color: #cfe8db; text-align: center; }
+  .mjcenter b { font-size: 13.5px; color: #fff; font-weight: 700; }
+  .mjwho { font-size: 12.5px; line-height: 1.4; color: #cfe8db; white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .mjseat.turn .mjwho { color: #fff; text-shadow: 0 0 8px rgba(255,255,255,.55); }
+  .mjwind { display: inline-block; min-width: 15px; text-align: center; border-radius: 3px;
+            background: rgba(255,255,255,.16); font-weight: 700; }
+  .mjwind.dealer { background: #d8b43c; color: #1a1206; }
+  .mjriichi { margin-left: 4px; padding: 0 5px; border-radius: 3px; background: #d94f6e; color: #fff; font-size: 12px; }
+  /* 河の入れ物は大きさを固定し、中身だけ回す(回しても場所を食い合わない)*/
+  .mjriverbox { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .at-top .mjriverbox, .at-self .mjriverbox { width: 100%; height: 106px; }
+  .at-left .mjriverbox, .at-right .mjriverbox { width: 106px; height: 100%; }
+  .mjriver { display: grid; grid-template-columns: repeat(6, 26px); gap: 2px; }
+  .at-top .mjriver   { transform: rotate(180deg); }
+  .at-left .mjriver  { transform: rotate(90deg); }
+  .at-right .mjriver { transform: rotate(-90deg); }
+  .rtile { display: flex; align-items: center; justify-content: center; width: 26px; height: 32px;
+           border-radius: 3px; background: linear-gradient(#fdfbf4, #ece5d5); color: #17111f;
+           border: 1px solid #b3a685; font-size: 12px; font-weight: 700; line-height: 1;
+           letter-spacing: -.06em; }
+
   /* 麻雀の牌 */
   .gtiles { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
   .gtile { display: inline-flex; align-items: center; justify-content: center;
@@ -271,7 +321,7 @@
            background: linear-gradient(#fdfbf4, #efe9db); color: #17111f;
            border: 1px solid #c3b79c; border-bottom: 3px solid #b3a685;
            font-size: 14px; font-weight: 700; line-height: 1.2; }
-  .gtile.red { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(205,178,255,.5); } /* ツモ牌 */
+  .gtile.drawn { margin-left: 10px; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(205,178,255,.5); } /* ツモ牌は離す */
   .gtile.can:hover, .gcard.can:hover { transform: translateY(-4px); border-color: var(--accent); }
   .gtile.can, .gcard.can { cursor: pointer; }
   #gameList details { margin-top: 6px; }
@@ -348,8 +398,18 @@
     header { grid-area: head; } #rooms { grid-area: room; } #notice { grid-area: note; } #plan { grid-area: plan; }
     #log { grid-area: log; } footer { grid-area: foot; }
     /* 右レーンは常設しない。プレビューを開いた時と 📋 で呼んだ時だけ現れる */
-    body { grid-template-columns: 264px minmax(0, 1fr) 0; }
-    body.side-open { grid-template-columns: 264px minmax(0, 1fr) minmax(320px, 34%); }
+    /* 幅は掴んで動かせる(--nav-w / --side-w に入る。localStorage に覚える)*/
+    body { grid-template-columns: var(--nav-w, 264px) minmax(0, 1fr) 0; }
+    body.side-open { grid-template-columns: var(--nav-w, 264px) minmax(0, 1fr) var(--side-w, 40%); }
+    /* 遊んでいる間は右を広く取る(卓をちゃんと見せる)。自分で動かしたらそちらが勝つ */
+    body.side-open.playing { grid-template-columns: var(--nav-w, 264px) minmax(0, 1fr) var(--side-w, 48%); }
+    .lane { position: relative; }
+    .grip { position: absolute; top: 0; bottom: 0; width: 9px; z-index: 5; cursor: col-resize; }
+    .lane.nav .grip { right: -5px; }
+    .lane.side .grip { left: -5px; }
+    .grip::after { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 3px;
+                   border-radius: 2px; background: transparent; transition: background .15s; }
+    .grip:hover::after, .grip.dragging::after { background: var(--accent); }
     .lane { display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; padding: 12px 0; }
     .lane.nav { grid-area: nav; border-right: 1px solid var(--line); }
     .lane.side { grid-area: side; border-left: 1px solid var(--line); display: none; }
@@ -359,6 +419,8 @@
     #rooms { margin: 10px var(--pad) 0; max-height: 44dvh; overflow-y: auto; }
     #roster { padding: 0; }
     .lane.side #board { max-height: 55%; overflow-y: auto; flex-shrink: 0; }
+    /* ゲーム中は卓を切らない(高さ制限を外して全部見せる)*/
+    .lane.side #board.playing { max-height: none; overflow: visible; }
     #preview { height: auto; flex: 1; min-height: 220px; }
     /* 部屋一覧と作業ボードが常設 = ヘッダのボタンは役目を終える(狭い画面では残る) */
     .lane.nav .task .tnote { display: none; }  /* 実況は進捗の帯に出るので繰り返さない */

@@ -487,10 +487,18 @@ function floorAdvance(pid: string): void {
   lastResponder = pid;
 }
 
+// 話しかけられるのは今いる部屋にいる相手だけ(クロエはどの部屋にもいる)。
+// 別の部屋にいる相手に届けたい時は、在室リストから「呼ぶ」で連れてくる
+function inThisRoom(pid: string): boolean {
+  if (pid === chloePid) return true;
+  return (participantRoom.get(pid) ?? 'work') === activeChannel;
+}
+
 function routeTargets(text: string): { targets: string[]; routing: RoomEvent['routing'] } {
   const head = kanaNormalize(text.slice(0, 12));
   let best: { pid: string; alias: string } | null = null;
   for (const p of registry.all()) {
+    if (!inThisRoom(p.participantId)) continue;
     // ghost(suffix ephemeral)の gone だけ除外。本物(canonical)の gone は名指し可
     // → inbox に積まれ復帰後に再配送 + 未達通知が出る(v6.1 修正)
     if (!registry.alive(p) && p.ephemeral) continue;
@@ -504,6 +512,7 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
   if (best) return { targets: [best.pid], routing: { method: 'name', matchedAlias: best.alias } };
   const aliveTarget = (pid: string | null): boolean => {
     if (!pid) return false;
+    if (!inThisRoom(pid)) return false;           // 別の部屋にいる相手には流れない
     const p = registry.get(pid);
     return p !== undefined && registry.alive(p); // S4: gone は floor/last_responder から自然解除
   };
@@ -511,7 +520,7 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
   if (aliveTarget(floorOwner)) return { targets: [floorOwner!], routing: { method: 'floor' } };
   if (aliveTarget(lastResponder)) return { targets: [lastResponder!], routing: { method: 'last_responder' } };
   if (chloePid && registry.get(chloePid)) return { targets: [chloePid], routing: { method: 'default' } };
-  return { targets: registry.all().map((p) => p.participantId), routing: { method: 'default' } };
+  return { targets: registry.all().map((p) => p.participantId).filter(inThisRoom), routing: { method: 'default' } };
 }
 
 // ---- W12: 報告ブロックの解析。テンプレを守っていれば構造化、守っていなければ notes から組み立てる ----
@@ -986,6 +995,7 @@ type OfficeTask = {
   report?: TaskReport;
   unread?: boolean;
   replies?: { at: string; text: string }[]; // このスレッドへの追加依頼
+  channel?: Channel;                        // どの部屋で頼まれたか(報告から戻れるように)
 };
 type TaskReport = {
   headline: string;      // 結果を 1 行
@@ -1152,7 +1162,7 @@ function startChloe(): void {
   function delegate(description: string, project?: string): OfficeTask {
     const task: OfficeTask = {
       id: ++taskSeq, agent: chloePid!, agentName: chloe.assignedName, request: description, project,
-      status: 'queued', notes: [], artifacts: [], at: new Date().toISOString(),
+      status: 'queued', notes: [], artifacts: [], at: new Date().toISOString(), channel: activeChannel,
     };
     officeTasks.push(task);
     while (officeTasks.length > 50) officeTasks.shift();

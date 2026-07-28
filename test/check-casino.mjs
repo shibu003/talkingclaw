@@ -251,16 +251,21 @@ console.log('[10] 画面用の卓(札と牌)');
   const m = start('mahjong', 4242, [{ id: 'c', name: 'クロエ' }]).session;
   apply(m, { type: 'deal', bet: 0 });
   const mv = view(m);
-  const hand = mv.table.find((r) => r.label.includes('手牌'));
-  ok(hand && hand.kind === 'tile', '麻雀は牌として出す');
-  ok(hand.faces.length === 14, `親の手牌は 14 枚(${hand?.faces.length})`);
-  ok(hand.faces.every((f) => f.move), '自分の番なので全部押して切れる');
-  ok(hand.faces[hand.faces.length - 1].red === true, 'ツモ牌は離して目立たせる');
+  ok(mv.hand.length === 14, `親の手牌は 14 枚(${mv.hand.length})`);
+  ok(mv.hand.every((f) => f.move), '自分の番なので全部押して切れる');
+  ok(mv.hand[mv.hand.length - 1].red === true, 'ツモ牌は離して目立たせる');
+  // 卓: 4 人ぶんが自分から見た向きで並ぶ
+  const b2 = mv.board;
+  ok(b2 && b2.seats.length === 4, '卓に 4 人ぶんの席がある');
+  ok(b2.seats.map((s) => s.at).join(',') === 'self,right,top,left', '自分から見た並び(自分・下家・対面・上家)');
+  ok(b2.seats[0].name === 'あなた' && b2.seats[0].dealer === true, '自分が親で下に座る');
+  ok(b2.seats.map((s) => s.wind).join('') === '東南西北', '風が席順どおりに振られる');
+  ok(b2.seats.every((s) => Array.isArray(s.river)), '各家に河がある');
+  ok(b2.dora.length > 0 && b2.round === '東1局', '中央に局とドラが出る');
   // 立直中はツモ切りだけ
   m.game.players[0].riichi = true;
   const rv = view(m);
-  const rhand = rv.table.find((r) => r.label.includes('手牌'));
-  ok(rhand.faces.filter((f) => f.move).length === 1, `立直中はツモ牌だけ押せる(${rhand.faces.filter((f) => f.move).length})`);
+  ok(rv.hand.filter((f) => f.move).length === 1, `立直中はツモ牌だけ押せる(${rv.hand.filter((f) => f.move).length})`);
 }
 
 console.log(fail === 0 ? '\nカジノ: ALL PASS' : '\nカジノ: FAIL あり');

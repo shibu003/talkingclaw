@@ -210,6 +210,17 @@ function applyPoker(session: Session & { kind: 'poker' }, cmd: Cmd): Reply {
 // 画面に出すための今の様子。ボタンは「声で言うのと同じ言葉」を持たせるので、
 // 押した時の道筋は声とまったく同じになる(判定の入口を二重に作らない)
 export type Face = { text: string; red?: boolean; hidden?: boolean; move?: string };
+// 麻雀の卓。自分から見た向き(自分=下、下家=右、対面=上、上家=左)で並べる
+export type MjSeat = {
+  at: 'self' | 'right' | 'top' | 'left';
+  name: string; points: number; wind: string;
+  riichi: boolean; turn: boolean; dealer: boolean;
+  river: string[];
+};
+export type MjBoard = {
+  round: string; honba: number; left: number; dora: string; sticks: number;
+  seats: MjSeat[];
+};
 export type View = {
   kind: Session['kind'] | null;
   title: string;
@@ -219,6 +230,8 @@ export type View = {
   tiles: { label: string; text: string }[];
   // 実物として見せる札・牌。move があるものは押せる(麻雀の打牌)
   table: { label: string; kind: 'card' | 'tile'; faces: Face[] }[];
+  board?: MjBoard;   // 麻雀だけ。卓そのものを描くための情報
+  hand?: Face[];     // 麻雀の手牌(卓の下に大きく並べる)
 };
 
 const RED_SUITS = ['♥', '♦'];
@@ -377,21 +390,33 @@ export function view(session: Session | null): View {
     }
     if (me.drawn !== null) handFaces.push({ text: mj.tileName(me.drawn), red: true, move: myDiscard ? `${mj.tileName(me.drawn)}切る` : undefined });
   }
-  const river: Face[] = g.players.flatMap((p) => p.discards.slice(-6).map((t) => ({ text: mj.tileName(t) })));
+  const WINDS = ['東', '南', '西', '北'];
+  const AT: MjSeat['at'][] = ['self', 'right', 'top', 'left']; // 自分から見た並び(反時計回り)
+  const board: MjBoard | undefined = handFaces.length === 0 ? undefined : {
+    round: `東${g.round}局`, honba: g.honba, left: mg.remaining(g),
+    dora: mj.tileName(mg.doraOf(g.doraIndicator)), sticks: g.riichiSticks,
+    seats: AT.map((at, i) => {
+      const p = g.players[(seat + i) % 4];
+      return {
+        at, name: p.name, points: p.points,
+        wind: WINDS[((seat + i) % 4 - g.dealer + 4) % 4],
+        riichi: p.riichi, turn: g.turn === (seat + i) % 4, dealer: g.dealer === (seat + i) % 4,
+        river: p.discards.map(mj.tileName),
+      };
+    }),
+  };
   return {
     kind: 'mahjong',
     title: `麻雀 — 東${g.round}局 ${g.honba}本場 / 残り ${mg.remaining(g)} 枚`,
-    table: handFaces.length === 0 ? [] : [
-      { label: `ドラ ${mj.tileName(mg.doraOf(g.doraIndicator))}`, kind: 'tile', faces: [{ text: mj.tileName(g.doraIndicator) }] },
-      { label: `あなたの手牌${me.riichi ? '(立直中)' : ''}`, kind: 'tile', faces: handFaces },
-      ...(river.length > 0 ? [{ label: '最近の捨て牌', kind: 'tile' as const, faces: river }] : []),
+    board,
+    hand: handFaces,
+    table: [],
+    // 局・ドラ・点数・河は卓が見せるので、ここでは重複させない(縦を詰めてスクロールを出さない)
+    state: handFaces.length === 0 ? ['「配って」で始まるよ'] : [
+      g.phase === 'discard' && g.turn === seat
+        ? `${mj.shanten(me.hand) === 0 ? '聴牌' : `${mj.shanten(me.hand)} シャンテン`}${me.riichi ? ' / 立直中' : ''}`
+        : `${g.players[g.turn]?.name ?? ''} の番`,
     ],
-    state: [
-      me.hand.some((n) => n > 0) ? `手牌 ${mg.handDisplay(g, session.meId)}` : '「配って」で始まるよ',
-      `ドラ ${mj.tileName(mg.doraOf(g.doraIndicator))}${me.riichi ? ' / 立直中' : ''}`,
-      g.players.map((p) => `${p.name} ${p.points}`).join(' / '),
-      g.phase === 'discard' && g.turn === seat ? `${mj.shanten(me.hand) === 0 ? '聴牌' : `${mj.shanten(me.hand)} シャンテン`}` : `${g.players[g.turn]?.name ?? ''} の番`,
-    ].filter(Boolean),
     rules: RULES_MJ,
     moves,
     tiles,
