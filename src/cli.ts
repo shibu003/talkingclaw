@@ -103,6 +103,76 @@ function stopAudio(): void {
   player = null;
 }
 
+// ---- 音声入力(macOS Speech。tools/claw-listen を呼ぶ)----
+const LISTEN_BIN = fileURLToPath(new URL('../tools/claw-listen', import.meta.url));
+const LISTEN_SRC = fileURLToPath(new URL('../tools/listen.swift', import.meta.url));
+let handsfree = false;
+let listening = false;
+const spokenRecently: { text: string; at: number }[] = []; // エコー棄却用
+
+function norm(t: string): string {
+  return t.toLowerCase().replace(/[ァ-ヶ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0x60)).replace(/[、。!?！?\s]/g, '');
+}
+function bigrams(t: string): Set<string> {
+  const s = new Set<string>();
+  for (let i = 0; i < t.length - 1; i++) s.add(t.slice(i, i + 2));
+  return s;
+}
+function similar(a: string, b: string): number { // Dice 係数
+  const [x, y] = [bigrams(a), bigrams(b)];
+  if (x.size === 0 || y.size === 0) return 0;
+  let hit = 0;
+  for (const g of x) if (y.has(g)) hit++;
+  return (2 * hit) / (x.size + y.size);
+}
+function isEcho(text: string): boolean {
+  const n = norm(text);
+  if (n.length < 2) return false;
+  const now = Date.now();
+  return spokenRecently.some((r) => now - r.at < 15_000 && (r.text.includes(n) || n.includes(r.text) || similar(r.text, n) >= 0.6));
+}
+function rememberSpoken(text: string): void {
+  spokenRecently.push({ text: norm(text), at: Date.now() });
+  while (spokenRecently.length > 12) spokenRecently.shift();
+}
+
+async function ensureListenBin(): Promise<boolean> {
+  const { existsSync } = await import('node:fs');
+  if (existsSync(LISTEN_BIN)) return true;
+  console.log(c.dim('  音声入力を初めて使うのでビルドします(swiftc、10 秒ほど)…'));
+  return new Promise((resolve) => {
+    const p = spawn('swiftc', ['-O', LISTEN_SRC, '-o', LISTEN_BIN, '-framework', 'Speech', '-framework', 'AVFoundation'], { stdio: 'inherit' });
+    p.on('close', (code) => resolve(code === 0));
+    p.on('error', () => resolve(false));
+  });
+}
+
+// 1 発話ぶん聞き取る。聞き取れたテキスト or null
+function listenOnce(maxSec = 30): Promise<string | null> {
+  return new Promise((resolve) => {
+    listening = true;
+    const p = spawn(LISTEN_BIN, [String(maxSec)], { stdio: ['ignore', 'pipe', 'inherit'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += d.toString(); });
+    p.on('close', (code) => { listening = false; resolve(code === 0 && out.trim() ? out.trim() : null); });
+    p.on('error', () => { listening = false; resolve(null); });
+  });
+}
+
+async function handsfreeLoop(): Promise<void> {
+  while (handsfree) {
+    if (player) { await new Promise((r) => setTimeout(r, 400)); continue; } // 再生中は聞かない(エコー防止)
+    const text = await listenOnce(30);
+    if (!handsfree) break;
+    if (!text) continue;
+    if (isEcho(text)) { console.log(c.dim(`  (自分たちの声っぽいので無視: ${text.slice(0, 20)})`)); continue; }
+    console.log(`${c.you('あなた(声)')} ${text}`);
+    stopAudio();
+    await api('/chat', { text }).catch(() => ({}));
+    await new Promise((r) => setTimeout(r, 600)); // 相手が話し始めるまで少し待つ
+  }
+}
+
 // ---- タイムライン購読(SSE)----
 let lastId = 0;
 let bootId = '';
@@ -120,7 +190,10 @@ function render(ev: Record<string, unknown>, live: boolean): void {
   } else if (type === 'agent_speech') {
     const tag = ev.filler ? c.dim(`(${name})`) : c.agent(name || '?');
     console.log(`${tag} ${ev.filler ? c.dim(text) : text}`);
-    if (live && typeof ev.audio === 'string') enqueueAudio(ev.audio);
+    if (live) {
+      rememberSpoken(text);
+      if (typeof ev.audio === 'string') enqueueAudio(ev.audio);
+    }
   } else if (type === 'system' || type === 'presence') {
     console.log(c.sys(`  * ${name ? name + ': ' : ''}${text || type}`));
   }
@@ -209,6 +282,8 @@ const HELP = `${c.bold('コマンド')}
   /settings        設定表示  (/settings chatModel haiku のように変更も)
   /room chat|work  部屋を切り替え(雑談 / 作業)
   /log [n]         直近の会話ログ
+  /v               マイクで 1 回話す(macOS の音声認識)
+  /v on | /v off   ハンズフリー(連続で聞き取る / 止める)
   /mute            再生中の音を止める
   /quit            終了(部屋は動き続ける)
 それ以外の入力はそのまま部屋への発言になります。`;
@@ -216,7 +291,7 @@ const HELP = `${c.bold('コマンド')}
 async function main(): Promise<void> {
   await ensureRoom();
   console.log(c.bold(`\n声の部屋 (terminal)  ${c.dim(`bootId ${room!.bootId.slice(0, 8)} / port ${room!.port}`)}`));
-  console.log(c.dim('喋って話したい時はブラウザ http://localhost:' + room!.port + ' を開いてね(音声認識はブラウザ専用)'));
+  console.log(c.dim('/v でマイク入力(macOS の音声認識)。ブラウザ http://localhost:' + room!.port + ' も同じ部屋だよ'));
   console.log(c.dim('/help でコマンド一覧\n'));
   void keepSubscribed();
 
@@ -233,6 +308,25 @@ async function main(): Promise<void> {
     if (line === '/quit' || line === '/exit') break;
     if (line === '/help') { console.log(HELP); continue; }
     if (line === '/mute') { stopAudio(); console.log(c.dim('  止めたよ')); continue; }
+    if (line === '/v' || line.startsWith('/v ')) {
+      const arg = line.split(/\s+/)[1];
+      if (!(await ensureListenBin())) { console.log(c.sys('  音声入力をビルドできませんでした(swiftc が要ります)')); continue; }
+      if (arg === 'off') { handsfree = false; console.log(c.dim('  ハンズフリーを止めたよ')); continue; }
+      if (arg === 'on') {
+        handsfree = true;
+        console.log(c.sys('  * ハンズフリー開始(話しかけてね。止める時は /v off + Enter)'));
+        void handsfreeLoop();
+        continue;
+      }
+      console.log(c.dim('  聞いてるよ…(話し終わったら自動で送るね)'));
+      const text = await listenOnce(30);
+      if (!text) { console.log(c.dim('  聞き取れなかった')); continue; }
+      if (isEcho(text)) { console.log(c.dim('  (自分たちの声っぽいので無視)')); continue; }
+      console.log(`${c.you('あなた(声)')} ${text}`);
+      stopAudio();
+      await api('/chat', { text }).catch(() => ({}));
+      continue;
+    }
     if (line === '/tasks') { await showTasks().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
     if (line === '/who') { await showWho().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
     if (line.startsWith('/settings')) { await showSettings(line.split(/\s+/).slice(1)).catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
@@ -254,6 +348,7 @@ async function main(): Promise<void> {
     if (r.error) console.log(c.sys(`  送信できなかった: ${r.error}`));
   }
 
+  handsfree = false;
   stopAudio();
   if (tmpDir) await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   console.log(c.dim('\n部屋はそのまま動いてるよ。またね'));

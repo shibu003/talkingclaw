@@ -5,3 +5,4 @@ node_modules/
 *.wav
 .DS_Store
 engine/
+tools/claw-listen

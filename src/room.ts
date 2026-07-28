@@ -295,7 +295,9 @@ async function runJob(job: SynthJob): Promise<void> {
   const emitSpeech = (audio: string | null) => {
     if (job.kind === 'speech') store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio, turnId: job.turnId, channel: job.channel });
   };
-  if (job.kind === 'speech' && job.epoch !== speechEpoch) return emitSpeech(null); // stale drop: 新 user 発話より前の未合成分
+  // stale drop: 2 世代以上前の未合成分だけ捨てる。直前の返事は相槌で消さない
+  // (本当の割り込みはブラウザ側の barge-in が担当する)
+  if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null);
   if (engineState !== 'ready' || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
   for (let attempt = 0; attempt < 2; attempt++) {
     try {

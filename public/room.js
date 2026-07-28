@@ -177,7 +177,8 @@ function render(ev) {
   // 実況/system・presence は channel を持たず常時表示(部屋切替の告知等は見えていてほしい)
   if ((ev.type === 'user_speech' || ev.type === 'agent_speech') && ev.channel && ev.channel !== currentChannel) return;
   if (ev.type === 'user_speech') {
-    if (!isReplay) audioQueue.length = 0; // stale drop: 自分が話したら溜まった読み上げは捨てる(再生中のみ完了させる)
+    // 短い相槌(「うん」等)では溜まった読み上げを捨てない。長い発話 = 話題転換とみなして捨てる
+    if (!isReplay && (ev.text ?? '').length >= 8) audioQueue.length = 0;
     const b = addBubble('user', ev.text ?? '');
     if (ev.targets && ev.targets.length > 0) {
       const to = document.createElement('span');
@@ -361,6 +362,11 @@ async function ensureVad() {
         currentAudio.volume = 0.15; // duck
         bargeTimer = setTimeout(() => {
           if (!playing || !currentAudio) return;
+          // 本物の発話だけで止める: STT の interim が来ていなければ自分たちの声/雑音とみなして戻す
+          if (!interimUpdatedAt || performance.now() - interimUpdatedAt > 1200) {
+            currentAudio.volume = 1;
+            return;
+          }
           currentAudio.pause();           // 再生中 = pause(S11)
           audioQueue.length = 0;          // 未再生 = 破棄
           playing = false;
