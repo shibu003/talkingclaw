@@ -8,7 +8,8 @@
     "smoke": "node src/smoke.ts",
     "web": "node src/room.ts",
     "setup-voice": "node scripts/setup-voice.mjs",
-    "metrics": "node scripts/metrics-report.mjs"
+    "metrics": "node scripts/metrics-report.mjs",
+    "cli": "node src/cli.ts"
   },
   "repository": {
     "type": "git",

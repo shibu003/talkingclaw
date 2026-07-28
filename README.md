@@ -17,7 +17,8 @@
 
 ```sh
 npm install
-npm run web          # 部屋を起動 → Chrome で http://localhost:3300 → 🎤 ON で会話
+npm run web          # 部屋を起動 → Chrome で http://localhost:3300 → 🎤 ON で音声会話
+npm run cli          # 同じ部屋を terminal から(打ち込む・聞く・見る。音声入力だけブラウザ専用)
 npm run setup-voice  # 第3の声「まい」を AivisHub から導入(同意フロー付き)
 npm start            # 旧: テキスト入力の一対一 CLI
 npm run smoke        # 非対話スモーク
@@ -52,6 +53,20 @@ agent の CLI を起動して「声の部屋に入って会話して」と言え
 
 - env: `AGENT_NAME`(部屋での名前)/ `VOICE`(`モデル名/スタイル名`)/ `PORT`(既定 3300)
 - 声は AivisSpeech の任意モデルを指定可(`curl http://127.0.0.1:10101/speakers` で一覧)
+
+### terminal から使う
+
+```sh
+npm run cli   # 部屋が無ければ自動で起動する
+```
+
+ブラウザと同じ部屋に繋がり、会話ログが流れ、**クロエたちの声はそのまま鳴る**(afplay)。
+打ち込んだ文はそのまま発言になる。コマンド: `/tasks`(作業ボード)`/who`(在室)
+`/settings [key] [value]`(モデル・effort の確認と変更)`/room chat|work`(部屋切替)
+`/log [n]` `/mute` `/quit`。`CLI_MUTE=1` で無音運用。
+
+**音声入力(マイク)だけはブラウザ専用** — 認識に使う Web Speech API がブラウザの機能のため。
+喋りたい時はブラウザ、打ち込みたい時は terminal、と使い分けられる(同じ部屋・同じ記憶)。
 
 ## 体感を作っている仕組み
 
