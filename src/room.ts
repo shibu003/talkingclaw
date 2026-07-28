@@ -392,6 +392,24 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
 }
 
 function userSpeech(text: string): RoomEvent {
+  // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う
+  if (pendingPermission) {
+    const t = text.trim();
+    if (PERM_YES.test(t)) {
+      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' } });
+      finishPermission(true, 'おっけー、許可したよ。続けるね。');
+      return ev;
+    }
+    if (PERM_NO.test(t)) {
+      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' } });
+      finishPermission(false, 'わかった、それはやめておくね。');
+      return ev;
+    }
+  }
+  if (process.env.ROOM_TEST_HOOKS === '1' && text === '__askperm__') {
+    void askUserPermission('テスト機能').then((ok) => store.append({ type: 'system', from: 'room', text: `perm:${ok}` }));
+    return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' } });
+  }
   speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
   const { targets, routing } = routeTargets(text);
   const turnId = `T${++turnSeq}`;
@@ -404,6 +422,41 @@ function userSpeech(text: string): RoomEvent {
     scheduleUndeliveredNotice(turnId, targets[0]);
   }
   return ev;
+}
+
+// ---- W8-8: 音声パーミッション(allow-list 外のツールを声で許可/拒否)----
+let pendingPermission: { resolve: (ok: boolean) => void; timer: NodeJS.Timeout; desc: string } | null = null;
+
+function askUserPermission(desc: string): Promise<boolean> {
+  if (pendingPermission) return Promise.resolve(false); // 同時 1 件のみ
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => finishPermission(false, '返事がなかったから見送ったよ。'), 60_000);
+    timer.unref();
+    pendingPermission = { resolve, timer, desc };
+    store.append({ type: 'system', from: 'room', text: `許可待ち: ${desc}(「いいよ」/「だめ」で答えてね)` });
+    if (chloePid) {
+      speechEpoch++; // 直前の読み上げ待ちより優先して届ける
+      enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', epoch: speechEpoch });
+    }
+  });
+}
+
+function finishPermission(ok: boolean, say: string): void {
+  if (!pendingPermission) return;
+  clearTimeout(pendingPermission.timer);
+  pendingPermission.resolve(ok);
+  pendingPermission = null;
+  if (chloePid) enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', epoch: speechEpoch });
+}
+
+const PERM_YES = /^(はい|うん|いいよ|いいですよ|おっけ|オッケー|ok|オーケー|許可|どうぞ|やって|承認)/i;
+const PERM_NO = /^(だめ|ダメ|駄目|やめて|いや|嫌|不許可|禁止|no|ノー|見送)/i;
+
+function describeTool(name: string, input: Record<string, unknown>): string {
+  if (name === 'Bash') return `コマンド実行(${String(input.command ?? '').slice(0, 50)})`;
+  const m = name.match(/^mcp__([^_]+)__(.+)$/);
+  if (m) return `${m[1]} の ${m[2]}`;
+  return name;
 }
 
 // ---- 6B: filler escalation(S6 完全形)----
@@ -481,6 +534,20 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
   timer.unref();
 }
 
+// ---- W8-8: projects レジストリ(worker の作業先。talkingclaw 自身も登録)----
+const PROJECTS_PATH = join(homedir(), '.talkingclaw', 'projects.json');
+function loadProjects(): Record<string, string> {
+  let user: Record<string, string> = {};
+  try { user = JSON.parse(readFileSync(PROJECTS_PATH, 'utf8')); } catch { /* 初回 */ }
+  const merged = {
+    workspace: config.agent.cwd,
+    talkingclaw: fileURLToPath(new URL('..', import.meta.url)),
+    ...user,
+  };
+  try { writeFileSync(PROJECTS_PATH, JSON.stringify(merged, null, 1), { mode: 0o600 }); } catch { /* */ }
+  return merged;
+}
+
 // ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
 const SETTINGS_PATH = join(homedir(), '.talkingclaw', 'settings.json');
 type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean };
@@ -508,7 +575,7 @@ function loadWorkerMcp(): { mcpServers: Record<string, unknown>; allow: string[]
 
 // ---- W8-2/3: office tasks(見る = board の元データ。導出 + 起票の 2 系統)----
 type OfficeTask = {
-  id: number; agent: string; agentName: string; request: string;
+  id: number; agent: string; agentName: string; request: string; project?: string;
   status: 'queued' | 'working' | 'done' | 'failed'; notes: string[]; artifacts: string[]; at: string;
 };
 const officeTasks: OfficeTask[] = [];
@@ -560,9 +627,9 @@ function startChloe(): void {
   let workerBusy = false;
   const taskQueue: OfficeTask[] = [];
 
-  function delegate(description: string): OfficeTask {
+  function delegate(description: string, project?: string): OfficeTask {
     const task: OfficeTask = {
-      id: ++taskSeq, agent: chloePid!, agentName: chloe.assignedName, request: description,
+      id: ++taskSeq, agent: chloePid!, agentName: chloe.assignedName, request: description, project,
       status: 'queued', notes: [], artifacts: [], at: new Date().toISOString(),
     };
     officeTasks.push(task);
@@ -591,6 +658,8 @@ function startChloe(): void {
     }
   }
 
+  let workerCwd = '';
+
   const workerSay = (task: OfficeTask) => (sentence: string): void => {
     task.notes.push(sentence);
     while (task.notes.length > 20) task.notes.shift();
@@ -598,12 +667,24 @@ function startChloe(): void {
   };
 
   async function runTask(task: OfficeTask): Promise<void> {
+    const projects = loadProjects();
+    const cwd = (task.project && projects[task.project]) || config.agent.cwd;
+    if (worker && workerCwd !== cwd) { void worker.close().catch(() => {}); worker = null; } // プロジェクト切替
     if (!worker) {
+      workerCwd = cwd;
       const ext = loadWorkerMcp();
+      const allowList = [...(config.agent.allowedTools as unknown as string[]), ...ext.allow];
       const opts = {
         systemPrompt: config.workerPrompt, model: workerSettings.workerModel,
-        allowedTools: [...(config.agent.allowedTools as unknown as string[]), ...ext.allow],
-        cwd: config.agent.cwd, maxTurns: config.agent.maxTurns,
+        allowedTools: allowList,
+        // W8-8: allow-list 外は自動拒否でなく声でユーザーに確認する
+        canUseTool: async (name: string, input: Record<string, unknown>) => {
+          const ok = await askUserPermission(describeTool(name, input));
+          return ok
+            ? { behavior: 'allow' as const, updatedInput: input }
+            : { behavior: 'deny' as const, message: 'ユーザーが見送った。別の方法で進めるか、諦めて報告して' };
+        },
+        cwd, maxTurns: config.agent.maxTurns,
         ...(Object.keys(ext.mcpServers).length > 0 ? { mcpServers: ext.mcpServers } : {}),
         ...(workerSettings.useUserSettings ? { settingSources: ['user', 'project'] as ('user' | 'project')[] } : {}),
         ...(workerSettings.workerEffort ? { effort: workerSettings.workerEffort } : {}),
@@ -642,11 +723,11 @@ function startChloe(): void {
     tools: [
       tool(
         'delegate_task',
-        '開発・作成・修正などの実作業を作業係に任せる。依頼内容を具体的に 1〜2 文で渡す。',
-        { description: z.string() },
-        async ({ description }) => {
-          const task = delegate(description);
-          return { content: [{ type: 'text', text: `作業係に任せた(task ${task.id})。ユーザーには短く「やっとくね」と伝えるだけでいい。` }] };
+        `開発・作成・修正などの実作業を作業係に任せる。依頼内容を具体的に 1〜2 文で渡す。project は作業先(${Object.keys(loadProjects()).join(' / ')}。省略時 workspace)。talkingclaw 自体の開発は project: "talkingclaw"。`,
+        { description: z.string(), project: z.string().optional() },
+        async ({ description, project }) => {
+          const task = delegate(description, project);
+          return { content: [{ type: 'text', text: `作業係に任せた(task ${task.id}${project ? ` / ${project}` : ''})。ユーザーには短く「やっとくね」と伝えるだけでいい。` }] };
         },
       ),
     ],
@@ -947,14 +1028,14 @@ const server = createServer(async (req, res) => {
   }
 
   if (path === '/settings') {
-    const allowedModels = ['haiku', 'sonnet', 'opus'];
+    const allowedModels = ['haiku', 'sonnet', 'opus', 'fable'];
     if (typeof body.workerModel === 'string' && allowedModels.includes(body.workerModel)) workerSettings.workerModel = body.workerModel;
-    if (typeof body.workerEffort === 'string' && ['', 'low', 'medium', 'high'].includes(body.workerEffort)) workerSettings.workerEffort = body.workerEffort;
+    if (typeof body.workerEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.workerEffort)) workerSettings.workerEffort = body.workerEffort;
     if (typeof body.useUserSettings === 'boolean') workerSettings.useUserSettings = body.useUserSettings;
     saveSettings();
     chloeResetWorker?.(); // 次の task から新設定(実行中の task は続行)
     const ext = loadWorkerMcp();
-    return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers) });
+    return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers), projects: Object.keys(loadProjects()) });
   }
 
   if (path === '/tasks') {

@@ -491,13 +491,13 @@ async function renderSettings() {
   settingsEl.replaceChildren();
   const mk = (labelText, el) => { const l = document.createElement('label'); l.textContent = labelText + ' '; l.appendChild(el); settingsEl.appendChild(l); };
   const modelSel = document.createElement('select');
-  for (const m of ['haiku', 'sonnet', 'opus']) {
+  for (const m of ['haiku', 'sonnet', 'opus', 'fable']) {
     const o = document.createElement('option'); o.value = m; o.textContent = m; if (d.workerModel === m) o.selected = true; modelSel.appendChild(o);
   }
   modelSel.onchange = () => void post('/settings', { workerModel: modelSel.value });
   mk('作業モデル:', modelSel);
   const effortSel = document.createElement('select');
-  for (const e of ['', 'low', 'medium', 'high']) {
+  for (const e of ['', 'low', 'medium', 'high', 'xhigh', 'max']) {
     const o = document.createElement('option'); o.value = e; o.textContent = e || '既定'; if (d.workerEffort === e) o.selected = true; effortSel.appendChild(o);
   }
   effortSel.onchange = () => void post('/settings', { workerEffort: effortSel.value });
@@ -512,6 +512,10 @@ async function renderSettings() {
     ? '外部 MCP: ' + d.externalMcp.join(', ')
     : '外部 MCP は ~/.talkingclaw/worker-mcp.json で追加できるよ(次の作業から反映)';
   settingsEl.appendChild(note);
+  const proj = document.createElement('div');
+  proj.className = 'tnote';
+  proj.textContent = '作業先プロジェクト: ' + (d.projects ?? []).join(' / ') + '(追加は ~/.talkingclaw/projects.json。「talkingclaw の◯◯直して」で自己開発)';
+  settingsEl.appendChild(proj);
 }
 
 connect();

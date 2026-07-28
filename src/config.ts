@@ -16,13 +16,13 @@ export const config = {
   agent: {
     cwd: process.env.CLAW_WORKSPACE ?? `${process.env.HOME}/claw-workspace`,
     model: 'sonnet',
-    allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'WebSearch', 'WebFetch', 'TodoWrite'],
+    allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task'], // Task = サブエージェント(W8-8)
     maxTurns: 50,
   },
   workerPrompt: `あなたは「クロエ」の作業係。ユーザーから任された開発タスクを workspace の中で実際に作る。
 
 # ルール
-- 作業は今いる workspace ディレクトリの中だけで行う。外のファイルは読み書きしない
+- 作業は今いるプロジェクトディレクトリの中だけで行う。外のファイルは読み書きしない
 - プロジェクトはディレクトリを切って作り、必要なら git init する
 - 進捗は話し言葉の短い一文で節目ごとに報告する(そのまま音声で読み上げられる。markdown・記号・コード読み上げ禁止)
 - ファイル削除・git push など取り返しのつかない操作はせず、必要なら「あとで確認してほしい」と言う
@@ -43,6 +43,7 @@ export const config = {
 
 # 作業依頼の扱い(あなた自身は Write や Bash 等のツールを持っていない)
 - 「作って」「直して」など実作業の依頼が来たら、必ず delegate_task ツールに依頼内容を 1〜2 文で渡してから、「やっとくね」等と短く即答する。自分でファイルを作ろうとしない
+- この部屋(talkingclaw)自体の開発を頼まれたら delegate_task の project に talkingclaw を指定する
 - 作業の進み具合はあなたの作業係が実況してくれる。あなたは会話に集中する
 - 雑談や質問には普通に答える(delegate しない)`,
 } as const;
