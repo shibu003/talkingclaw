@@ -78,7 +78,7 @@
   /* ---- パネル(部屋・ボード・設定は同時に 1 枚だけ)---- */
   .panel { display: none; margin: 10px var(--pad) 0; padding: 14px 16px; background: var(--surface);
            border: 1px solid var(--line); border-radius: var(--r-md);
-           font-size: var(--fs-ui); max-height: 44dvh; overflow-y: auto; }
+           font-size: var(--fs-ui); max-height: 44dvh; overflow-y: auto; overflow-x: hidden; }
   .panel.open { display: block; }
   .panel h2 { display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
               font-size: var(--fs-small); font-weight: 700; letter-spacing: .1em; color: var(--muted); }
@@ -209,7 +209,8 @@
      ① 文を連結しない(どの文がいつ話されたかが残る)
      ② .turn = 1 つの依頼とその返答のまとまり。左の罫線で「どこへの返答か」が見える
      ③ どの依頼にも属さない発話(実況・警告)は罫線の外に出す = 文脈が混ざらない */
-  #log { flex: 1; min-height: 0; overflow-y: auto; padding: 18px var(--pad); scroll-padding-bottom: 16px;
+  #log { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+         padding: 18px var(--pad); scroll-padding-bottom: 16px;
          display: flex; flex-direction: column; }
   .turn { display: flex; flex-direction: column; margin: 6px 0;
           padding-left: 13px; border-left: 2px solid var(--line); }
@@ -440,7 +441,11 @@
     .grip::after { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 3px;
                    border-radius: 2px; background: transparent; transition: background .15s; }
     .grip:hover::after, .grip.dragging::after { background: var(--accent); }
-    .lane { display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; padding: 12px 0; }
+    /* 横に動かして読ませる場所は作らない。overflow-y だけ指定すると
+       CSS が overflow-x も auto にしてしまい、数 px の溢れで横スクロールが生える。
+       はみ出す名前は省略して、全体は title で読む */
+    .lane { display: flex; flex-direction: column; gap: 12px; min-height: 0;
+            overflow-y: auto; overflow-x: hidden; padding: 12px 0; }
     .lane.nav { grid-area: nav; border-right: 1px solid var(--line); }
     .lane.side { grid-area: side; border-left: 1px solid var(--line); display: none; }
     body.side-open .lane.side { display: flex; }
@@ -455,7 +460,8 @@
     .lane.nav #rooms { background: none; border: 0; padding: 0; margin: 0; }
     .lane.nav #rooms h2, .lane.nav #rooms .tnote, .lane.nav .rsub { display: none; }
     .lane.nav .room { flex-direction: column; align-items: center; gap: 3px; text-align: center;
-                      padding: 9px 4px; margin: 0 6px 4px; border-radius: 12px; }
+                      padding: 9px 4px; margin: 0 6px 4px; border-radius: 12px;
+                      width: calc(100% - 12px); min-width: 0; }
     .lane.nav .room .ricon { font-size: 21px; line-height: 1.1; }
     .lane.nav .room .rmain { align-items: center; width: 100%; }
     .lane.nav .room .rmain b { font-size: 12px; font-weight: 500; line-height: 1.3; max-width: 100%; }
@@ -473,7 +479,7 @@
     .railbtn:hover { background: var(--surface-2); color: var(--text); }
     .railbtn .ricon { font-size: 19px; line-height: 1.1; }
     #roster { padding: 0; }
-    .lane.side #board { max-height: 55%; overflow-y: auto; flex-shrink: 0; }
+    .lane.side #board { max-height: 55%; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; }
     /* ゲーム中は卓を切らない(高さ制限を外して全部見せる)*/
     .lane.side #board.playing { max-height: none; overflow: visible; }
     #preview { height: auto; flex: 1; min-height: 220px; }

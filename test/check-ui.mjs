@@ -92,6 +92,18 @@ if (/\.style\.display\s*=/.test(js.replace(/noticeEl\.style\.display\s*=\s*'bloc
   } else console.log('  ✅ 成果物は「見て分かるもの」だけ(ソースは成果物に出さない)');
 }
 
+// 横に動かして読ませる場所は作らない。
+// overflow-y だけ書くと CSS が overflow-x も auto にするので、必ず対で hidden を書く
+{
+  const blocks = [...html.matchAll(/\{[^{}]*overflow-y:\s*auto[^{}]*\}/g)].map((m) => m[0]);
+  const missing = blocks.filter((b) => !/overflow-x:\s*hidden/.test(b) && !/overflow:\s*hidden/.test(b));
+  if (missing.length > 0) {
+    console.log(`  ❌ overflow-y: auto に overflow-x: hidden が付いていない箇所が ${missing.length} 件`);
+    console.log('     (overflow-y だけ指定すると横スクロールが生える。横に読ませる場所は作らない方針)');
+    fail = 1;
+  } else console.log(`  ✅ 縦に動く場所 ${blocks.length} 箇所すべてで横スクロールを止めている`);
+}
+
 // 読みやすさ: 文字と背景のコントラストが WCAG AA(4.5:1)を割ってないか
 const varOf = (name) => html.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, 'i'))?.[1];
 const lum = (hex) => {
