@@ -580,6 +580,7 @@ const rosterEl = document.getElementById('roster');
 let lastBoardRows = []; // 在室チップに「何をしているか」を出すための直近の作業状況
 let selectedPid = null;
 const pidNames = new Map();
+const pidRooms = new Map(); // 誰がどの部屋にいるか(部屋一覧に出す)
 async function refreshRoster() {
   try {
     const r = await fetch('/participants?token=' + TOKEN);
@@ -589,6 +590,7 @@ async function refreshRoster() {
     rosterEl.replaceChildren();
     // 相手が 1 人(クロエだけ)の時は選ぶ余地が無いので、行ごと隠して画面を軽くする
     rosterEl.classList.toggle('hidden', d.participants.length <= 1 && selectedPid === null);
+    if (wideLayout()) void renderRooms();   // 部屋一覧の顔ぶれを合わせる
     const label = document.createElement('span');
     label.className = 'label';
     label.textContent = '話す相手:';
@@ -600,6 +602,7 @@ async function refreshRoster() {
     rosterEl.appendChild(auto);
     for (const p of d.participants) {
       pidNames.set(p.participantId, p.name);
+      if (p.room) pidRooms.set(p.participantId, p.room);
       const chip = document.createElement('span');
       chip.className = 'chip ' + (p.presence === 'gone' ? 'gone' : 'active') + (p.participantId === selectedPid ? ' selected' : '');
       // 別の部屋にいる相手はグレー。押すと「呼ぶ?」を出す(いきなり動かさない)
@@ -731,7 +734,6 @@ const boardEl = document.getElementById('boardList');
 let boardOpen = wideLayout(); // 右レーン常設中は「開いている」— 描画を止めない
 const panels = {
   rooms: { el: document.getElementById('rooms'), btn: document.getElementById('roomBtn'), render: renderRooms },
-  tasks: { el: document.getElementById('tasks'), btn: document.getElementById('progress'), render: refreshBoard },
   board: { el: document.getElementById('board'), btn: document.getElementById('boardBtn'), render: refreshBoard },
   settings: { el: document.getElementById('settings'), btn: document.getElementById('settingsBtn'), render: renderSettings },
 };
@@ -743,7 +745,7 @@ function openPanel(name) {
     p.el.classList.toggle('open', on);
     p.btn.setAttribute('aria-expanded', String(on));
   }
-  boardOpen = wideLayout() || openedPanel === 'board' || openedPanel === 'tasks';
+  boardOpen = wideLayout() || openedPanel === 'board';
   if (openedPanel) void panels[openedPanel].render();
 }
 for (const [key, p] of Object.entries(panels)) {
@@ -825,11 +827,27 @@ async function renderRooms() {
   for (const room of roomList) {
     const btn = document.createElement('button');
     btn.className = 'room' + (room.channel === currentChannel ? ' here' : '');
-    btn.textContent = room.label;
+    const main = document.createElement('span');
+    main.className = 'rmain';
+    const name = document.createElement('b');
+    name.textContent = room.label;
+    main.appendChild(name);
+    // その部屋に誰がいて、何が起きているか(部屋を選ぶ材料になる)
+    const who = [...pidRooms].filter(([, ch]) => ch === room.channel).map(([pid]) => pidNames.get(pid) ?? '');
+    const sub = document.createElement('span');
+    sub.className = 'rsub';
+    sub.textContent = who.filter(Boolean).join('・') || 'クロエ';
+    main.appendChild(sub);
+    btn.appendChild(main);
     if (room.channel === currentChannel) {
       const mark = document.createElement('span');
       mark.className = 'here-mark';
       mark.textContent = 'いまここ';
+      btn.appendChild(mark);
+    } else if (gameKind && room.channel === 'game') {
+      const mark = document.createElement('span');
+      mark.className = 'rbadge';
+      mark.textContent = '遊び中';
       btn.appendChild(mark);
     }
     btn.onclick = () => void enterRoom(room.channel);
@@ -956,7 +974,8 @@ function handleNav(text) {
     addSys('閉じたよ');
   } else if (intent.kind === 'rooms' || intent.kind === 'board' || intent.kind === 'settings') {
     // 「見せて」は常に開く方向(既に開いていても閉じない)。中身は開き直して最新に
-    showPanelForce(intent.kind === 'board' ? 'tasks' : intent.kind);
+    if (intent.kind === 'board') switchBoardTab('work');
+    else showPanelForce(intent.kind);
     addSys({ rooms: '部屋の一覧を出したよ', board: '進行中の作業を出したよ', settings: '設定を出したよ' }[intent.kind]);
   } else if (intent.kind === 'history') {
     void showHistory(currentChannel); // 別タブは音声だと出せない(ポップアップ扱い)ので、その場に読み込む
@@ -1108,7 +1127,7 @@ async function planAction(action) {
 }
 
 const progressEl = document.getElementById('progress');
-progressEl.onclick = () => showPanelForce('tasks');
+progressEl.onclick = () => switchBoardTab('work');   // 進行中は右の「作業」で見る
 function renderProgress(rows) {
   const s = progressSummary(rows);
   boardActive = s.counts.working + s.counts.queued > 0; // 動いている間は更新を速く
@@ -1158,9 +1177,10 @@ const historyEl = document.getElementById('historyList');
 // 右レーンの 3 面。生きている一覧(成果物・報告)は短く保ち、
 // 済んだものと全部の履歴は「履歴」に集める(ここだけは長くなってよい)
 const gameEl = document.getElementById('gameList');
+const worksEl = document.getElementById('tasks');
 const SIDE_VIEWS = {
   artifact: [artifactEl, 'tabArtifact'], inbox: [inboxEl, 'tabInbox'],
-  history: [historyEl, 'tabHistory'], game: [gameEl, 'tabGame'],
+  work: [worksEl, 'tabWork'], game: [gameEl, 'tabGame'],
 };
 let sideView = 'artifact';
 let inboxTab = false; // 報告を見ている間は成果物一覧を描き直さない
@@ -1176,6 +1196,7 @@ function switchBoardTab(view) {
     document.getElementById(btnId).classList.toggle('on', name === sideView);
   }
   void (sideView === 'inbox' ? refreshInbox() : sideView === 'game' ? refreshGame() : refreshBoard());
+  document.body.classList.toggle('playing', gameKind !== null && sideView === 'game');
 }
 
 // ---- 幅を掴んで動かす(Zed のような仕切り)----
@@ -1394,9 +1415,13 @@ async function playMove(text) {
 
 // 履歴: 済んだ作業を新しい順に。生きている一覧から外したものはここで必ず見つかる
 function renderHistory(rows) {
-  if (sideView !== 'history') return;
+  if (sideView !== 'work') return;
   const done = rows.filter((t) => t.status === 'done' || t.status === 'failed' || t.status === 'interrupted');
   historyEl.replaceChildren();
+  const head = document.createElement('div');
+  head.className = 'grow-label';
+  head.textContent = '終わったもの';
+  historyEl.appendChild(head);
   if (done.length === 0) {
     const e = document.createElement('div');
     e.className = 'tnote';

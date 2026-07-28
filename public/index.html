@@ -86,11 +86,17 @@
 
   /* 部屋一覧: 1 行 1 部屋。今いる部屋だけ縁と背景で立てる */
   .room { width: 100%; text-align: left; display: flex; align-items: center; gap: 10px;
-          padding: 12px 14px; margin-bottom: 8px; border-radius: var(--r-sm);
-          border: 1px solid var(--line); background: var(--surface-2);
-          font-size: 15px; font-weight: 600; line-height: 1.5; }
-  .room:hover { border-color: var(--accent); }
-  .room.here { border-color: var(--accent); background: #322850; }
+          padding: 10px 13px; margin-bottom: 6px; border-radius: var(--r-sm);
+          border: 1px solid transparent; background: transparent;
+          font-size: 15px; font-weight: 600; line-height: 1.4; }
+  .room .rmain { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .room .rmain b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .room .rsub { font-size: 12.5px; font-weight: 400; color: var(--muted); line-height: 1.4;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .room .rbadge { flex-shrink: 0; font-size: 12px; padding: 1px 7px; border-radius: 999px;
+                  background: var(--surface-2); color: var(--muted); }
+  .room:hover { background: var(--surface-2); }
+  .room.here { background: #322850; border-color: var(--line); }
   .room .here-mark { margin-left: auto; flex-shrink: 0; font-size: 12.5px; font-weight: 700; letter-spacing: .06em;
                      color: var(--accent-ink); background: var(--accent); border-radius: 999px; padding: 2px 9px; }
   #roomsExtra:empty { display: none; }   /* 新規作成・名前変更 UI のマウント先 */
@@ -282,8 +288,10 @@
      河は 6 枚 3 段。各家が自分の向きに捨てるので、上下左右で回してある。
      大きさを固定してあるので、どれだけ捨ててもスクロールしない */
   .mjtable { display: grid; gap: 4px; padding: 10px; margin-bottom: 10px; border-radius: var(--r-md);
-             grid-template-columns: 116px minmax(0, 1fr) 116px;
-             grid-template-rows: 130px minmax(0, 1fr) 130px;
+             /* 河 6×3 = 154×94。回すと 94×154。外側の列/行は 94 + 名前ぶん、
+                中央は 154 を確保する。卓ごとレーンに収まる大きさで固定 */
+             grid-template-columns: 124px minmax(164px, 1fr) 124px;
+             grid-template-rows: 128px minmax(164px, 1fr) 128px;
              background: radial-gradient(ellipse at center, #1d5c40 0%, #123c2a 100%);
              border: 1px solid #0d2a1d; box-shadow: inset 0 0 30px rgba(0,0,0,.45); }
   .mjseat { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; }
@@ -302,22 +310,23 @@
   .mjwind.dealer { background: #d8b43c; color: #1a1206; }
   .mjriichi { margin-left: 4px; padding: 0 5px; border-radius: 3px; background: #d94f6e; color: #fff; font-size: 12px; }
   /* 河の入れ物は大きさを固定し、中身だけ回す(回しても場所を食い合わない)*/
-  .mjriverbox { display: flex; align-items: center; justify-content: center; overflow: hidden; }
-  .at-top .mjriverbox, .at-self .mjriverbox { width: 100%; height: 106px; }
-  .at-left .mjriverbox, .at-right .mjriverbox { width: 106px; height: 100%; }
-  .mjriver { display: grid; grid-template-columns: repeat(6, 26px); gap: 2px; }
+  .mjriverbox { display: flex; align-items: center; justify-content: center; overflow: hidden; flex-shrink: 0; }
+  /* 入れ物は回した後の実寸ぴったりに取る(はみ出させない)*/
+  .at-top .mjriverbox, .at-self .mjriverbox { width: 162px; height: 102px; }
+  .at-left .mjriverbox, .at-right .mjriverbox { width: 102px; height: 162px; }
+  .mjriver { display: grid; grid-template-columns: repeat(6, 24px); gap: 2px; }
   .at-top .mjriver   { transform: rotate(180deg); }
   .at-left .mjriver  { transform: rotate(90deg); }
   .at-right .mjriver { transform: rotate(-90deg); }
-  .rtile { display: flex; align-items: center; justify-content: center; width: 26px; height: 32px;
+  .rtile { display: flex; align-items: center; justify-content: center; width: 24px; height: 30px;
            border-radius: 3px; background: linear-gradient(#fdfbf4, #ece5d5); color: #17111f;
            border: 1px solid #b3a685; font-size: 12px; font-weight: 700; line-height: 1;
-           letter-spacing: -.06em; }
+           letter-spacing: -.1em; }
 
   /* 晒した面子(鳴き)。誰にでも見えるので河のそばに小さく置く */
   .mjmelds { display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; max-width: 100%; }
   .mjmeld { display: flex; gap: 1px; }
-  .rtile.open { width: 19px; height: 24px; font-size: 12px; border-color: #d8b43c; }
+  .rtile.open { width: 18px; height: 23px; font-size: 12px; border-color: #d8b43c; }
 
   /* 麻雀の牌 */
   .gtiles { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
@@ -420,8 +429,18 @@
     .lane.side { grid-area: side; border-left: 1px solid var(--line); display: none; }
     body.side-open .lane.side { display: flex; }
     .lane > * { margin: 0 var(--pad); width: auto; max-height: none; flex-shrink: 0; }
-    .lane #tasks, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
-    #rooms { margin: 10px var(--pad) 0; max-height: 44dvh; overflow-y: auto; }
+    .lane #rooms, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
+    /* 左は部屋の場所。囲みを外して一覧そのものに見せる */
+    .lane.nav #rooms { background: none; border: 0; padding: 0; margin: 0 var(--pad); }
+    .lane.nav #rooms h2 { margin-bottom: 10px; }
+    /* 左は部屋の一覧が主役。説明文と大きな作成フォームは畳んで縦を空ける */
+    .lane.nav #rooms .tnote { display: none; }
+    .lane.nav .rform { gap: 6px; }
+    .lane.nav .rform input { flex: 1 1 100%; padding: 8px 12px; font-size: var(--fs-small); }
+    .lane.nav .rform button { padding: 7px 12px; font-size: var(--fs-small); font-weight: 500; }
+    .lane.nav .rlinks { gap: 6px; margin-top: 10px; padding-top: 10px; }
+    .lane.nav .linkbtn { padding: 6px 11px; font-size: 12.5px; }
+    .lane.nav #roomsExtra { margin-top: 10px; padding-top: 10px; }
     #roster { padding: 0; }
     .lane.side #board { max-height: 55%; overflow-y: auto; flex-shrink: 0; }
     /* ゲーム中は卓を切らない(高さ制限を外して全部見せる)*/
@@ -446,6 +465,11 @@
     <button id="settingsBtn" class="hbtn" title="設定" aria-expanded="false">⚙</button>
   </div>
 </header>
+<div id="notice"></div>
+<div id="plan"></div>
+<!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
+     display:contents になり、今までどおり会話の上に積まれる -->
+<div class="lane nav">
 <div id="rooms" class="panel">
   <h2>部屋</h2>
   <div id="roomList"></div>
@@ -458,14 +482,8 @@
   </div>
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
-<div id="notice"></div>
-<div id="plan"></div>
-<!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
-     display:contents になり、今までどおり会話の上に積まれる -->
-<div class="lane nav">
-<button id="progress" title="進行中の作業を開く"></button>
-<div id="tasks" class="panel"><h2>進行中</h2><div id="boardList"></div></div>
 <div id="roster"></div>
+<button id="progress" title="進行中の作業を開く"></button>
 <div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
 </div>
 <!-- 右レーン: 作業スペース(何ができたか)。中央の会話とは場所を取り合わない -->
@@ -474,12 +492,12 @@
   <div class="tabs">
     <button id="tabArtifact" class="tab on">成果物</button>
     <button id="tabInbox" class="tab">報告 <span id="inboxCount"></span></button>
-    <button id="tabHistory" class="tab" title="完了したものと全部の履歴">履歴</button>
+    <button id="tabWork" class="tab" title="進行中と終わったもの">作業</button>
     <button id="tabGame" class="tab" title="遊ぶ">ゲーム <span id="gameBadge" class="badge"></span></button>
   </div>
   <div id="artifactList"></div>
   <div id="inboxList" hidden></div>
-  <div id="historyList" hidden></div>
+  <div id="tasks" hidden><div id="boardList"></div><div id="historyList"></div></div>
   <div id="gameList" hidden></div>
 </div>
 <div id="preview">
