@@ -175,6 +175,7 @@ function render(ev) {
   // 実況/system・presence は channel を持たず常時表示(部屋切替の告知等は見えていてほしい)
   if ((ev.type === 'user_speech' || ev.type === 'agent_speech') && ev.channel && ev.channel !== currentChannel) return;
   if (ev.type === 'user_speech') {
+    if (!isReplay) lastUserSpokeAt = performance.now();
     // 短い相槌(「うん」等)では溜まった読み上げを捨てない。長い発話 = 話題転換とみなして捨てる
     if (!isReplay && (ev.text ?? '').length >= 8) audioQueue.length = 0;
     const b = addBubble('user', ev.text ?? '');
@@ -497,9 +498,47 @@ async function fetchRooms() {
       : { channel: c.channel, label: c.label ?? c.name ?? ROOM_LABEL[c.channel] ?? c.channel }));
   } catch { /* 未対応サーバでは組み込みの 2 部屋のまま */ }
 }
+// 部屋を作る / 名前を変える(音声ナビからも押せるよう data-voice を付ける)
+function renderRoomsExtra() {
+  const box = document.getElementById('roomsExtra');
+  box.replaceChildren();
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = '部屋の名前(例: デザイン相談)';
+  input.maxLength = 24;
+  input.dataset.voice = 'room-name-input';
+  const create = document.createElement('button');
+  create.textContent = '＋ この名前で作る';
+  create.className = 'go';
+  create.dataset.voice = 'create-room';
+  const rename = document.createElement('button');
+  rename.textContent = '今の部屋の名前を変える';
+  rename.dataset.voice = 'rename-room';
+  const act = async (action) => {
+    const label = input.value.trim();
+    if (!label) { input.focus(); addSys('部屋の名前を入れてね'); return; }
+    try {
+      const r = await post('/rooms', { action, label, channel: currentChannel });
+      const d = await r.json();
+      if (!r.ok) { addSys(d.error ?? '部屋を操作できなかった'); return; }
+      input.value = '';
+      if (action === 'create') { await renderRooms(); await enterRoom(d.channel); }
+      else { await renderRooms(); updateRoomBtn(); }
+    } catch { addSys('サーバに繋がらないみたい'); }
+  };
+  create.onclick = () => void act('create');
+  rename.onclick = () => void act('rename');
+  input.onkeydown = (e) => { if (e.key === 'Enter' && !e.isComposing) void act('create'); };
+  const row = document.createElement('div');
+  row.className = 'rform';
+  row.append(input, create, rename);
+  box.appendChild(row);
+}
+
 async function renderRooms() {
   await fetchRooms();
   updateRoomBtn();
+  renderRoomsExtra();
   const list = document.getElementById('roomList');
   list.replaceChildren();
   for (const room of roomList) {
@@ -886,9 +925,26 @@ function checkAutoPreview(d) {
   for (const t of d.tasks ?? []) {
     if (t.id && t.status === 'done' && (t.artifacts ?? []).length > 0 && !previewedTasks.has(t.id)) {
       previewedTasks.add(t.id);
-      showPreview(t.artifacts[0]);
+      offerPreview(t.artifacts[0]);
     }
   }
+}
+
+// 厳格ルール: ユーザーの会話を邪魔してまで成果物を開かない。
+// 話している / 読み上げ中 / 直近 10 秒に発話があった時は、押せる案内だけ出す。
+let lastUserSpokeAt = 0;
+function offerPreview(relPath) {
+  const busy = playing || gateActive() || performance.now() - lastUserSpokeAt < 10_000;
+  if (!busy) { showPreview(relPath); return; }
+  const div = document.createElement('div');
+  div.className = 'sys';
+  const a = document.createElement('a');
+  a.href = '#';
+  a.textContent = `📦 ${relPath} — 押すと開くよ`;
+  a.onclick = (e) => { e.preventDefault(); showPreview(relPath); };
+  div.appendChild(a);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
 }
 // ---- 進捗をリアルタイムに保つ ----
 // ① 部屋の出来事(SSE)が来たら即取り直す ② 作業が動いている間は速く、無い時はゆっくり

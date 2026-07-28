@@ -24,11 +24,44 @@ const voice = new Voice(config.tts);
 // ---- 部屋分割(会話コンテキストの分離): 作業部屋 / 雑談部屋 ----
 // 単一の EventStore は共有したまま、event に channel を付け会話の記憶(Brain)と transcript だけを隔てる。
 // 「今どちらの部屋にいるか」は単一の activeChannel(部屋全体で 1 つ。/channel で切替)。
-const CHANNELS = ['work', 'chat'] as const;
-const ROOM_LABEL: Record<Channel, string> = { work: '作業部屋', chat: '雑談部屋' };
+// 部屋は増やせる: 既定の 2 つに加えて、ユーザーが名前を付けて作れる(~/.talkingclaw/rooms.json に永続化)。
+const ROOMS_PATH = join(homedir(), '.talkingclaw', 'rooms.json');
+const DEFAULT_ROOMS: { id: Channel; label: string }[] = [
+  { id: 'work', label: '作業部屋' },
+  { id: 'chat', label: '雑談部屋' },
+];
+function loadRooms(): { id: Channel; label: string }[] {
+  try {
+    const rows = JSON.parse(readFileSync(ROOMS_PATH, 'utf8')) as { id: string; label: string }[];
+    const clean = rows.filter((r) => typeof r?.id === 'string' && typeof r?.label === 'string');
+    return clean.length > 0 ? clean : DEFAULT_ROOMS;
+  } catch { return DEFAULT_ROOMS; }
+}
+let rooms = loadRooms();
+function saveRooms(): void {
+  try {
+    mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+    writeFileSync(ROOMS_PATH, JSON.stringify(rooms, null, 1), { mode: 0o600 });
+  } catch { /* 保存できなくても今の部屋は使える */ }
+}
+function roomLabel(ch: Channel): string {
+  return rooms.find((r) => r.id === ch)?.label ?? ch;
+}
+// 表示名から id を作る(英数は slug、日本語だけの名前は room-<連番>)
+function newRoomId(label: string): Channel {
+  const base = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24);
+  let id = base || `room-${rooms.length + 1}`;
+  for (let n = 2; rooms.some((r) => r.id === id); n++) id = `${base || 'room'}-${n}`;
+  return id;
+}
+function roomPrompt(ch: Channel): string {
+  const preset = (config.rooms as Record<string, string>)[ch];
+  if (preset) return preset;
+  return `\n\n# 今いる部屋\nここは「${roomLabel(ch)}」の部屋。この部屋の話題に集中して、他の部屋の話は持ち込まない`;
+}
 let activeChannel: Channel = 'work';
 function isChannel(v: unknown): v is Channel {
-  return v === 'work' || v === 'chat';
+  return typeof v === 'string' && rooms.some((r) => r.id === v);
 }
 
 // ---- audio 置き場(相槌プールは evict 対象外)----
@@ -474,7 +507,98 @@ function routeTargets(text: string): { targets: string[]; routing: RoomEvent['ro
   return { targets: registry.all().map((p) => p.participantId), routing: { method: 'default' } };
 }
 
-function userSpeech(text: string): RoomEvent {
+// ---- W11-2: 認識テキストの補正辞書(誤変換をここで直してから部屋に流す)----
+const DICT_PATH = join(homedir(), '.talkingclaw', 'dictionary.json');
+let dictCache: { at: number; map: Record<string, string> } = { at: 0, map: {} };
+function loadDict(): Record<string, string> {
+  if (Date.now() - dictCache.at < 5_000) return dictCache.map;
+  let user: Record<string, string> = {};
+  try { user = JSON.parse(readFileSync(DICT_PATH, 'utf8')); } catch { /* 無ければ既定のみ */ }
+  dictCache = { at: Date.now(), map: { ...config.dictionary, ...user } };
+  return dictCache.map;
+}
+function applyDict(text: string): string {
+  let out = text;
+  for (const [wrong, right] of Object.entries(loadDict())) {
+    if (!wrong) continue;
+    out = out.split(wrong).join(right);
+  }
+  return out;
+}
+function learnWord(wrong: string, right: string): void {
+  let user: Record<string, string> = {};
+  try { user = JSON.parse(readFileSync(DICT_PATH, 'utf8')); } catch { /* 初回 */ }
+  user[wrong] = right;
+  try {
+    mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+    const tmp = `${DICT_PATH}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(user, null, 1), { mode: 0o600 });
+    renameSync(tmp, DICT_PATH);
+    dictCache = { at: 0, map: {} };
+  } catch { /* 覚えられなくても会話は続ける */ }
+}
+
+// ---- W11-1: 確定バッファ — 細切れの認識結果を 1 発話にまとめてから部屋に流す ----
+// 「頼んでる時に全てあの」「つけて」のような断片それぞれに返事してしまう問題への対処。
+// ユーザーが話している間(userSpeaking)は確定しない = 言い終わってから考え始める。
+const FRAGMENT_MAX_CHARS = 15;   // これ未満は「続きがありそう」とみなす
+const FRAGMENT_WAIT_MS = 1_500;  // 続きを待つ時間(来たらリセット)
+const FRAGMENT_MAX_HOLD_MS = 5_000; // 保留の上限(レイテンシの天井)
+const TRAILING_PARTICLE = /(の|は|が|を|に|で|と|も|や|か|て|で|し|から|けど|ので|あの|えっと|その)$/;
+
+type Pending = { text: string; firstAt: number; timer: NodeJS.Timeout | null };
+let pending: Pending | null = null;
+
+function looksIncomplete(text: string): boolean {
+  return text.length < FRAGMENT_MAX_CHARS || TRAILING_PARTICLE.test(text);
+}
+
+// 確定待ちに積む。確定したら userSpeech を呼ぶ。戻り値は「今すぐ確定したか」
+function acceptUtterance(text: string): RoomEvent | null {
+  const merged = pending ? `${pending.text} ${text}` : text;
+  const firstAt = pending?.firstAt ?? Date.now();
+  if (pending?.timer) clearTimeout(pending.timer);
+
+  const heldTooLong = Date.now() - firstAt >= FRAGMENT_MAX_HOLD_MS;
+  if (!looksIncomplete(text) && !isUserSpeaking()) {
+    pending = null;
+    return userSpeech(merged); // 言い切っていて、もう話していない → 即確定
+  }
+  if (heldTooLong && !isUserSpeaking()) {
+    pending = null;
+    return userSpeech(merged);
+  }
+  pending = { text: merged, firstAt, timer: null };
+  armPending(FRAGMENT_WAIT_MS);
+  return null;
+}
+
+// 確定タイマー。まだ話している間は上限まで伸ばし続ける(伸ばす時も必ず再判定する)
+function armPending(delayMs: number): void {
+  if (!pending) return;
+  if (pending.timer) clearTimeout(pending.timer);
+  const timer = setTimeout(() => {
+    if (!pending) return;
+    if (isUserSpeaking() && Date.now() - pending.firstAt < FRAGMENT_MAX_HOLD_MS) {
+      armPending(500); // まだ喋ってる → もう少し待つ
+      return;
+    }
+    flushPending();
+  }, delayMs);
+  timer.unref();
+  pending.timer = timer;
+}
+
+function flushPending(): void {
+  if (!pending) return;
+  const { text, timer } = pending;
+  if (timer) clearTimeout(timer);
+  pending = null;
+  if (text.trim()) userSpeech(text.trim());
+}
+
+function userSpeech(rawText: string): RoomEvent {
+  const text = applyDict(rawText);
   userSpeaking = false; // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
   // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う
   if (pendingPermission) {
@@ -782,7 +906,7 @@ let chloeResetWorker: (() => void) | null = null;
 let chloeResetChat: (() => void) | null = null;
 // W9-2: 本番は 180s(sonnet + delegate の長 turn を誤殺しない)。テストは短縮して回転を速く
 // テスト時も「通常応答(context 注入込みで 20-40s)は切らず、ハングだけ捕まえる」値にする
-const ASK_GUARD_MS = Number(process.env.ASK_GUARD_MS ?? (process.env.ROOM_TEST_HOOKS === '1' ? 45_000 : 180_000));
+const ASK_GUARD_MS = Number(process.env.ASK_GUARD_MS ?? (process.env.ROOM_TEST_HOOKS === '1' ? 90_000 : 180_000));
 const ASK_GRACE_MS = process.env.ROOM_TEST_HOOKS === '1' ? 5_000 : 10_000;
 const TIMEOUT = Symbol('timeout');
 function timeoutMarker(ms: number): Promise<typeof TIMEOUT> {
@@ -807,6 +931,26 @@ function startChloe(): void {
     });
   }
 
+  // --- W11-3: 作業係を独立した話者として在室させる(実況がクロエの会話に混ざらない)---
+  const helperOutcome = registry.join(config.workerParticipant.name, config.workerParticipant.voice, store.lastId, store.bootId);
+  const helper = 'error' in helperOutcome ? null : helperOutcome.participant;
+  const helperPid = helper?.participantId ?? chloePid;
+  if (helper) {
+    const keepHelper = setInterval(() => { helper.lastSeen = Date.now(); }, 30_000);
+    keepHelper.unref();
+    store.append({ type: 'presence', from: helper.participantId, name: helper.assignedName, text: 'joined' });
+    if (engineState === 'ready') {
+      void resolveVoice(config.workerParticipant.voice).then((speaker) => {
+        if (speaker === null) return;
+        helper.voice.resolvedSpeaker = speaker;
+        helper.voice.status = 'ready';
+      });
+    }
+  }
+
+  // 実況として声に出す価値がない定型文(画面には残す)
+  const BOILERPLATE = /^(skipped:|add when|成果物[:：]|補足[:：]|注意[:：])/;
+
   // --- W8-2: worker(実作業係)。会話 Brain とは別セッションで並行動作 ---
   mkdirSync(config.agent.cwd, { recursive: true });
   let worker: Brain | null = null;
@@ -828,8 +972,7 @@ function startChloe(): void {
   planDelegate = delegate; // 相談がまとまった時の登録先(confirm_plan / POST /plan から使う)
 
   chloeResetChat = () => {
-    for (const c of CHANNELS) {
-      const cs = channelState[c];
+    for (const [c, cs] of channelState) {
       cs.chain = cs.chain.catch(() => {}).then(() => {
         void cs.brain.close().catch(() => {});
         cs.brain = new Brain(makeConvBrainOpts(c));
@@ -912,8 +1055,12 @@ function startChloe(): void {
   const workerSay = (task: OfficeTask) => (sentence: string): void => {
     task.notes.push(sentence);
     while (task.notes.length > 20) task.notes.shift();
-    // 実況(進捗報告)は常に作業部屋。雑談部屋にいる間は文脈に混ざらない(channel フィルタで隔離)
-    enqueueJob({ pid: chloePid!, priority: 2, kind: 'speech', text: sentence, turnId: 'none', epoch: speechEpoch, channel: 'work' });
+    // W11-3: 実況は「作業係」の声で。定型文(skipped: 等)は画面だけに出して読み上げない
+    if (BOILERPLATE.test(sentence.trim())) {
+      store.append({ type: 'agent_speech', from: helperPid!, name: helper?.assignedName ?? '作業係', text: sentence, audio: null, turnId: 'none', channel: 'work' });
+      return;
+    }
+    enqueueJob({ pid: helperPid!, priority: 2, kind: 'speech', text: sentence, turnId: 'none', epoch: speechEpoch, channel: 'work' });
   };
 
   async function runTask(task: OfficeTask): Promise<void> {
@@ -971,7 +1118,7 @@ function startChloe(): void {
       // W10-4: まとめてでなく、終わったものから個別に報告する
       const head = task.request.slice(0, 24);
       enqueueJob({
-        pid: chloePid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
         text: task.artifacts.length > 0 ? `${head}、できたよ。画面に出しておくね。` : `${head}、できたよ。`,
       });
     } catch (error) {
@@ -1005,6 +1152,33 @@ function startChloe(): void {
             planUnderDiscussion: plan, // 相談中の案(まだ着手していない)
             tasks, people, userScreen: uiState, engine: engineState, activeChannel,
           }, null, 1) }] };
+        },
+      ),
+      tool(
+        'cancel_task',
+        '直前に頼んだ作業を取り消す。ユーザーに「ちがう」「そうじゃない」と言われた時に使う。まだ始まっていないものだけ取り消せる。',
+        { taskId: z.number().optional() },
+        async ({ taskId }) => {
+          const target = taskId
+            ? officeTasks.find((t) => t.id === taskId)
+            : [...officeTasks].reverse().find((t) => t.status === 'queued' || t.status === 'working');
+          if (!target) return { content: [{ type: 'text' as const, text: '取り消せる作業が見つからない。ユーザーにそう伝えて。' }] };
+          if (target.status === 'working') {
+            return { content: [{ type: 'text' as const, text: `「${target.request.slice(0, 30)}」はもう始まってる。止められないので、そう正直に伝えて。` }] };
+          }
+          target.status = 'failed';
+          target.notes.push('ユーザーの指示で取り消し');
+          saveTasks();
+          return { content: [{ type: 'text' as const, text: `「${target.request.slice(0, 30)}」を取り消した。短く伝えて、正しい内容を聞き直して。` }] };
+        },
+      ),
+      tool(
+        'learn_word',
+        '音声認識でいつも間違って聞こえる言葉を覚える。「キッドハブは GitHub のことね」のように言われた時に使う。',
+        { wrong: z.string(), right: z.string() },
+        async ({ wrong, right }) => {
+          learnWord(wrong, right);
+          return { content: [{ type: 'text' as const, text: `「${wrong}」は「${right}」として覚えた。次から自動で直る。短く伝えて。` }] };
         },
       ),
       tool(
@@ -1065,13 +1239,13 @@ function startChloe(): void {
       ? ['mcp__office__propose_plan', 'mcp__office__confirm_plan']
       : ['mcp__office__delegate_task'];
     return {
-      systemPrompt: config.systemPrompt + config.rooms[channel] + (consulting ? CONSULT_PROMPT : ''),
+      systemPrompt: config.systemPrompt + roomPrompt(channel) + (consulting ? CONSULT_PROMPT : ''),
       model: workerSettings.chatModel,
       ...(workerSettings.chatEffort ? { effort: workerSettings.chatEffort } : {}),
       mcpServers: { office: officeServer } as Record<string, unknown>,
       allowedTools: channel === 'work'
-        ? [...workTools, 'mcp__office__remember', 'mcp__office__room_status']
-        : ['mcp__office__remember', 'mcp__office__room_status'],
+        ? [...workTools, 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']
+        : ['mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word'],
       maxTurns: 8, // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
       // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
       canUseTool: async (name: string, input: Record<string, unknown>) => {
@@ -1087,9 +1261,16 @@ function startChloe(): void {
   }
 
   type ChannelState = { brain: Brain; inbox: RoomEvent[]; busy: boolean; needsContext: boolean; chain: Promise<void> };
-  const channelState: Record<Channel, ChannelState> = Object.fromEntries(
-    CHANNELS.map((c) => [c, { brain: new Brain(makeConvBrainOpts(c)), inbox: [], busy: false, needsContext: true, chain: Promise.resolve() }]),
-  ) as Record<Channel, ChannelState>; // W8-1: boot/再生成後の最初の ask に直近ログを注入(channel ごと)
+  // 部屋ごとの会話 Brain。増やせる部屋に合わせて、入った部屋の分だけ作る(未使用の部屋は持たない)
+  const channelState = new Map<Channel, ChannelState>();
+  function chan(channel: Channel): ChannelState {
+    let cs = channelState.get(channel);
+    if (!cs) {
+      cs = { brain: new Brain(makeConvBrainOpts(channel)), inbox: [], busy: false, needsContext: true, chain: Promise.resolve() };
+      channelState.set(channel, cs); // W8-1: 最初の ask に記憶 + 直近ログを注入
+    }
+    return cs;
+  }
 
   // W9-2: 記憶忘れの根治 — memory 全文 + 直近ログを Brain 生成のたびに注入する
   function contextPrefix(channel: Channel): string {
@@ -1113,7 +1294,7 @@ function startChloe(): void {
   // W9-2: 同一チャンネルの ask は必ず 1 本ずつ(greeting warmup 中にユーザー発話が来て
   // Brain.ask が「前の返答を待っています」で弾かれる事故の根治)
   function askGuarded(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
-    const cs = channelState[channel];
+    const cs = chan(channel);
     const run = cs.chain.catch(() => {}).then(() => askOnce(channel, text, turnId));
     cs.chain = run.catch(() => {}); // 後続は前の失敗を引き継がない
     return run;
@@ -1121,7 +1302,7 @@ function startChloe(): void {
 
   // ask を見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
   async function askOnce(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
-    const cs = channelState[channel];
+    const cs = chan(channel);
     const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
     if (cs.needsContext) { text = contextPrefix(channel) + text; cs.needsContext = false; }
     const ask = hang ? new Promise<string>(() => {}) : cs.brain.ask(text, speakStreamed(channel, turnId));
@@ -1137,7 +1318,7 @@ function startChloe(): void {
   }
 
   async function drain(channel: Channel): Promise<void> {
-    const cs = channelState[channel];
+    const cs = chan(channel);
     if (cs.busy) return;
     cs.busy = true;
     try {
@@ -1158,7 +1339,7 @@ function startChloe(): void {
     if (ev.type === 'user_speech' && ev.targets?.includes(chloePid!)) {
       if (ev.turnId) { const t = turns.get(ev.turnId); if (t) t.delivered = true; } // in-process = 即配送
       const channel = ev.channel ?? 'work';
-      channelState[channel].inbox.push(ev);
+      chan(channel).inbox.push(ev);
       void drain(channel);
     }
   });
@@ -1174,14 +1355,12 @@ function startChloe(): void {
   }
 
   // greeting = Brain warmup(初回コールドスタートを起動時に消化。channel ごとに 1 回)
-  const GREETING: Record<Channel, string> = {
-    work: '(ユーザーが声の部屋(作業部屋)に来られるようになった。あなたらしく短く一言で挨拶して)',
-    chat: '(ユーザーが雑談部屋に来られるようになった。作業の話はせず、あなたらしく短く気楽に一言だけ挨拶して)',
-  };
-  for (const channel of CHANNELS) {
-    void askGuarded(channel, GREETING[channel], undefined)
-      .then(() => console.error(`クロエ(${channel}) warmup 完了`));
-  }
+  // 増やせる部屋の分まで温めると待ち時間もお金も増えるので、今いる部屋だけ温める
+  const greeting = activeChannel === 'chat'
+    ? '(ユーザーが雑談部屋に来られるようになった。作業の話はせず、あなたらしく短く気楽に一言だけ挨拶して)'
+    : `(ユーザーが声の部屋(${roomLabel(activeChannel)})に来られるようになった。あなたらしく短く一言で挨拶して)`;
+  void askGuarded(activeChannel, greeting, undefined)
+    .then(() => console.error(`クロエ(${activeChannel}) warmup 完了`));
 }
 
 if (process.env.NO_CHLOE !== '1') startChloe();
@@ -1193,18 +1372,18 @@ const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了�
 
 // W8-1: 会話ログの永続化(共有記憶の正)。user 発話 + 非 filler 本応答を追記。
 // 部屋分割: channel ごとに別ファイル(work = 既存 transcript.jsonl のまま・後方互換)
-const TRANSCRIPT_PATH: Record<Channel, string> = {
-  work: join(homedir(), '.talkingclaw', 'transcript.jsonl'),
-  chat: join(homedir(), '.talkingclaw', 'transcript-chat.jsonl'),
-};
+function transcriptPath(channel: Channel): string {
+  // work だけ既存ファイル名のまま(後方互換)。他は transcript-<channel>.jsonl
+  return join(homedir(), '.talkingclaw', channel === 'work' ? 'transcript.jsonl' : `transcript-${channel}.jsonl`);
+}
 function transcriptAppend(channel: Channel, who: string, text: string): void {
   try {
-    appendFileSync(TRANSCRIPT_PATH[channel], JSON.stringify({ at: new Date().toISOString(), who, text }) + '\n', { mode: 0o600 });
+    appendFileSync(transcriptPath(channel), JSON.stringify({ at: new Date().toISOString(), who, text }) + '\n', { mode: 0o600 });
   } catch { /* ログ欠落は本流を止めない */ }
 }
 function transcriptTail(channel: Channel, lines: number): { at: string; who: string; text: string }[] {
   try {
-    const all = readFileSync(TRANSCRIPT_PATH[channel], 'utf8').trim().split('\n');
+    const all = readFileSync(transcriptPath(channel), 'utf8').trim().split('\n');
     return all.slice(-lines).map((l) => JSON.parse(l));
   } catch {
     return [];
@@ -1326,7 +1505,7 @@ const server = createServer(async (req, res) => {
     if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' }); // 会話ログは秘匿
     const channel = isChannel(url.searchParams.get('channel')) ? (url.searchParams.get('channel') as Channel) : 'work';
     const rows = transcriptTail(channel, Math.min(Number(url.searchParams.get('lines') ?? 500) || 500, 2000));
-    const md = `# 声の部屋 会話ログ(${ROOM_LABEL[channel]})\n\n` + rows.map((r) => `- ${r.at.slice(0, 16).replace('T', ' ')} **${r.who}**: ${r.text}`).join('\n') + '\n';
+    const md = `# 声の部屋 会話ログ(${roomLabel(channel)})\n\n` + rows.map((r) => `- ${r.at.slice(0, 16).replace('T', ' ')} **${r.who}**: ${r.text}`).join('\n') + '\n';
     res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     return res.end(md);
   }
@@ -1367,6 +1546,10 @@ const server = createServer(async (req, res) => {
     const ping = setInterval(() => res.write(': ping\n\n'), 25_000); // S1: SSE heartbeat
     req.on('close', () => { clearInterval(ping); unsubscribe(); });
     return;
+  }
+
+  if (req.method === 'GET' && path === '/channels') {
+    return json(res, 200, { active: activeChannel, rooms: rooms.map((r) => ({ channel: r.id, label: r.label })) });
   }
 
   if (req.method === 'GET' && path === '/participants') {
@@ -1427,8 +1610,16 @@ const server = createServer(async (req, res) => {
   if (path === '/chat') {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
-    const ev = userSpeech(text);
-    return json(res, 200, { ok: true, eventId: ev.id, turnId: ev.turnId });
+    // W11-1: 断片は確定バッファでまとめる。immediate:true(テキスト入力など)は素通し
+    const ev = body.immediate === true ? userSpeech(text) : acceptUtterance(text);
+    return json(res, 200, ev ? { ok: true, eventId: ev.id, turnId: ev.turnId } : { ok: true, pending: true });
+  }
+
+  if (path === '/dict') {
+    const wrong = String(body.wrong ?? '').trim();
+    const right = String(body.right ?? '').trim();
+    if (wrong && right) learnWord(wrong, right);
+    return json(res, 200, { ok: Boolean(wrong && right), dictionary: loadDict() });
   }
 
   if (path === '/settings') {
@@ -1525,17 +1716,48 @@ const server = createServer(async (req, res) => {
     return json(res, 200, { ok: true, selected: selectedPid });
   }
 
+  if (path === '/rooms') {
+    // 部屋の作成 / 名前変更。id は作る時に決まり、以後変わらない(ログの置き場所が id 基準のため)
+    const action = String(body.action ?? '');
+    const label = String(body.label ?? '').trim().replace(/\s+/g, ' ').slice(0, 24);
+    if (action === 'create') {
+      if (!label) return json(res, 400, { error: '部屋の名前を入れてね' });
+      if (rooms.length >= 12) return json(res, 400, { error: '部屋は 12 個までにしておこう' });
+      if (rooms.some((r) => r.label === label)) return json(res, 400, { error: `「${label}」はもうあるよ` });
+      const id = newRoomId(label);
+      rooms.push({ id, label });
+      saveRooms();
+      store.append({ type: 'system', from: 'room', text: `「${label}」の部屋を作ったよ` });
+      return json(res, 200, { ok: true, channel: id, label, rooms });
+    }
+    if (action === 'rename') {
+      const target = isChannel(body.channel) ? body.channel : activeChannel;
+      if (!label) return json(res, 400, { error: '新しい名前を入れてね' });
+      const room = rooms.find((r) => r.id === target);
+      if (!room) return json(res, 400, { error: '不明な部屋です' });
+      const before = room.label;
+      room.label = label;
+      saveRooms();
+      store.append({ type: 'system', from: 'room', text: `部屋の名前を「${before}」から「${label}」に変えたよ` });
+      return json(res, 200, { ok: true, channel: target, label, rooms });
+    }
+    return json(res, 400, { error: 'action は create / rename' });
+  }
+
   if (path === '/channel') {
-    // 部屋分割: 今いる部屋(作業部屋/雑談部屋)を切替。以後のデフォルト発話・クロエの記憶がこちらに切り替わる
-    if (!isChannel(body.channel)) return json(res, 400, { error: '不明な部屋です(work / chat)' });
+    // 部屋分割: 今いる部屋を切替。以後のデフォルト発話・クロエの記憶がこちらに切り替わる
+    if (!isChannel(body.channel)) return json(res, 400, { error: '不明な部屋です' });
     activeChannel = body.channel;
-    store.append({ type: 'system', from: 'room', text: `部屋を${ROOM_LABEL[activeChannel]}に切り替えたよ`, channel: activeChannel });
+    store.append({ type: 'system', from: 'room', text: `部屋を${roomLabel(activeChannel)}に切り替えたよ`, channel: activeChannel });
     return json(res, 200, { ok: true, channel: activeChannel });
   }
 
   if (path === '/speech-state') {
     // ブラウザ側の STT interim/final から「ユーザーが今話しているか」を報告させる。認証はトークンのみ(participant 不問)。
+    const wasSpeaking = userSpeaking;
     userSpeaking = body.speaking === true;
+    // W11-1: 話し終わった瞬間に、溜めていた断片を 1 発話として確定する
+    if (wasSpeaking && !userSpeaking) setTimeout(() => flushPending(), 250).unref();
     userSpeakingAt = Date.now();
     return json(res, 200, { ok: true, userSpeaking });
   }

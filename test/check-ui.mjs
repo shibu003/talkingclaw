@@ -18,6 +18,23 @@ if (/\.style\.display\s*=/.test(js.replace(/noticeEl\.style\.display\s*=\s*'bloc
   console.log('  ❌ パネルの開閉が style.display 直書きに戻ってる(openPanel に一本化して)'); fail = 1;
 } else console.log('  ✅ パネル開閉は openPanel に一本化されてる');
 
+// 部屋の作成 / 名前変更が「画面から押せる」形で組まれているか
+{
+  const need = [
+    ["data-voice の作成ボタン", /dataset\.voice = 'create-room'/],
+    ["data-voice の名前変更ボタン", /dataset\.voice = 'rename-room'/],
+    ["名前の入力欄", /dataset\.voice = 'room-name-input'/],
+    ['/rooms への送信', /post\('\/rooms', \{ action, label, channel: currentChannel \}\)/],
+    ['作成ボタンの onclick', /create\.onclick\s*=/],
+    ['名前変更ボタンの onclick', /rename\.onclick\s*=/],
+    ['部屋パネルを開くと出る', /renderRoomsExtra\(\);/],
+  ];
+  for (const [what, re] of need) {
+    if (!re.test(js)) { console.log(`  ❌ ${what} が見つからない(ボタンが動かない)`); fail = 1; }
+  }
+  if (fail === 0) console.log('  ✅ 部屋の作成 / 名前変更ボタンは画面に出て /rooms に繋がってる');
+}
+
 // 進捗の帯: 件数から作る割合が壊れてないか(純関数を room.js から取り出す)
 {
   const body = js.slice(js.indexOf('// >>> progressSummary'), js.indexOf('// <<< progressSummary'));

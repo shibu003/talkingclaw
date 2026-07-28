@@ -80,6 +80,17 @@
                      color: var(--accent-ink); background: var(--accent); border-radius: 999px; padding: 2px 9px; }
   #roomsExtra:empty { display: none; }   /* 新規作成・名前変更 UI のマウント先 */
   #roomsExtra { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--surface-2); }
+  /* 部屋を作る / 名前を変える */
+  .rform { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .rform input { flex: 1 1 12em; min-width: 0; padding: 10px 14px; border-radius: var(--r-sm);
+                 border: 1px solid var(--line); background: var(--surface-2); color: var(--text);
+                 font-size: var(--fs-ui); }
+  .rform input:focus { border-color: var(--accent); outline: none; }
+  .rform button { padding: 10px 16px; border-radius: 999px; border: 1px solid var(--line);
+                  background: var(--surface-2); color: var(--text); font-size: var(--fs-ui); font-weight: 600; }
+  .rform button.go { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .rform button:hover { border-color: var(--accent); }
+
   /* この部屋の記録(ログ・アーカイブ)は部屋の道具なので、ヘッダでなくここに置く */
   .rlinks { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px;
             border-top: 1px solid var(--surface-2); }
@@ -184,14 +195,12 @@
   #send:hover { border-color: var(--accent); }
 
   /* ---- 成果物プレビュー ---- */
-  #preview { display: none; position: fixed; right: 0; top: 0; width: min(560px, 92vw); height: 100dvh;
-             background: var(--surface); border-left: 1px solid var(--line); z-index: 10; flex-direction: column; }
+  #preview { display: none; flex-direction: column; margin: 0 18px 8px; border: 1px solid var(--line, #3d3356);
+             border-radius: 12px; overflow: hidden; background: #1d1729; height: 42dvh; flex: none; }
   #preview.open { display: flex; }
-  #preview .phead { display: flex; gap: 10px; align-items: center; padding: 12px 14px;
-                    font-size: var(--fs-ui); border-bottom: 1px solid var(--line); }
-  #preview .phead #previewTitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #preview .phead a { color: var(--accent); margin-left: auto; flex-shrink: 0; }
-  #preview iframe { flex: 1; border: 0; background: #fff; }
+  #preview .phead { display: flex; gap: 10px; align-items: center; padding: 8px 12px; font-size: 13px; }
+  #preview .phead a { color: #b48ef7; margin-left: auto; }
+  #preview iframe { flex: 1; border: 0; background: #fff; width: 100%; }
 
   @media (max-width: 480px) { :root { --pad: 14px; } #roomBtn { max-width: 100%; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
