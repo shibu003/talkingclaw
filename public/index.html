@@ -236,17 +236,22 @@
              color: var(--muted); font-size: 15px; line-height: 1.8; }
 
   /* ---- 入力 ---- */
-  footer { padding: 12px var(--pad) calc(12px + env(safe-area-inset-bottom));
-           display: flex; gap: 10px; align-items: center; border-top: 1px solid var(--line); }
-  #mic { width: 56px; height: 56px; border-radius: 50%; border: none; background: var(--surface-2);
-         font-size: 24px; flex-shrink: 0; transition: background .2s, transform .2s; }
+  /* 入力欄がこの画面の主役。道具は欄の中に収める(外に散らばらせない)*/
+  footer { padding: 12px var(--pad) calc(12px + env(safe-area-inset-bottom)); border-top: 0; }
+  #composer { width: 100%; max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px;
+              padding: 10px 12px; border-radius: var(--r-lg); border: 1px solid var(--line);
+              background: var(--surface); box-shadow: 0 6px 20px -12px rgba(0,0,0,.7); }
+  #composer:focus-within { border-color: var(--accent); }
+  #composer.drop { border-color: var(--accent); }
+  .ctools { display: flex; align-items: center; gap: 4px; }
+  .cspacer { flex: 1; }
+  #mic { width: 34px; height: 34px; border-radius: 50%; border: none; background: var(--surface-2);
+         font-size: 17px; flex-shrink: 0; transition: background .2s, transform .2s; }
   #mic.on { background: var(--accent); color: var(--accent-ink); }
   #mic.listening { background: var(--hot); color: #fff; animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { transform: scale(1.08); } }
-  #composer { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
-  #composer.drop #text { border-color: var(--accent); }
-  #text { width: 100%; min-width: 0; padding: 14px 18px; border-radius: 999px; border: 1px solid var(--line);
-          background: var(--surface-2); font-size: var(--fs-body); line-height: 1.5; outline: none; }
+  #text { width: 100%; min-width: 0; padding: 6px 6px 2px; border: 0; background: transparent;
+          font-size: var(--fs-body); line-height: 1.6; outline: none; }
   /* 送る前の添付。押すと外せる */
   #attached:empty { display: none; }
   #attached { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -343,9 +348,9 @@
   #gameList .grules { margin-top: 6px; font-size: var(--fs-small); line-height: 1.8; color: var(--muted); }
   #text::placeholder { color: var(--muted); }
   #text:focus { border-color: var(--accent); }
-  #send { width: 46px; height: 46px; border-radius: 50%; border: 1px solid var(--line);
-          background: var(--surface-2); font-size: 17px; flex-shrink: 0; }
-  #send:hover { border-color: var(--accent); }
+  #send { width: 34px; height: 34px; border-radius: 50%; border: 0;
+          background: var(--accent); color: var(--accent-ink); font-size: 15px; flex-shrink: 0; }
+  #send:hover { filter: brightness(1.1); }
 
   /* ---- 報告スレッドと成果物プレビュー(右レーンの中身)---- */
   .tabs { display: flex; gap: 8px; margin: 0 0 10px; }
@@ -411,6 +416,17 @@
                                 "nav plan side" "nav log side"  "nav foot side"; }
     header { grid-area: head; } #rooms { grid-area: room; } #notice { grid-area: note; } #plan { grid-area: plan; }
     #log { grid-area: log; } footer { grid-area: foot; }
+    /* 中身は中央に寄せて、左右にたっぷり余白を取る */
+    #log { align-items: center; }
+    #log > * { width: 100%; max-width: 760px; }
+    /* 塊は 760px で中央、本文は 30em で折り返す(ID の指定に負けないよう #log を付ける)*/
+    #log .tx, #log .interim { max-width: var(--measure); }
+    #log .card, #log .att { max-width: var(--measure); }
+    header { max-width: 792px; margin: 0 auto; width: 100%; border-bottom: 0; }
+    #notice, #plan, #rooms { max-width: 760px; margin-left: auto; margin-right: auto; width: 100%; }
+    /* 部屋はレールで選ぶので、ヘッダのボタンは要らない。在室をここに出す */
+    #roomBtn { display: none; }
+    header #roster { display: flex; padding: 0; gap: 6px; }
     /* 右レーンは常設しない。プレビューを開いた時と 📋 で呼んだ時だけ現れる */
     /* 幅は掴んで動かせる(--nav-w / --side-w に入る。localStorage に覚える)*/
     body { grid-template-columns: var(--nav-w, 264px) minmax(0, 1fr) 0; }
@@ -430,17 +446,32 @@
     body.side-open .lane.side { display: flex; }
     .lane > * { margin: 0 var(--pad); width: auto; max-height: none; flex-shrink: 0; }
     .lane #rooms, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
-    /* 左は部屋の場所。囲みを外して一覧そのものに見せる */
-    .lane.nav #rooms { background: none; border: 0; padding: 0; margin: 0 var(--pad); }
-    .lane.nav #rooms h2 { margin-bottom: 10px; }
-    /* 左は部屋の一覧が主役。説明文と大きな作成フォームは畳んで縦を空ける */
-    .lane.nav #rooms .tnote { display: none; }
-    .lane.nav .rform { gap: 6px; }
-    .lane.nav .rform input { flex: 1 1 100%; padding: 8px 12px; font-size: var(--fs-small); }
-    .lane.nav .rform button { padding: 7px 12px; font-size: var(--fs-small); font-weight: 500; }
-    .lane.nav .rlinks { gap: 6px; margin-top: 10px; padding-top: 10px; }
-    .lane.nav .linkbtn { padding: 6px 11px; font-size: 12.5px; }
-    .lane.nav #roomsExtra { margin-top: 10px; padding-top: 10px; }
+    /* ---- 左はアイコンのレール(Genspark 型)----
+       罫線ではなく背景色の差で分ける。名前はアイコンの下に小さく、
+       入りきらないぶんは title で読める */
+    body { --nav-w: 84px; }
+    .lane.nav { border-right: 0; background: #191426; padding: 10px 0; gap: 4px; align-items: stretch; }
+    .lane.nav > * { margin: 0 6px; }
+    .lane.nav #rooms { background: none; border: 0; padding: 0; margin: 0; }
+    .lane.nav #rooms h2, .lane.nav #rooms .tnote, .lane.nav .rsub { display: none; }
+    .lane.nav .room { flex-direction: column; align-items: center; gap: 3px; text-align: center;
+                      padding: 9px 4px; margin: 0 6px 4px; border-radius: 12px; }
+    .lane.nav .room .ricon { font-size: 21px; line-height: 1.1; }
+    .lane.nav .room .rmain { align-items: center; width: 100%; }
+    .lane.nav .room .rmain b { font-size: 12px; font-weight: 500; line-height: 1.3; max-width: 100%; }
+    .lane.nav .room .here-mark, .lane.nav .room .rbadge { display: none; }
+    .lane.nav .room.here { background: var(--surface-2); }
+    .lane.nav .room.here .rmain b { color: var(--accent); font-weight: 700; }
+    /* 作成・名前変更・記録は「もっと」から開く(レールには置かない)*/
+    .lane.nav #roomsExtra, .lane.nav .rlinks { display: none; }
+    /* 在室は中央のヘッダで見る。進捗はレールでは潰れるので「作業」タブに任せる */
+    .lane.nav #roster, .lane.nav #progress { display: none; }
+    /* レールの下: 部屋を作る / 記録 */
+    .railbtn { display: flex; flex-direction: column; align-items: center; gap: 2px;
+               padding: 8px 4px; margin: 0 6px; border-radius: 12px; border: 0;
+               background: transparent; color: var(--muted); font-size: 12px; line-height: 1.3; }
+    .railbtn:hover { background: var(--surface-2); color: var(--text); }
+    .railbtn .ricon { font-size: 19px; line-height: 1.1; }
     #roster { padding: 0; }
     .lane.side #board { max-height: 55%; overflow-y: auto; flex-shrink: 0; }
     /* ゲーム中は卓を切らない(高さ制限を外して全部見せる)*/
@@ -459,6 +490,7 @@
   <button id="roomBtn" title="部屋を選ぶ" aria-expanded="false">
     <span class="rname">部屋</span><span class="caret">▼</span>
   </button>
+  <div id="roster"></div>
   <div id="status">接続中…</div>
   <div class="tools">
     <button id="boardBtn" class="hbtn" title="成果物と報告" aria-expanded="false">📋<span id="boardBadge" class="badge"></span></button>
@@ -482,7 +514,6 @@
   </div>
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
-<div id="roster"></div>
 <button id="progress" title="進行中の作業を開く"></button>
 <div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
 </div>
@@ -511,15 +542,18 @@
 </div>
 <div id="log"></div>
 <footer>
-  <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>
   <div id="composer">
     <div id="attached"></div>
     <input id="text" placeholder="話しかけてね(画像やファイルはドロップ・貼り付けでも送れるよ)" autocomplete="off">
+    <div class="ctools">
+      <button id="attachBtn" class="hbtn" title="画像やファイルを送る">📎</button>
+      <button id="stopBtn" class="hbtn" title="読み上げを止める">⏹</button>
+      <span class="cspacer"></span>
+      <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>
+      <button id="send" title="送信">➤</button>
+    </div>
   </div>
-  <button id="stopBtn" class="hbtn" title="読み上げを止める">⏹</button>
-  <button id="attachBtn" class="hbtn" title="画像やファイルを送る">📎</button>
   <input id="fileInput" type="file" multiple hidden>
-  <button id="send" title="送信">➤</button>
 </footer>
 <script src="/vad/vad-web.js"></script>
 <script src="/room.js"></script>

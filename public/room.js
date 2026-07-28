@@ -818,6 +818,27 @@ function renderRoomsExtra() {
   box.appendChild(row);
 }
 
+// レールの下に置く道具(部屋を作る / 記録)。狭い画面では部屋パネルの中に出るので足さない
+function renderRailTools() {
+  const host = document.getElementById('roomList');
+  if (!wideLayout()) return;
+  for (const [icon, label, run] of [
+    ['＋', '作る', () => { showPanelForce('rooms'); voiceTarget('room-name-input')?.focus(); }],
+    ['📄', '記録', () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel)],
+  ]) {
+    const b = document.createElement('button');
+    b.className = 'railbtn';
+    const i = document.createElement('span');
+    i.className = 'ricon';
+    i.textContent = icon;
+    const t = document.createElement('span');
+    t.textContent = label;
+    b.append(i, t);
+    b.onclick = run;
+    host.appendChild(b);
+  }
+}
+
 async function renderRooms() {
   await fetchRooms();
   updateRoomBtn();
@@ -827,10 +848,16 @@ async function renderRooms() {
   for (const room of roomList) {
     const btn = document.createElement('button');
     btn.className = 'room' + (room.channel === currentChannel ? ' here' : '');
+    // レール表示で使うアイコン(名前の先頭の絵文字。無ければ部屋ごとの既定)
+    const icon = document.createElement('span');
+    icon.className = 'ricon';
+    const lead = room.label.match(/^\p{Extended_Pictographic}/u)?.[0];
+    icon.textContent = lead ?? ({ work: '🛠', chat: '💬', game: '🎲' }[room.channel] ?? '🗂');
+    btn.appendChild(icon);
     const main = document.createElement('span');
     main.className = 'rmain';
     const name = document.createElement('b');
-    name.textContent = room.label;
+    name.textContent = room.label.replace(/^\p{Extended_Pictographic}\s*/u, '');
     main.appendChild(name);
     // その部屋に誰がいて、何が起きているか(部屋を選ぶ材料になる)
     const who = [...pidRooms].filter(([, ch]) => ch === room.channel).map(([pid]) => pidNames.get(pid) ?? '');
@@ -850,9 +877,11 @@ async function renderRooms() {
       mark.textContent = '遊び中';
       btn.appendChild(mark);
     }
+    btn.title = `${room.label}(${sub.textContent})`;   // レールでは名前が縮むので全体は title で
     btn.onclick = () => void enterRoom(room.channel);
     list.appendChild(btn);
   }
+  renderRailTools();
 }
 async function enterRoom(next) {
   openPanel(null);
