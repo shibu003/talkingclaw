@@ -124,8 +124,11 @@ export class Voice {
   }
 
   async #synthesize(text: string, speaker = this.#speaker): Promise<Buffer> {
+    // timeout 必須: 応答しない request を待ち続けると直列 pump 全体が巻き添えで停止する
+    // (以降の合成が一切走らない)。abort → 呼び出し側の retry / text-only 経路へ。
+    // synthesis の上限はモデル cold load 実測 83s × 1.8(短くすると初回合成を殺してフラッピングする)
     const params = new URLSearchParams({ text, speaker: String(speaker) });
-    const queryRes = await fetch(`${this.#url}/audio_query?${params}`, { method: 'POST' });
+    const queryRes = await fetch(`${this.#url}/audio_query?${params}`, { method: 'POST', signal: AbortSignal.timeout(15_000) });
     if (!queryRes.ok) throw new Error(`AivisSpeech audio_query が失敗しました (${queryRes.status})`);
     const audioQuery = (await queryRes.json()) as { speedScale: number };
     audioQuery.speedScale = this.#speedScale;
@@ -134,6 +137,7 @@ export class Voice {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(audioQuery),
+      signal: AbortSignal.timeout(150_000),
     });
     if (!synthRes.ok) throw new Error(`AivisSpeech synthesis が失敗しました (${synthRes.status})`);
     return Buffer.from(await synthRes.arrayBuffer());

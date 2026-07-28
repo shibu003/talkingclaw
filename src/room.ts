@@ -313,7 +313,12 @@ function enqueueJob(job: SynthJob): void {
     store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio: null, turnId: job.turnId, channel: job.channel });
     return; // per-participant 上限: 古い順でなく新規を text-only(FIFO 順序を保つ)
   }
-  q.push(job);
+  // priority inversion 防止: pickNext はキュー先頭しか見ないので、speech を先頭の ack-pool 群より
+  // 前に差し込む(でないと再起動直後、本発話が自分のプール事前合成の後ろで数分待たされる)。
+  // speech 同士の FIFO と ack-pool 同士の順序はどちらも保たれる
+  const poolIdx = job.kind === 'speech' ? q.findIndex((j) => j.kind === 'ack-pool') : -1;
+  if (poolIdx >= 0) q.splice(poolIdx, 0, job);
+  else q.push(job);
   jobQueues.set(job.pid, q);
   if (!rrOrder.includes(job.pid)) rrOrder.push(job.pid);
   void pump();
@@ -345,6 +350,7 @@ async function runJob(job: SynthJob): Promise<void> {
     try {
       const wav = await voice.synthesizeWav(job.text, speaker);
       synthFailStreak = 0;
+      if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null); // stale drop: 合成中に 2 世代進んだ
       if (!wav) return emitSpeech(null);
       const url = putAudio(wav, job.kind === 'ack-pool');
       if (job.kind === 'ack-pool') {
