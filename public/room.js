@@ -17,7 +17,7 @@ let listening = false;
 let playing = false;
 let currentAudio = null; // 6C: barge-in の duck/pause 対象
 const audioQueue = [];    // { url, bubble, eventId }
-const bubbles = new Map(); // 連続する同一発話者の文を 1 吹き出しにまとめる: key=from
+let lastBubble = null; // 連続する同一発話者の文を 1 吹き出しにまとめるための直前の吹き出し
 // 自己音声棄却(SP3 実機で誤認を確認): 直近 8s に再生したテキストと一致する認識結果は捨てる
 const recentPlayed = [];
 function rememberPlayed(text) {
@@ -65,16 +65,14 @@ function addSys(text) {
 }
 
 function agentBubble(from, name, text) {
-  const prev = bubbles.get('last');
-  if (prev && prev.from === from) {
-    prev.body.textContent += ' ' + text;
+  if (lastBubble && lastBubble.from === from) {
+    lastBubble.body.textContent += ' ' + text;
     log.scrollTop = log.scrollHeight;
-    return prev;
+    return lastBubble;
   }
   const b = addBubble('agent', text, name || from);
-  const entry = { from, div: b.div, body: b.body };
-  bubbles.set('last', entry);
-  return entry;
+  lastBubble = { from, div: b.div, body: b.body };
+  return lastBubble;
 }
 
 // ---- 再生(audio 要素 = AEC 維持)----
@@ -187,7 +185,7 @@ function render(ev) {
       to.textContent = '→ ' + (ev.targets.length > 2 ? 'みんな' : names.join('・'));
       b.div.appendChild(to);
     }
-    bubbles.delete('last');
+    lastBubble = null;
   } else if (ev.type === 'agent_speech') {
     const b = agentBubble(ev.from, ev.name, ev.text ?? '');
     if (ev.audio && !isReplay) {
@@ -203,7 +201,7 @@ function render(ev) {
     }
   } else if (ev.type === 'system' || ev.type === 'presence') {
     addSys((ev.name ? ev.name + ': ' : '') + (ev.text ?? ev.type));
-    bubbles.delete('last');
+    lastBubble = null;
     if (ev.type === 'presence' && typeof refreshRoster === 'function') setTimeout(() => refreshRoster(), 100);
   }
   // 部屋で何か起きた = 作業の状態も変わっている可能性。進捗表示をすぐ取り直す
@@ -523,7 +521,7 @@ async function enterRoom(next) {
   currentChannel = next;
   updateRoomBtn();
   log.replaceChildren();
-  bubbles.clear();
+  lastBubble = null;
   audioQueue.length = 0;
   await showHistory(next); // 切り替えた部屋の直近の会話を読み込む(白紙にしない)
 }
@@ -539,7 +537,7 @@ async function showHistory(channel, lines = 40) {
       if (r.who === 'あなた') addBubble('user', r.text);
       else agentBubble('history:' + r.who, r.who, r.text);
     }
-    bubbles.delete('last'); // 履歴とライブの吹き出しをつなげない
+    lastBubble = null; // 履歴とライブの吹き出しをつなげない
     addSys('— ここから今 —');
     log.scrollTop = log.scrollHeight;
   } catch { addSys('履歴を読めなかった(📄 会話ログから見てね)'); }

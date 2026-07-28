@@ -9,7 +9,7 @@ export type Channel = 'work' | 'chat';
 export type RoomEvent = {
   id: number;
   at: string;
-  type: 'user_speech' | 'agent_speech' | 'agent_message' | 'presence' | 'system' | 'error' | 'user_interim';
+  type: 'user_speech' | 'agent_speech' | 'presence' | 'system';
   from: string; // participantId | 'user' | 'room'
   name?: string;
   text?: string;
