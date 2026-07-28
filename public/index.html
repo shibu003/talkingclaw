@@ -114,6 +114,7 @@
   .sys { align-self: center; display: flex; align-items: center; gap: 10px; width: 100%;
          margin: 2px 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.6; text-align: center; }
   .sys::before, .sys::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .sys a { color: var(--accent); }
   .interim { align-self: flex-end; max-width: min(84%, var(--measure)); padding: 0 16px;
              color: var(--muted); font-size: 15px; line-height: 1.8; }
 
@@ -180,7 +181,7 @@
 <div id="log"></div>
 <footer>
   <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>
-  <input id="text" placeholder="テキストでも話しかけられるよ" autocomplete="off">
+  <input id="text" placeholder="話しかけてね(「部屋一覧見せて」で画面も動くよ)" autocomplete="off">
   <button id="send" title="送信">➤</button>
 </footer>
 <script src="/vad/vad-web.js"></script>

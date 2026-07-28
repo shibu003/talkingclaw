@@ -235,6 +235,7 @@ function restartDetected() {
 async function send(text) {
   text = text.trim();
   if (!text) return;
+  if (handleNav(text)) return; // 音声ナビ: 画面移動の指示は会話に流さず、その場で画面を動かす
   setStatus('届けたよ');
   try {
     const res = await post('/chat', { text });
@@ -540,6 +541,71 @@ async function showHistory(channel, lines = 40) {
     addSys('— ここから今 —');
     log.scrollTop = log.scrollHeight;
   } catch { addSys('履歴を読めなかった(📄 会話ログから見てね)'); }
+}
+
+// ---- 音声ナビ: 話すだけで画面を動かす(ボタンを押さなくていい)----
+// 「部屋一覧見せて」「雑談部屋に行って」「履歴出して」「閉じて」等。会話に紛れて誤爆しないよう、
+// 短い言い切り(14 字以内)か「見せて/開いて/行って」等の指示語がある時だけ拾う。
+// >>> navIntent(pure: test/check-nav.mjs から取り出して単体で検査する)
+function navIntent(text, rooms) {
+  const t = (text || '').replace(/\s|[、。!?！?]/g, '');
+  const verb = /(開い|ひらい|見せ|みせ|表示|出して|行っ|いっ|入っ|はいっ|移動|切り替え|きりかえ|戻|もど|閉じ|とじ)/.test(t);
+  const short = t.length <= 14;
+  if (!verb && !short) return null;
+  const has = (...words) => words.some((w) => t.includes(w));
+  if (has('閉じ', 'とじ', '消して', '戻って', 'もどって')) return { kind: 'close' };
+  if (has('部屋一覧', '部屋の一覧', '部屋のリスト', '部屋リスト', 'どんな部屋', '部屋どれ')) return { kind: 'rooms' };
+  if (has('アーカイブ', '過去ログ', '昔のログ')) return { kind: 'archive' };
+  if (has('履歴', 'ログ', 'りれき')) return { kind: 'history' };
+  if (has('ボード', 'タスク', '進捗', '作業状況')) return { kind: 'board' };
+  if (has('設定', 'せってい')) return { kind: 'settings' };
+  // 部屋の名前で入室。まず正式名(「雑談部屋」)、次に語幹(「雑談」)+ 指示語
+  const names = (rooms || []).map((r) => ({ channel: r.channel, name: (r.label || '').replace(/[^\p{L}\p{N}]/gu, '') }));
+  for (const r of names) if (r.name && t.includes(r.name)) return { kind: 'enter', channel: r.channel };
+  for (const r of names) {
+    const stem = r.name.replace(/(部屋|ルーム)$/, '');
+    if (verb && stem.length >= 2 && t.includes(stem)) return { kind: 'enter', channel: r.channel };
+  }
+  return null;
+}
+// <<< navIntent
+
+function handleNav(text) {
+  const intent = navIntent(text, roomList);
+  if (!intent) return false;
+  if (intent.kind === 'close') {
+    openPanel(null);
+    previewEl.classList.remove('open');
+    addSys('閉じたよ');
+  } else if (intent.kind === 'rooms' || intent.kind === 'board' || intent.kind === 'settings') {
+    // 「見せて」は常に開く方向(既に開いていても閉じない)。中身は開き直して最新に
+    if (openedPanel !== intent.kind) openPanel(intent.kind);
+    else void panels[intent.kind].render();
+    addSys({ rooms: '部屋の一覧を出したよ', board: '作業ボードを出したよ', settings: '設定を出したよ' }[intent.kind]);
+  } else if (intent.kind === 'history') {
+    void showHistory(currentChannel); // 別タブは音声だと出せない(ポップアップ扱い)ので、その場に読み込む
+  } else if (intent.kind === 'archive') {
+    const w = window.open('/archives.md?token=' + TOKEN);
+    if (!w) addSysLink('アーカイブはここから見てね', '/archives.md?token=' + TOKEN);
+  } else if (intent.kind === 'enter') {
+    if (intent.channel === currentChannel) { openPanel(null); addSys('もうこの部屋にいるよ'); }
+    else void enterRoom(intent.channel);
+  }
+  setStatus('画面を動かしたよ');
+  return true;
+}
+
+// ポップアップが塞がれた時の逃げ道(音声からの window.open はブロックされる事がある)
+function addSysLink(text, href) {
+  const div = document.createElement('div');
+  div.className = 'sys';
+  const a = document.createElement('a');
+  a.href = href;
+  a.target = '_blank';
+  a.textContent = text;
+  div.appendChild(a);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
 }
 updateRoomBtn();
 async function refreshBoard() {
