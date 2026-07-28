@@ -547,18 +547,44 @@ async function showHistory(channel, lines = 40) {
 // 「部屋一覧見せて」「雑談部屋に行って」「履歴出して」「閉じて」等。会話に紛れて誤爆しないよう、
 // 短い言い切り(14 字以内)か「見せて/開いて/行って」等の指示語がある時だけ拾う。
 // >>> navIntent(pure: test/check-nav.mjs から取り出して単体で検査する)
-function navIntent(text, rooms) {
+function navIntent(text, rooms, people) {
   const t = (text || '').replace(/\s|[、。!?！?]/g, '');
-  const verb = /(開い|ひらい|見せ|みせ|表示|出して|行っ|いっ|入っ|はいっ|移動|切り替え|きりかえ|戻|もど|閉じ|とじ)/.test(t);
+  const verb = /(開い|ひらい|見せ|みせ|表示|出して|行っ|いっ|入っ|はいっ|移動|切り替え|きりかえ|戻|もど|閉じ|とじ|作っ|つくっ|作成|新し|変え|かえ|付け|つけ|変更|切って|オフ|オン|止め|やめ)/.test(t);
   const short = t.length <= 14;
   if (!verb && !short) return null;
   const has = (...words) => words.some((w) => t.includes(w));
+
+  // 作る・名前を変える(部屋そのものを操作する言葉。部屋名の一致より先に見る)
+  const named = (re) => t.match(re)?.[1]?.replace(/^(を|の|は)/, '').slice(0, 30) || null;
+  if (has('新しい部屋', '新規部屋', '部屋を作', '部屋作', 'ルームを作', '部屋立て', '部屋を立て')) {
+    return { kind: 'create', name: named(/(.+?)(って|という|っていう|の)(名前で)?(部屋|ルーム)を?(作|立)/) || named(/名前は(.+)$/) };
+  }
+  if (has('名前を', '名前は', '名前変え', '改名', 'リネーム')) {
+    const name = named(/名前(?:を|は)(.+?)(に|へ)(して|変え|変更|し$)/) || named(/名前(?:を|は)(.+)$/);
+    if (name) return { kind: 'rename', name };
+    return { kind: 'rename', name: null };
+  }
+
   if (has('閉じ', 'とじ', '消して', '戻って', 'もどって')) return { kind: 'close' };
   if (has('部屋一覧', '部屋の一覧', '部屋のリスト', '部屋リスト', 'どんな部屋', '部屋どれ')) return { kind: 'rooms' };
   if (has('アーカイブ', '過去ログ', '昔のログ')) return { kind: 'archive' };
+  if (has('会話ログ', 'ログファイル', '全部のログ')) return { kind: 'logfile' };
   if (has('履歴', 'ログ', 'りれき')) return { kind: 'history' };
+  if (has('成果物', 'プレビュー', 'できたやつ', '作ったやつ', '出来上がり')) return { kind: 'artifact' };
   if (has('ボード', 'タスク', '進捗', '作業状況')) return { kind: 'board' };
   if (has('設定', 'せってい')) return { kind: 'settings' };
+  if (has('マイク', 'ハンズフリー')) {
+    return { kind: 'mic', on: !has('切って', 'オフ', 'off', '止め', 'やめ', '消して') };
+  }
+
+  // 話し相手の指名(在室リストの操作)
+  if (has('みんな') && verb) return { kind: 'speaker', participantId: null };
+  for (const p of people || []) {
+    if (p.name && t.includes(p.name) && /(と話|に話|に聞|と喋|に頼|呼んで|指名|に伝え)/.test(t)) {
+      return { kind: 'speaker', participantId: p.participantId, name: p.name };
+    }
+  }
+
   // 部屋の名前で入室。まず正式名(「雑談部屋」)、次に語幹(「雑談」)+ 指示語
   const names = (rooms || []).map((r) => ({ channel: r.channel, name: (r.label || '').replace(/[^\p{L}\p{N}]/gu, '') }));
   for (const r of names) if (r.name && t.includes(r.name)) return { kind: 'enter', channel: r.channel };
@@ -570,8 +596,17 @@ function navIntent(text, rooms) {
 }
 // <<< navIntent
 
+// 部屋の作成 / 名前変更の操作部品は #roomsExtra に他機能が載せる。音声からも押せるように
+// data-voice="create-room" / "rename-room" / "room-name-input" を付けてもらう約束(無ければ案内を出す)。
+function voiceTarget(name) { return document.querySelector(`[data-voice="${name}"]`); }
+function showPanelForce(name) {
+  if (openedPanel !== name) openPanel(name);
+  else void panels[name].render();
+}
+
 function handleNav(text) {
-  const intent = navIntent(text, roomList);
+  const people = [...pidNames].map(([participantId, name]) => ({ participantId, name }));
+  const intent = navIntent(text, roomList, people);
   if (!intent) return false;
   if (intent.kind === 'close') {
     openPanel(null);
@@ -579,20 +614,58 @@ function handleNav(text) {
     addSys('閉じたよ');
   } else if (intent.kind === 'rooms' || intent.kind === 'board' || intent.kind === 'settings') {
     // 「見せて」は常に開く方向(既に開いていても閉じない)。中身は開き直して最新に
-    if (openedPanel !== intent.kind) openPanel(intent.kind);
-    else void panels[intent.kind].render();
+    showPanelForce(intent.kind);
     addSys({ rooms: '部屋の一覧を出したよ', board: '作業ボードを出したよ', settings: '設定を出したよ' }[intent.kind]);
   } else if (intent.kind === 'history') {
     void showHistory(currentChannel); // 別タブは音声だと出せない(ポップアップ扱い)ので、その場に読み込む
-  } else if (intent.kind === 'archive') {
-    const w = window.open('/archives.md?token=' + TOKEN);
-    if (!w) addSysLink('アーカイブはここから見てね', '/archives.md?token=' + TOKEN);
+  } else if (intent.kind === 'archive' || intent.kind === 'logfile') {
+    const href = intent.kind === 'archive'
+      ? '/archives.md?token=' + TOKEN
+      : '/transcript.md?token=' + TOKEN + '&channel=' + currentChannel;
+    const w = window.open(href);
+    if (!w) addSysLink(intent.kind === 'archive' ? 'アーカイブはここから見てね' : '会話ログはここから見てね', href);
+  } else if (intent.kind === 'artifact') {
+    void showLatestArtifact();
+  } else if (intent.kind === 'mic') {
+    if (handsfree !== intent.on) micBtn.click();
+    addSys(intent.on ? 'マイクつけたよ' : 'マイク切ったよ');
+  } else if (intent.kind === 'speaker') {
+    void (async () => {
+      await post('/select', { participantId: intent.participantId });
+      void refreshRoster();
+      addSys(intent.participantId ? `${intent.name} に話しかける設定にしたよ` : 'みんな(自動)に戻したよ');
+    })();
+  } else if (intent.kind === 'create') {
+    showPanelForce('rooms');
+    const input = voiceTarget('room-name-input');
+    if (intent.name && input) input.value = intent.name;
+    const btn = voiceTarget('create-room');
+    if (btn) { btn.click(); addSys(intent.name ? `「${intent.name}」で部屋を作るね` : '部屋を作る画面を出したよ'); }
+    else { input?.focus(); addSys('部屋の一覧を出したよ(作成の操作はここに出るよ)'); }
+  } else if (intent.kind === 'rename') {
+    showPanelForce('rooms');
+    const input = voiceTarget('room-name-input');
+    if (intent.name && input) input.value = intent.name;
+    const btn = voiceTarget('rename-room');
+    if (btn) { btn.click(); addSys(intent.name ? `この部屋の名前を「${intent.name}」にするね` : '名前を変える画面を出したよ'); }
+    else { input?.focus(); addSys('部屋の一覧を出したよ(名前の変更はここからだよ)'); }
   } else if (intent.kind === 'enter') {
     if (intent.channel === currentChannel) { openPanel(null); addSys('もうこの部屋にいるよ'); }
     else void enterRoom(intent.channel);
   }
   setStatus('画面を動かしたよ');
   return true;
+}
+
+// 「成果物見せて」: 直近で出来た成果物をその場のプレビューで開く
+async function showLatestArtifact() {
+  try {
+    const d = await (await post('/tasks', {})).json();
+    const rows = [...(d.tasks ?? []), ...(d.open ?? [])].filter((t) => (t.artifacts ?? []).length > 0);
+    const last = rows[rows.length - 1];
+    if (!last) { addSys('まだ成果物は無いよ'); return; }
+    showPreview(last.artifacts[last.artifacts.length - 1]);
+  } catch { addSys('成果物を取れなかった'); }
 }
 
 // ポップアップが塞がれた時の逃げ道(音声からの window.open はブロックされる事がある)
