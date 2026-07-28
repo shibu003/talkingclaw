@@ -549,8 +549,19 @@ async function showHistory(channel, lines = 40) {
 // 「部屋一覧見せて」「雑談部屋に行って」「履歴出して」「閉じて」等。会話に紛れて誤爆しないよう、
 // 短い言い切り(14 字以内)か「見せて/開いて/行って」等の指示語がある時だけ拾う。
 // >>> navIntent(pure: test/check-nav.mjs から取り出して単体で検査する)
-function navIntent(text, rooms, people) {
+function navIntent(text, rooms, people, hasPlan) {
   const t = (text || '').replace(/\s|[、。!?！?]/g, '');
+
+  // 相談の締め: 案が画面に出ている間だけ「終わり」「それでいこう」等を確定の合図として受ける。
+  // 案が無い時は普通の会話なので何も横取りしない。直しの言葉が混じっていたら確定しない。
+  if (hasPlan && t.length <= 24) {
+    if (/(やめ|中止|無し|キャンセル|取り下げ|忘れて|白紙)/.test(t)) return { kind: 'plan-cancel' };
+    const revising = /(でも|けど|直し|なおし|変え|かえ|待っ|ちょっと|違う|ちがう|別の|もう一度|やり直)/.test(t);
+    if (!revising && /(終わり|おわり|以上|それでいこう|これでいこう|それでいい|これでいい|いいよ|お願い|おねがい|進め|始め|はじめ|やって|やろう|やっちゃ|決まり|確定|ゴー|オッケー|おっけー|了解|大丈夫)/.test(t)) {
+      return { kind: 'plan-confirm' };
+    }
+  }
+
   const verb = /(開い|ひらい|見せ|みせ|表示|出して|行っ|いっ|入っ|はいっ|移動|切り替え|きりかえ|戻|もど|閉じ|とじ|作っ|つくっ|作成|新し|変え|かえ|付け|つけ|変更|切って|オフ|オン|止め|やめ)/.test(t);
   const short = t.length <= 14;
   if (!verb && !short) return null;
@@ -608,8 +619,12 @@ function showPanelForce(name) {
 
 function handleNav(text) {
   const people = [...pidNames].map(([participantId, name]) => ({ participantId, name }));
-  const intent = navIntent(text, roomList, people);
+  const intent = navIntent(text, roomList, people, planActive);
   if (!intent) return false;
+  if (intent.kind === 'plan-confirm' || intent.kind === 'plan-cancel') {
+    void planAction(intent.kind === 'plan-confirm' ? 'confirm' : 'cancel');
+    return true;
+  }
   if (intent.kind === 'close') {
     openPanel(null);
     previewEl.classList.remove('open');
@@ -723,7 +738,9 @@ function progressSummary(rows) {
 // ---- 相談モード: まとまるまで作業は始まらない。案は画面に出して合図を待つ ----
 // 音声からの確定も同じ道を通す: post('/plan', { action: 'confirm' })
 const planEl = document.getElementById('plan');
+let planActive = false; // 案が画面に出ている間だけ「終わり」等の合図を確定として受け取る
 function renderPlan(p) {
+  planActive = !!p;
   planEl.classList.toggle('on', !!p);
   if (!p) return;
   planEl.replaceChildren();
@@ -749,6 +766,10 @@ function renderPlan(p) {
   stop.onclick = () => void planAction('cancel');
   acts.append(go, stop);
   planEl.appendChild(acts);
+  const hint = document.createElement('p');
+  hint.className = 'tnote';
+  hint.textContent = '声でもいいよ —「終わり」「それでいこう」で着手、「やめて」で取り下げ';
+  planEl.appendChild(hint);
 }
 async function planAction(action) {
   try {

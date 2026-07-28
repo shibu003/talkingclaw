@@ -13,8 +13,8 @@ const ROOMS = [
 ];
 const PEOPLE = [{ participantId: 'p1', name: 'コハク' }, { participantId: 'p2', name: 'まい' }];
 let fail = 0;
-const eq = (text, want) => {
-  const got = navIntent(text, ROOMS, PEOPLE);
+const eq = (text, want, hasPlan = false) => {
+  const got = navIntent(text, ROOMS, PEOPLE, hasPlan);
   const detail = got ? (got.channel ?? got.name ?? (got.kind === 'mic' ? (got.on ? 'on' : 'off') : got.participantId)) : null;
   const g = got ? got.kind + (detail ? ':' + detail : '') : 'null';
   if (g !== want) { console.log(`  ❌ 「${text}」→ ${g}(期待: ${want})`); fail = 1; }
@@ -61,6 +61,25 @@ eq('戻って', 'close');             // 画面を戻す方は close
 eq('みんなに切り替えて', 'speaker');
 // 作る・変えるの言葉でも、雑談は拾わない
 eq('新しいカフェができたらしいよ、今度いっしょに行ってみたいなって思ってるんだけど', 'null');
+
+// 相談の締め(第 4 引数 = 案が画面に出ているか)
+const P = true;
+eq('終わり', 'plan-confirm', P);
+eq('それでいこう', 'plan-confirm', P);
+eq('オッケー、それでお願い', 'plan-confirm', P);
+eq('じゃあ始めて', 'plan-confirm', P);
+eq('やっぱやめて', 'plan-cancel', P);
+eq('キャンセルで', 'plan-cancel', P);
+// 直したい時は確定しない(相談を続ける)
+eq('でも二番目のところ変えてほしい', 'null', P);
+eq('ちょっと待って', 'null', P);
+eq('もう一度考えて', 'null', P);
+// 案が出ていない時は普通の会話として素通しする
+eq('終わり', 'null');
+eq('それでいこう', 'null');
+// 案が出ていても画面移動の言葉はこれまで通り効く
+eq('部屋一覧見せて', 'rooms', P);
+eq('マイク切って', 'mic:off', P);
 
 console.log(fail === 0 ? '  ✅ 音声ナビの言葉の判定は全部期待どおり' : '');
 process.exit(fail);
