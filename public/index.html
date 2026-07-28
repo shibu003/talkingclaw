@@ -59,6 +59,11 @@
   .chip.active { color: var(--text); }
   .chip.selected { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 700; }
   .chip.gone { opacity: .5; }
+  /* 別の部屋にいる相手はグレー。押すと「呼ぶ?」が出る */
+  .chip.away { opacity: .55; border-style: dashed; }
+  .chip .where { margin-left: 6px; font-size: 12px; color: var(--muted); }
+  .invite { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%; margin-top: 8px;
+            font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
 
   /* ---- パネル(部屋・ボード・設定は同時に 1 枚だけ)---- */
   .panel { display: none; margin: 10px var(--pad) 0; padding: 14px 16px; background: var(--surface);

@@ -60,6 +60,8 @@ function roomPrompt(ch: Channel): string {
   return `\n\n# 今いる部屋\nここは「${roomLabel(ch)}」の部屋。この部屋の話題に集中して、他の部屋の話は持ち込まない`;
 }
 let activeChannel: Channel = 'work';
+// 誰がどの部屋にいるか。内蔵クロエだけはどの部屋にもいる(この map に載せない)
+const participantRoom = new Map<string, Channel>();
 function isChannel(v: unknown): v is Channel {
   return typeof v === 'string' && rooms.some((r) => r.id === v);
 }
@@ -1712,6 +1714,8 @@ const server = createServer(async (req, res) => {
         name: p.assignedName,
         presence: registry.presence(p, waiters.has(p.participantId)),
         voice: p.voice.status,
+        // null = どの部屋にもいる(内蔵クロエ)。それ以外は今いる部屋と比べてグレーにする
+        room: p.participantId === chloePid ? null : (participantRoom.get(p.participantId) ?? 'work'),
       })),
     });
   }
@@ -1734,6 +1738,7 @@ const server = createServer(async (req, res) => {
     const outcome = registry.join(requestedName, String(body.voice ?? ''), store.lastId, store.bootId, resume);
     if ('error' in outcome) return json(res, 400, { error: outcome.error });
     const { participant: p, mode } = outcome;
+    if (!participantRoom.has(p.participantId)) participantRoom.set(p.participantId, activeChannel); // 入ってきた相手は今いる部屋へ
     if (engineState === 'ready' && p.voice.status !== 'ready') {
       const speaker = await resolveVoice(p.voice.requested);
       p.voice.resolvedSpeaker = speaker;
@@ -1981,6 +1986,17 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: true, channel: target, label, rooms });
     }
     return json(res, 400, { error: 'action は create / rename' });
+  }
+
+  // 別の部屋にいる相手を、今いる部屋に呼ぶ
+  if (path === '/invite') {
+    const pid = String(body.participantId ?? '');
+    const p = registry.get(pid);
+    if (!p) return json(res, 400, { error: 'その相手は見つかりません' });
+    if (pid === chloePid) return json(res, 200, { ok: true, room: null }); // クロエはどこにでもいる
+    participantRoom.set(pid, activeChannel);
+    store.append({ type: 'presence', from: pid, name: p.assignedName, text: `${roomLabel(activeChannel)}に来たよ`, channel: activeChannel });
+    return json(res, 200, { ok: true, room: activeChannel });
   }
 
   if (path === '/channel') {

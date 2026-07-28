@@ -477,8 +477,17 @@ async function refreshRoster() {
       pidNames.set(p.participantId, p.name);
       const chip = document.createElement('span');
       chip.className = 'chip ' + (p.presence === 'gone' ? 'gone' : 'active') + (p.participantId === selectedPid ? ' selected' : '');
+      // 別の部屋にいる相手はグレー。押すと「呼ぶ?」を出す(いきなり動かさない)
+      const elsewhere = p.room != null && p.room !== currentChannel;
+      chip.classList.toggle('away', elsewhere);
       const job = lastBoardRows.find((t) => t.status === 'working' && t.agentName === p.name);
       chip.textContent = p.name + (p.voice !== 'ready' ? '(声なし)' : '');
+      if (elsewhere) {
+        const where = document.createElement('span');
+        where.className = 'where';
+        where.textContent = roomLabel(p.room).replace(/^[^\p{L}]+/u, '');
+        chip.appendChild(where);
+      }
       if (job) {
         const busy = document.createElement('span');
         busy.className = 'busy';
@@ -487,6 +496,7 @@ async function refreshRoster() {
         chip.title = job.request ?? '';
       }
       chip.onclick = async () => {
+        if (elsewhere) return askInvite(p);   // 別の部屋にいる = まず呼ぶかどうか
         const next = selectedPid === p.participantId ? null : p.participantId;
         await post('/select', { participantId: next });
         void refreshRoster();
@@ -494,6 +504,28 @@ async function refreshRoster() {
       rosterEl.appendChild(chip);
     }
   } catch { /* 次の更新で */ }
+}
+// 別の部屋にいる相手を呼ぶかどうかを、その場で選ばせる(勝手に動かさない)
+function askInvite(p) {
+  const box = document.createElement('span');
+  box.className = 'invite';
+  const q = document.createElement('span');
+  q.textContent = `${p.name} は${roomLabel(p.room)}にいるよ。呼ぶ?`;
+  const yes = document.createElement('button');
+  yes.className = 'tact';
+  yes.textContent = '呼ぶ';
+  yes.onclick = async () => {
+    const r = await post('/invite', { participantId: p.participantId });
+    if (!r.ok) addSys('呼べなかった');
+    else addSys(`${p.name} を${roomLabel(currentChannel)}に呼んだよ`);
+    void refreshRoster();
+  };
+  const no = document.createElement('button');
+  no.className = 'tact';
+  no.textContent = 'やめる';
+  no.onclick = () => void refreshRoster();
+  box.append(q, yes, no);
+  rosterEl.appendChild(box);
 }
 setInterval(refreshRoster, 5000);
 void refreshRoster();
