@@ -284,6 +284,7 @@ const HELP = `${c.bold('コマンド')}
   /log [n]         直近の会話ログ
   /v               マイクで 1 回話す(macOS の音声認識)
   /v on | /v off   ハンズフリー(連続で聞き取る / 止める)
+  /dict [add 誤 正] 聞き間違いの補正辞書(表示 / 追加)
   /mute            再生中の音を止める
   /quit            終了(部屋は動き続ける)
 それ以外の入力はそのまま部屋への発言になります。`;
@@ -308,6 +309,19 @@ async function main(): Promise<void> {
     if (line === '/quit' || line === '/exit') break;
     if (line === '/help') { console.log(HELP); continue; }
     if (line === '/mute') { stopAudio(); console.log(c.dim('  止めたよ')); continue; }
+    if (line.startsWith('/dict')) {
+      const parts = line.split(/\s+/);
+      if (parts[1] === 'add' && parts[2] && parts[3]) {
+        const d = await api('/dict', { wrong: parts[2], right: parts[3] });
+        console.log(c.dim(`  「${parts[2]}」→「${parts[3]}」を覚えたよ(${Object.keys((d.dictionary as object) ?? {}).length} 語)`));
+      } else {
+        const d = await api('/dict', {});
+        const dict = (d.dictionary ?? {}) as Record<string, string>;
+        for (const [k, v] of Object.entries(dict).slice(0, 30)) console.log(c.dim(`  ${k} → ${v}`));
+        console.log(c.dim('  追加: /dict add <誤って聞こえる語> <正しい語>'));
+      }
+      continue;
+    }
     if (line === '/v' || line.startsWith('/v ')) {
       const arg = line.split(/\s+/)[1];
       if (!(await ensureListenBin())) { console.log(c.sys('  音声入力をビルドできませんでした(swiftc が要ります)')); continue; }
