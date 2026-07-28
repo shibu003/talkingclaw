@@ -10,6 +10,7 @@
     "setup-voice": "node scripts/setup-voice.mjs",
     "metrics": "node scripts/metrics-report.mjs",
     "cost": "node scripts/cost-report.mjs",
+    "split-log": "node scripts/split-transcript.mjs",
     "cli": "node src/cli.ts",
     "check-ui": "node test/check-ui.mjs && node test/check-nav.mjs && node test/check-git.mjs",
     "setup-stt": "swiftc -O tools/listen.swift -o tools/claw-listen -framework Speech -framework AVFoundation"
