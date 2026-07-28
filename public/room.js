@@ -206,6 +206,8 @@ function render(ev) {
     bubbles.delete('last');
     if (ev.type === 'presence' && typeof refreshRoster === 'function') setTimeout(() => refreshRoster(), 100);
   }
+  // 部屋で何か起きた = 作業の状態も変わっている可能性。進捗表示をすぐ取り直す
+  boardSoon();
 }
 
 // ---- daemon 再起動検出(S8: EventSource は 401 を読めない → 無認証 /health を poll)----
@@ -722,6 +724,7 @@ const progressEl = document.getElementById('progress');
 progressEl.onclick = () => showPanelForce('board');
 function renderProgress(rows) {
   const s = progressSummary(rows);
+  boardActive = s.counts.working + s.counts.queued > 0; // 動いている間は更新を速く
   progressEl.classList.toggle('on', s.total > 0);
   if (s.total === 0) return;
   progressEl.replaceChildren();
@@ -760,6 +763,8 @@ function renderProgress(rows) {
 }
 
 async function refreshBoard() {
+  if (boardBusy) return; // 取得が重ならないように(SSE 連打 + 定期更新)
+  boardBusy = true;
   try {
     const r = await post('/tasks', {});
     const d = await r.json();
@@ -809,7 +814,10 @@ async function refreshBoard() {
       }
       boardEl.appendChild(div);
     }
-  } catch { /* 次回 */ }
+  } catch { /* 次回 */ } finally {
+    boardBusy = false;
+    scheduleBoard(); // 次の更新を状況に合わせて予約(作業中は速く)
+  }
 }
 function checkAutoPreview(d) {
   for (const t of d.tasks ?? []) {
@@ -819,7 +827,24 @@ function checkAutoPreview(d) {
     }
   }
 }
-setInterval(refreshBoard, 5000);
+// ---- 進捗をリアルタイムに保つ ----
+// ① 部屋の出来事(SSE)が来たら即取り直す ② 作業が動いている間は速く、無い時はゆっくり
+// ③ 裏に回ったタブでは止め、戻ってきたら即更新(無駄打ちしない)
+let boardTimer = null;
+let boardPending = null;
+let boardBusy = false;
+let boardActive = false;   // renderProgress が「作業中/待機がある」を教えてくれる
+function boardSoon(ms = 250) {
+  clearTimeout(boardPending);
+  boardPending = setTimeout(() => void refreshBoard(), ms);
+}
+function scheduleBoard() {
+  clearTimeout(boardTimer);
+  if (document.hidden) return;
+  boardTimer = setTimeout(() => void refreshBoard(), boardActive ? 1200 : 5000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshBoard(); });
+void refreshBoard();
 
 // ---- W8-7: worker 設定パネル ----
 const settingsEl = document.getElementById('settingsBody');

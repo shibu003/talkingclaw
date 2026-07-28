@@ -91,7 +91,7 @@
   .s-done { background: #4c9e68; } .s-working { background: var(--accent); }
   .s-queued { background: #4d4270; } .s-failed { background: #b0455f; }
   .pbar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: #2c2440; }
-  .pbar i { display: block; height: 100%; }
+  .pbar i { display: block; height: 100%; transition: width .35s ease; } /* 件数が変わると滑らかに伸縮 */
   .pbar .s-working {
     background-image: linear-gradient(115deg, rgba(255,255,255,.34) 25%, transparent 25%, transparent 50%,
                                        rgba(255,255,255,.34) 50%, rgba(255,255,255,.34) 75%, transparent 75%);
