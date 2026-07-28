@@ -595,16 +595,18 @@ async function refreshRoster() {
     label.className = 'label';
     label.textContent = '話す相手:';
     rosterEl.appendChild(label);
-    const auto = document.createElement('span');
+    const auto = document.createElement('button');
     auto.className = 'chip active' + (selectedPid === null ? ' selected' : '');
+    auto.setAttribute('aria-pressed', String(selectedPid === null));
     auto.textContent = 'みんな(自動)';
     auto.onclick = async () => { await post('/select', { participantId: null }); void refreshRoster(); };
     rosterEl.appendChild(auto);
     for (const p of d.participants) {
       pidNames.set(p.participantId, p.name);
       if (p.room) pidRooms.set(p.participantId, p.room);
-      const chip = document.createElement('span');
+      const chip = document.createElement('button');
       chip.className = 'chip ' + (p.presence === 'gone' ? 'gone' : 'active') + (p.participantId === selectedPid ? ' selected' : '');
+      chip.setAttribute('aria-pressed', String(p.participantId === selectedPid));
       // 別の部屋にいる相手はグレー。押すと「呼ぶ?」を出す(いきなり動かさない)
       const elsewhere = p.room != null && p.room !== currentChannel;
       chip.classList.toggle('away', elsewhere);
@@ -712,6 +714,9 @@ function shotOf(relPath, project, onFail) {
   img.src = fileUrl(relPath, project);
   img.onerror = () => { img.remove(); onFail?.(); };
   img.onclick = () => showPreview(relPath, project);
+  img.tabIndex = 0;                                  // キーボードでも開ける
+  img.setAttribute('role', 'button');
+  img.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showPreview(relPath, project); } };
   return img;
 }
 
@@ -769,7 +774,13 @@ document.getElementById('archiveBtn').onclick = () => window.open('/archives.md?
 const roomBtnName = document.querySelector('#roomBtn .rname');
 let roomList = [{ channel: 'work', label: ROOM_LABEL.work }, { channel: 'chat', label: ROOM_LABEL.chat }];
 function roomLabel(ch) { return roomList.find((r) => r.channel === ch)?.label ?? ROOM_LABEL[ch] ?? ch; }
-function updateRoomBtn() { roomBtnName.textContent = roomLabel(currentChannel); }
+let unreadCount = 0;
+function updateRoomBtn() {
+  roomBtnName.textContent = roomLabel(currentChannel);
+  document.getElementById('roomTitle').textContent = roomLabel(currentChannel);
+  // タブに出る名前: 未読 → 部屋名 の順。何が起きているかがタブだけで分かる
+  document.title = (unreadCount > 0 ? `(${unreadCount}) ` : '') + roomLabel(currentChannel) + ' — talkingclaw';
+}
 async function fetchRooms() {
   try {
     const r = await fetch('/channels?token=' + TOKEN);
@@ -1221,8 +1232,11 @@ function switchBoardTab(view) {
   openSide(true);
   inboxTab = sideView !== 'artifact';
   for (const [name, [el, btnId]] of Object.entries(SIDE_VIEWS)) {
-    el.hidden = name !== sideView;
-    document.getElementById(btnId).classList.toggle('on', name === sideView);
+    const on = name === sideView;
+    el.hidden = !on;
+    const btn = document.getElementById(btnId);
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-selected', String(on));   // 見た目だけのタブにしない
   }
   void (sideView === 'inbox' ? refreshInbox() : sideView === 'game' ? refreshGame() : refreshBoard());
   document.body.classList.toggle('playing', gameKind !== null && sideView === 'game');
@@ -1640,7 +1654,8 @@ async function refreshInbox() {
     const unread = d.unread ?? 0;
     inboxCountEl.textContent = unread > 0 ? String(unread) : '';
     boardBadgeEl.textContent = unread > 0 ? String(unread) : '';   // 狭い画面の 📋 に付ける赤丸
-    document.title = (unread > 0 ? `(${unread}) ` : '') + 'talkingclaw — 声の部屋';
+    unreadCount = unread;
+    updateRoomBtn();   // タイトルは部屋名と未読を 1 か所で組み立てる
     if (!inboxTab) return;
     inboxEl.replaceChildren();
     if ((d.threads ?? []).length === 0) {

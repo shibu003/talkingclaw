@@ -49,10 +49,15 @@
   #roomBtn:hover { border-color: var(--accent); }
   #roomBtn .rname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #roomBtn .caret { color: var(--muted); font-size: 12px; }
+  /* 見出しの頂点。今どの部屋を見ているかを文書構造としても示す */
+  #roomTitle { display: none; font-size: var(--fs-ui); font-weight: 700; line-height: 1.4;
+               letter-spacing: .02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #status { font-size: var(--fs-small); line-height: 1.5; color: var(--muted); margin-left: auto; text-align: right; }
   .tools { display: flex; gap: 2px; }
+  /* 触れる的は 44px 以上。見た目のアイコンは小さいままで、押せる範囲だけ広げる */
   .hbtn { background: transparent; border: 1px solid transparent; color: var(--muted);
-          border-radius: var(--r-sm); padding: 7px 10px; font-size: 16px; line-height: 1; }
+          border-radius: var(--r-sm); padding: 7px 10px; font-size: 16px; line-height: 1;
+          min-width: 44px; min-height: 44px; }
   .hbtn:hover { background: var(--surface-2); color: var(--text); }
   .hbtn[aria-expanded="true"] { background: var(--surface-2); border-color: var(--accent); color: var(--text); }
 
@@ -169,12 +174,13 @@
   /* 自分で片付けるためのボタン(直す・やめる・消す)*/
   .tacts { display: flex; gap: 6px; margin-top: 7px; }
   .tact { background: transparent; border: 1px solid var(--line); color: var(--muted);
-          border-radius: 999px; padding: 3px 11px; font-size: 12.5px; line-height: 1.5; }
+          border-radius: 999px; padding: 7px 13px; font-size: 12.5px; line-height: 1.5; min-height: 32px; }
   .tact:hover { border-color: var(--accent); color: var(--text); }
   .tedit { width: 100%; background: var(--surface-2); border: 1px solid var(--accent); color: var(--text);
            border-radius: var(--r-sm); padding: 6px 10px; font-size: var(--fs-small); }
   /* 選んでまとめて操作する(会話以外の一覧に共通)*/
-  .pick { width: 15px; height: 15px; margin-right: 8px; accent-color: var(--accent); vertical-align: middle; }
+  .pick { width: 18px; height: 18px; margin-right: 8px; padding: 12px; accent-color: var(--accent);
+          vertical-align: middle; }
   .pickbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px;
              padding-top: 10px; border-top: 1px solid var(--surface-2);
              font-size: var(--fs-small); line-height: 1.5; color: var(--muted); }
@@ -246,13 +252,13 @@
   #composer.drop { border-color: var(--accent); }
   .ctools { display: flex; align-items: center; gap: 4px; }
   .cspacer { flex: 1; }
-  #mic { width: 34px; height: 34px; border-radius: 50%; border: none; background: var(--surface-2);
-         font-size: 17px; flex-shrink: 0; transition: background .2s, transform .2s; }
+  #mic { width: 44px; height: 44px; border-radius: 50%; border: none; background: var(--surface-2);
+         font-size: 18px; flex-shrink: 0; transition: background .2s, transform .2s; }
   #mic.on { background: var(--accent); color: var(--accent-ink); }
   #mic.listening { background: var(--hot); color: #fff; animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { transform: scale(1.08); } }
-  #text { width: 100%; min-width: 0; padding: 6px 6px 2px; border: 0; background: transparent;
-          font-size: var(--fs-body); line-height: 1.6; outline: none; }
+  #text { width: 100%; min-width: 0; min-height: 44px; padding: 10px 6px 6px; border: 0;
+          background: transparent; font-size: var(--fs-body); line-height: 1.6; outline: none; }
   /* 送る前の添付。押すと外せる */
   #attached:empty { display: none; }
   #attached { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -349,8 +355,8 @@
   #gameList .grules { margin-top: 6px; font-size: var(--fs-small); line-height: 1.8; color: var(--muted); }
   #text::placeholder { color: var(--muted); }
   #text:focus { border-color: var(--accent); }
-  #send { width: 34px; height: 34px; border-radius: 50%; border: 0;
-          background: var(--accent); color: var(--accent-ink); font-size: 15px; flex-shrink: 0; }
+  #send { width: 44px; height: 44px; border-radius: 50%; border: 0;
+          background: var(--accent); color: var(--accent-ink); font-size: 16px; flex-shrink: 0; }
   #send:hover { filter: brightness(1.1); }
 
   /* ---- 報告スレッドと成果物プレビュー(右レーンの中身)---- */
@@ -397,7 +403,8 @@
   .shot { display: block; width: 100%; max-height: 190px; object-fit: contain; object-position: left;
           margin-top: 10px; border-radius: var(--r-sm); background: #fff; cursor: zoom-in; }
   .files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  .files a { display: inline-block; padding: 5px 12px; border-radius: 999px; background: var(--surface-2);
+  .files a { display: inline-flex; align-items: center; min-height: 36px; padding: 7px 13px;
+             border-radius: 999px; background: var(--surface-2);
              border: 1px solid var(--line); color: var(--text); font-size: var(--fs-small); line-height: 1.5;
              text-decoration: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .files a:hover { border-color: var(--accent); }
@@ -427,6 +434,7 @@
     #notice, #plan, #rooms { max-width: 760px; margin-left: auto; margin-right: auto; width: 100%; }
     /* 部屋はレールで選ぶので、ヘッダのボタンは要らない。在室をここに出す */
     #roomBtn { display: none; }
+    #roomTitle { display: block; }
     header #roster { display: flex; padding: 0; gap: 6px; }
     /* 右レーンは常設しない。プレビューを開いた時と 📋 で呼んだ時だけ現れる */
     /* 幅は掴んで動かせる(--nav-w / --side-w に入る。localStorage に覚える)*/
@@ -487,6 +495,16 @@
     .lane.nav .task .tnote { display: none; }  /* 実況は進捗の帯に出るので繰り返さない */
   }
 
+  /* 指で押す幅では触れる的を 44px に上げる。広い画面は主にマウスなので、
+     密なレールとチップは 32px のままにして縦を詰める(両立させるための線引き)*/
+  @media (max-width: 1099px) {
+    .chip { min-height: 44px; padding: 10px 14px; }
+    .files a { min-height: 44px; }
+    .tact { min-height: 44px; padding: 11px 15px; }
+    #roomBtn { min-height: 44px; }
+    .tab { min-height: 44px; padding: 10px 15px; }
+    .linkbtn { min-height: 44px; }
+  }
   @media (max-width: 480px) { :root { --pad: 14px; } #roomBtn { max-width: 100%; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
@@ -496,6 +514,7 @@
   <button id="roomBtn" title="部屋を選ぶ" aria-expanded="false">
     <span class="rname">部屋</span><span class="caret">▼</span>
   </button>
+  <h1 id="roomTitle">部屋</h1>
   <div id="roster"></div>
   <div id="status">接続中…</div>
   <div class="tools">
@@ -507,7 +526,7 @@
 <div id="plan"></div>
 <!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
      display:contents になり、今までどおり会話の上に積まれる -->
-<div class="lane nav">
+<nav class="lane nav" aria-label="部屋">
 <div id="rooms" class="panel">
   <h2>部屋</h2>
   <div id="roomList"></div>
@@ -522,20 +541,20 @@
 </div>
 <button id="progress" title="進行中の作業を開く"></button>
 <div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
-</div>
+</nav>
 <!-- 右レーン: 作業スペース(何ができたか)。中央の会話とは場所を取り合わない -->
-<div class="lane side">
+<aside class="lane side" aria-label="作業スペース">
 <div id="board" class="panel">
-  <div class="tabs">
-    <button id="tabArtifact" class="tab on">成果物</button>
-    <button id="tabInbox" class="tab">報告 <span id="inboxCount"></span></button>
-    <button id="tabWork" class="tab" title="進行中と終わったもの">作業</button>
-    <button id="tabGame" class="tab" title="遊ぶ">ゲーム <span id="gameBadge" class="badge"></span></button>
+  <div class="tabs" role="tablist" aria-label="作業スペースの表示">
+    <button id="tabArtifact" class="tab on" role="tab" aria-selected="true" aria-controls="artifactList">成果物</button>
+    <button id="tabInbox" class="tab" role="tab" aria-selected="false" aria-controls="inboxList">報告 <span id="inboxCount"></span></button>
+    <button id="tabWork" class="tab" role="tab" aria-selected="false" aria-controls="tasks" title="進行中と終わったもの">作業</button>
+    <button id="tabGame" class="tab" role="tab" aria-selected="false" aria-controls="gameList" title="遊ぶ">ゲーム <span id="gameBadge" class="badge"></span></button>
   </div>
-  <div id="artifactList"></div>
-  <div id="inboxList" hidden></div>
-  <div id="tasks" hidden><div id="boardList"></div><div id="historyList"></div></div>
-  <div id="gameList" hidden></div>
+  <div id="artifactList" role="tabpanel" aria-labelledby="tabArtifact"></div>
+  <div id="inboxList" role="tabpanel" aria-labelledby="tabInbox" hidden></div>
+  <div id="tasks" role="tabpanel" aria-labelledby="tabWork" hidden><div id="boardList"></div><div id="historyList"></div></div>
+  <div id="gameList" role="tabpanel" aria-labelledby="tabGame" hidden></div>
 </div>
 <div id="preview">
   <div class="phead">
@@ -545,8 +564,9 @@
   </div>
   <iframe id="previewFrame" title="成果物プレビュー"></iframe>
 </div>
-</div>
-<div id="log"></div>
+</aside>
+<!-- 会話は読み上げの対象。声の部屋なので、増えた行が読み上げられないと意味がない -->
+<main id="log" aria-live="polite" aria-relevant="additions" aria-label="会話"></main>
 <footer>
   <div id="composer">
     <div id="attached"></div>
