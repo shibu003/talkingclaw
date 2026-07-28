@@ -207,6 +207,7 @@ function applyPoker(session: Session & { kind: 'poker' }, cmd: Cmd): Reply {
 
 // 画面に出すための今の様子。ボタンは「声で言うのと同じ言葉」を持たせるので、
 // 押した時の道筋は声とまったく同じになる(判定の入口を二重に作らない)
+export type Face = { text: string; red?: boolean; hidden?: boolean; move?: string };
 export type View = {
   kind: Session['kind'] | null;
   title: string;
@@ -214,7 +215,57 @@ export type View = {
   rules: string;
   moves: { label: string; text: string }[];
   tiles: { label: string; text: string }[];
+  // 実物として見せる札・牌。move があるものは押せる(麻雀の打牌)
+  table: { label: string; kind: 'card' | 'tile'; faces: Face[] }[];
 };
+
+const RED_SUITS = ['♥', '♦'];
+const cardFace = (name: string): Face => ({ text: name, red: RED_SUITS.includes(name[0]) });
+
+/** クロエに渡す「場の説明」。同じ卓に着いている時は、ユーザーの手札を絶対に入れない */
+export function brief(session: Session | null): string {
+  if (!session) return '';
+  if (session.kind === 'blackjack') {
+    const g = session.game;
+    const open = g.phase === 'player';
+    return [
+      'いまユーザーとブラックジャックで遊んでいる。あなたがディーラー。',
+      `ルール: ${RULES_BJ}`,
+      `チップ ${g.chips} 枚 / ${g.hands} 手 ${g.wins} 勝 ${g.losses} 敗 ${g.pushes} 分。`,
+      g.player.length > 0 ? `ユーザーの手は ${bj.handText(g.player)}(${bj.handValue(g.player).total})。表向きなので見えている。` : '',
+      g.dealer.length > 0 ? `あなたの手は ${open ? `${bj.cardName(g.dealer[0])} と伏せ札(2 枚目はユーザーに言わないこと)` : bj.handText(g.dealer)}。` : '',
+      'ルールや状況を聞かれたら答えていい。ただし伏せ札は明かさない。',
+    ].filter(Boolean).join('\n');
+  }
+  if (session.kind === 'poker') {
+    const t = session.table;
+    const me = t.seats.find((s) => s.id === session.meId);
+    return [
+      'いまユーザーとポーカー(テキサスホールデム)を遊んでいる。あなたは同じ卓の相手。',
+      `ルール: ${RULES_PK}`,
+      `ポット ${pk.potOf(t)} / ${t.seats.map((s) => `${s.name} ${s.chips}${s.folded ? '(降)' : ''}`).join(' / ')}`,
+      t.board.length > 0 ? `場札は ${pk.handText(t.board)}(全員に見えている)。` : '場札はまだ無い。',
+      `いまは ${t.seats[t.toAct]?.name ?? '?'} の番。`,
+      `【重要】${me?.name ?? 'ユーザー'}の手札は伏せられていて、あなたには見えない。`,
+      '推測して言い当てようとしないこと。聞かれても「見えないよ」と答える。',
+      'ルール・ポット・場札・チップの話はしていい。',
+    ].join('\n');
+  }
+  const g = session.game;
+  const seat = g.players.findIndex((p) => p.id === session.meId);
+  const me = g.players[seat];
+  return [
+    'いまユーザーと麻雀(東風戦)を遊んでいる。あなたは同じ卓の相手。',
+    `ルール: ${RULES_MJ}`,
+    `東${g.round}局 ${g.honba}本場 / 残り ${mg.remaining(g)} 枚 / ドラ表示は ${mj.tileName(g.doraIndicator)}。`,
+    g.players.map((p) => `${p.name} ${p.points}点${p.riichi ? '(立直)' : ''}`).join(' / '),
+    `いまは ${g.players[g.turn]?.name ?? '?'} の番。`,
+    `捨て牌(全員に見えている): ${g.players.map((p) => `${p.name}[${p.discards.map(mj.tileName).join(' ') || '無し'}]`).join(' ')}`,
+    `【重要】${me?.name ?? 'ユーザー'}の手牌は伏せられていて、あなたには見えない。`,
+    '推測して言い当てようとしないこと。聞かれても「見えないよ」と答える。',
+    'ルール・点数・巡目・捨て牌・ドラの話はしていい。',
+  ].join('\n');
+}
 
 export function view(session: Session | null): View {
   if (!session) {
@@ -226,7 +277,7 @@ export function view(session: Session | null): View {
         { label: '♠ ブラックジャック', text: 'ブラックジャックやろう' },
         { label: '🀄 麻雀', text: '麻雀やろう' },
       ],
-      tiles: [],
+      tiles: [], table: [],
     };
   }
   if (session.kind === 'blackjack') {
@@ -247,6 +298,13 @@ export function view(session: Session | null): View {
         : [{ label: '100 賭ける', text: '100賭ける' }, { label: '500 賭ける', text: '500賭ける' },
           { label: '補充', text: '補充して' }, { label: 'やめる', text: 'もうやめる' }],
       tiles: [],
+      table: g.player.length === 0 ? [] : [
+        { label: `ディーラー${playing ? '' : `(${bj.handValue(g.dealer).total})`}`, kind: 'card',
+          faces: playing ? [cardFace(bj.cardName(g.dealer[0])), { text: '?', hidden: true }]
+            : g.dealer.map((c) => cardFace(bj.cardName(c))) },
+        { label: `あなた(${bj.handValue(g.player).total})`, kind: 'card',
+          faces: g.player.map((c) => cardFace(bj.cardName(c))) },
+      ],
     };
   }
   if (session.kind === 'poker') {
@@ -272,6 +330,13 @@ export function view(session: Session | null): View {
         ]
         : [{ label: '配って', text: '配って' }, { label: 'やめる', text: 'もうやめる' }],
       tiles: [],
+      table: me.hole.length === 0 ? [] : [
+        { label: `場(ポット ${pk.potOf(t)})`, kind: 'card',
+          faces: [...t.board.map((c) => cardFace(pk.cardName(c))),
+            ...Array.from({ length: Math.max(0, 5 - t.board.length) }, () => ({ text: '?', hidden: true }))] },
+        { label: `あなたの手${need > 0 ? `(コール ${need})` : ''}`, kind: 'card',
+          faces: me.hole.map((c) => cardFace(pk.cardName(c))) },
+      ],
     };
   }
   const g = session.game;
@@ -300,9 +365,25 @@ export function view(session: Session | null): View {
   }
   if (g.phase === 'done' || g.phase === 'over') moves.push({ label: '次の局', text: '配って' });
   moves.push({ label: 'やめる', text: 'もうやめる' });
+  const handFaces: Face[] = [];
+  if (me.hand.some((n) => n > 0)) {
+    for (let t = 0; t < 34; t++) {
+      for (let i = 0; i < me.hand[t]; i++) {
+        if (t === me.drawn && i === me.hand[t] - 1) continue; // ツモ牌は右に離して置く
+        handFaces.push({ text: mj.tileName(t), move: myDiscard && (!me.riichi || t === me.drawn) ? `${mj.tileName(t)}切る` : undefined });
+      }
+    }
+    if (me.drawn !== null) handFaces.push({ text: mj.tileName(me.drawn), red: true, move: myDiscard ? `${mj.tileName(me.drawn)}切る` : undefined });
+  }
+  const river: Face[] = g.players.flatMap((p) => p.discards.slice(-6).map((t) => ({ text: mj.tileName(t) })));
   return {
     kind: 'mahjong',
     title: `麻雀 — 東${g.round}局 ${g.honba}本場 / 残り ${mg.remaining(g)} 枚`,
+    table: handFaces.length === 0 ? [] : [
+      { label: `ドラ ${mj.tileName(mg.doraOf(g.doraIndicator))}`, kind: 'tile', faces: [{ text: mj.tileName(g.doraIndicator) }] },
+      { label: `あなたの手牌${me.riichi ? '(立直中)' : ''}`, kind: 'tile', faces: handFaces },
+      ...(river.length > 0 ? [{ label: '最近の捨て牌', kind: 'tile' as const, faces: river }] : []),
+    ],
     state: [
       me.hand.some((n) => n > 0) ? `手牌 ${mg.handDisplay(g, session.meId)}` : '「配って」で始まるよ',
       `ドラ ${mj.tileName(mg.doraOf(g.doraIndicator))}${me.riichi ? ' / 立直中' : ''}`,

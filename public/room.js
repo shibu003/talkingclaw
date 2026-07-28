@@ -1189,16 +1189,21 @@ async function refreshGame() {
       }
       gameEl.appendChild(st);
     }
-    if ((v.tiles ?? []).length > 0) {
+    // 札と牌は実物として並べる。押せるもの(麻雀の打牌)はボタンになる
+    for (const row of v.table ?? []) {
+      const lab = document.createElement('div');
+      lab.className = 'grow-label';
+      lab.textContent = row.label;
+      gameEl.appendChild(lab);
       const box = document.createElement('div');
-      box.className = 'gtiles';
-      for (const t of v.tiles) {
-        const b = document.createElement('button');
-        b.className = 'gtile';
-        b.textContent = t.label;
-        b.title = '押すと切るよ';
-        b.onclick = () => void playMove(t.text);
-        box.appendChild(b);
+      box.className = row.kind === 'card' ? 'gcards' : 'gtiles';
+      for (const f of row.faces) {
+        const el = document.createElement(f.move ? 'button' : 'span');
+        el.className = (row.kind === 'card' ? 'gcard' : 'gtile')
+          + (f.red ? ' red' : '') + (f.hidden ? ' back' : '') + (f.move ? ' can' : '');
+        el.textContent = f.hidden ? '' : f.text;
+        if (f.move) { el.title = '押すと切るよ'; el.onclick = () => void playMove(f.move); }
+        box.appendChild(el);
       }
       gameEl.appendChild(box);
     }
@@ -1696,6 +1701,100 @@ async function renderSettings() {
   proj.className = 'tnote';
   proj.textContent = '作業先プロジェクト: ' + (d.projects ?? []).join(' / ') + '(追加は ~/.talkingclaw/projects.json。「talkingclaw の◯◯直して」で自己開発)';
   settingsEl.appendChild(proj);
+  await renderMemory();
+  await renderDict();
+}
+
+// 覚えたことを画面から見て消せるようにする。
+// 声で覚えるだけで消せないと、間違って覚えたものが残り続ける
+async function renderMemory() {
+  const box = document.createElement('div');
+  box.className = 'editlist';
+  const h = document.createElement('b');
+  h.textContent = 'クロエが覚えていること';
+  box.appendChild(h);
+  try {
+    const d = await (await post('/memory', {})).json();
+    const lines = d.lines ?? [];
+    if (lines.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'tnote';
+      e.textContent = 'まだ何も覚えてないよ';
+      box.appendChild(e);
+    }
+    for (const line of lines) {
+      const row = document.createElement('div');
+      row.className = 'erow';
+      const t = document.createElement('span');
+      t.textContent = line.replace(/^-\s*/, '');
+      const del = document.createElement('button');
+      del.className = 'tact';
+      del.textContent = '忘れて';
+      del.onclick = async () => { await post('/memory', { remove: line }); void renderSettings(); };
+      row.append(t, del);
+      box.appendChild(row);
+    }
+    const add = document.createElement('input');
+    add.className = 'tedit';
+    add.placeholder = '覚えてほしいことを書いて Enter';
+    add.onkeydown = async (e) => {
+      if (e.key !== 'Enter' || e.isComposing || !add.value.trim()) return;
+      await post('/memory', { add: add.value.trim() });
+      void renderSettings();
+    };
+    box.appendChild(add);
+  } catch { /* 次に開いた時に */ }
+  settingsEl.appendChild(box);
+}
+
+// 聞き間違いの言い換え表。既定ぶんは消せない(もとから入っているもの)
+async function renderDict() {
+  const box = document.createElement('div');
+  box.className = 'editlist';
+  const h = document.createElement('b');
+  h.textContent = '聞き間違いの言い換え';
+  box.appendChild(h);
+  try {
+    const d = await (await post('/dict', {})).json();
+    const all = d.dictionary ?? {};
+    const mine = d.user ?? {};
+    for (const [wrong, right] of Object.entries(all)) {
+      const row = document.createElement('div');
+      row.className = 'erow';
+      const t = document.createElement('span');
+      t.textContent = `${wrong} → ${right}`;
+      row.appendChild(t);
+      if (wrong in mine) {
+        const del = document.createElement('button');
+        del.className = 'tact';
+        del.textContent = '消す';
+        del.onclick = async () => { await post('/dict', { wrong, remove: true }); void renderSettings(); };
+        row.appendChild(del);
+      } else {
+        const note = document.createElement('span');
+        note.className = 'tnote';
+        note.textContent = 'もとから';
+        row.appendChild(note);
+      }
+      box.appendChild(row);
+    }
+    const wrongIn = document.createElement('input');
+    wrongIn.className = 'tedit';
+    wrongIn.placeholder = 'こう聞こえる';
+    const rightIn = document.createElement('input');
+    rightIn.className = 'tedit';
+    rightIn.placeholder = 'ほんとはこれ(Enter で覚える)';
+    rightIn.onkeydown = async (e) => {
+      if (e.key !== 'Enter' || e.isComposing || !wrongIn.value.trim() || !rightIn.value.trim()) return;
+      await post('/dict', { wrong: wrongIn.value.trim(), right: rightIn.value.trim() });
+      void renderSettings();
+    };
+    const row = document.createElement('div');
+    row.className = 'erow';
+    row.append(wrongIn, rightIn);
+    box.appendChild(row);
+  } catch { /* 次に開いた時に */ }
+  settingsEl.appendChild(box);
 }
 
 connect();

@@ -180,6 +180,14 @@
   #settings select, #settings input { background: var(--surface-2); color: var(--text);
     border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 10px; }
   #settings .tnote { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--surface-2); }
+  /* 覚えたこと・言い換え表: 見て消せるようにする */
+  .editlist { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--surface-2); }
+  .editlist > b { display: block; font-size: var(--fs-small); font-weight: 700; color: var(--muted);
+                  letter-spacing: .06em; margin-bottom: 8px; }
+  .erow { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: var(--fs-small); line-height: 1.6; }
+  .erow > span:first-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .erow .tnote { margin: 0; padding: 0; border: 0; flex: none; }
+  .editlist .tedit { margin-top: 6px; }
 
   /* ---- 会話ログ: 吹き出しをやめ、発話 1 件 = 1 行にする ----
      ① 文を連結しない(どの文がいつ話されたかが残る)
@@ -246,11 +254,26 @@
            border-radius: 999px; padding: 8px 16px; font-size: var(--fs-ui); font-weight: 600; line-height: 1.4; }
   .gmove:hover { border-color: var(--accent); }
   .gmove.hot { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-  /* 麻雀の牌は押して切る。等幅にして並びを揃える */
-  .gtiles { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
-  .gtile { background: #f6f2e8; color: #17111f; border: 1px solid #cbbfa6; border-radius: 5px;
-           padding: 7px 6px; min-width: 40px; font-size: 14px; font-weight: 700; line-height: 1.3; }
-  .gtile:hover { border-color: var(--accent); transform: translateY(-3px); }
+  /* 札と牌: 実物らしく見せる。押せるものだけ浮く */
+  .grow-label { font-size: var(--fs-small); color: var(--muted); margin: 8px 0 4px; }
+  .gcards { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .gcard { display: inline-flex; align-items: center; justify-content: center;
+           min-width: 42px; height: 58px; padding: 0 6px; border-radius: 6px;
+           background: #fdfcf8; color: #17111f; border: 1px solid #b9b0c4;
+           box-shadow: 0 2px 5px rgba(0,0,0,.35); font-size: 17px; font-weight: 700; line-height: 1.1; }
+  .gcard.red { color: #c62c46; }
+  .gcard.back { background: repeating-linear-gradient(45deg, #4a3f74, #4a3f74 5px, #3a3060 5px, #3a3060 10px);
+                border-color: #2a2240; color: transparent; box-shadow: none; }
+  /* 麻雀の牌 */
+  .gtiles { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+  .gtile { display: inline-flex; align-items: center; justify-content: center;
+           min-width: 38px; height: 52px; padding: 0 4px; border-radius: 5px;
+           background: linear-gradient(#fdfbf4, #efe9db); color: #17111f;
+           border: 1px solid #c3b79c; border-bottom: 3px solid #b3a685;
+           font-size: 14px; font-weight: 700; line-height: 1.2; }
+  .gtile.red { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(205,178,255,.5); } /* ツモ牌 */
+  .gtile.can:hover, .gcard.can:hover { transform: translateY(-4px); border-color: var(--accent); }
+  .gtile.can, .gcard.can { cursor: pointer; }
   #gameList details { margin-top: 6px; }
   #gameList summary { cursor: pointer; color: var(--muted); font-size: var(--fs-small); }
   #gameList .grules { margin-top: 6px; font-size: var(--fs-small); line-height: 1.8; color: var(--muted); }

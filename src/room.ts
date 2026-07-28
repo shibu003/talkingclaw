@@ -578,10 +578,11 @@ function applyDict(text: string): string {
   }
   return out;
 }
-function learnWord(wrong: string, right: string): void {
-  let user: Record<string, string> = {};
-  try { user = JSON.parse(readFileSync(DICT_PATH, 'utf8')); } catch { /* 初回 */ }
-  user[wrong] = right;
+// ユーザーが覚えさせたぶんだけ(config.dictionary の既定は含まない)
+function userDict(): Record<string, string> {
+  try { return JSON.parse(readFileSync(DICT_PATH, 'utf8')); } catch { return {}; }
+}
+function saveDict(user: Record<string, string>): void {
   try {
     mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
     const tmp = `${DICT_PATH}.tmp-${process.pid}`;
@@ -589,6 +590,11 @@ function learnWord(wrong: string, right: string): void {
     renameSync(tmp, DICT_PATH);
     dictCache = { at: 0, map: {} };
   } catch { /* 覚えられなくても会話は続ける */ }
+}
+function learnWord(wrong: string, right: string): void {
+  const user = userDict();
+  user[wrong] = right;
+  saveDict(user);
 }
 
 // ---- W11-1: 確定バッファ — 細切れの認識結果を 1 発話にまとめてから部屋に流す ----
@@ -899,6 +905,19 @@ function readMemory(): string {
     const lines = readFileSync(MEMORY_PATH, 'utf8').trim().split('\n');
     return lines.slice(-MEMORY_MAX_LINES).join('\n');
   } catch { return ''; }
+}
+function memoryLines(): string[] {
+  try { return readFileSync(MEMORY_PATH, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean); }
+  catch { return []; }
+}
+// 覚え違いを消せるようにする(声で覚えるだけで消せないと、間違いが残り続ける)
+function writeMemory(lines: string[]): void {
+  try {
+    mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+    const tmp = `${MEMORY_PATH}.tmp`;
+    writeFileSync(tmp, lines.join('\n') + (lines.length > 0 ? '\n' : ''), { mode: 0o600 });
+    renameSync(tmp, MEMORY_PATH);
+  } catch (e) { console.error('記憶を書き換えられなかった:', (e as Error).message); }
 }
 function appendMemory(note: string): void {
   const line = `- ${new Date().toISOString().slice(0, 10)} ${note.trim().replace(/\n/g, ' ')}\n`;
@@ -1501,6 +1520,9 @@ function startChloe(): void {
     if (memo) parts.push(`(あなたが書き留めた大事なこと。必ず踏まえて)\n${memo}`);
     const rows = transcriptTail(channel, 60);
     if (rows.length > 0) parts.push(`(この部屋の直近の会話ログ。文脈の続きとして自然に振る舞って)\n${rows.map((r) => `${r.who}: ${r.text}`).join('\n')}`);
+    // 遊んでいる最中なら、いまの場を教える。ユーザーの手札・手牌は brief に入れていない
+    const gameBrief = casino.brief(gameSessions.get(channel) ?? null);
+    if (gameBrief) parts.push(gameBrief);
     return parts.length > 0 ? `${parts.join('\n\n')}\n---\n` : '';
   }
 
@@ -1902,8 +1924,28 @@ const server = createServer(async (req, res) => {
   if (path === '/dict') {
     const wrong = String(body.wrong ?? '').trim();
     const right = String(body.right ?? '').trim();
+    if (wrong && body.remove === true) {           // 覚え違いを消す(自分で足したものだけ)
+      const user = userDict();
+      delete user[wrong];
+      saveDict(user);
+      return json(res, 200, { ok: true, dictionary: loadDict(), user: userDict() });
+    }
     if (wrong && right) learnWord(wrong, right);
-    return json(res, 200, { ok: Boolean(wrong && right), dictionary: loadDict() });
+    return json(res, 200, { ok: Boolean(wrong && right), dictionary: loadDict(), user: userDict() });
+  }
+
+  // クロエの記憶。声で覚えるだけでなく、間違って覚えたものを画面から消せるようにする
+  if (path === '/memory') {
+    const lines = memoryLines();
+    if (typeof body.add === 'string' && body.add.trim()) {
+      appendMemory(body.add.trim());
+      return json(res, 200, { ok: true, lines: memoryLines() });
+    }
+    if (typeof body.remove === 'string' && body.remove) {
+      writeMemory(lines.filter((l) => l !== body.remove));
+      return json(res, 200, { ok: true, lines: memoryLines() });
+    }
+    return json(res, 200, { lines });
   }
 
   if (path === '/settings') {
