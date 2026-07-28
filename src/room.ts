@@ -615,6 +615,29 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
   timer.unref();
 }
 
+// ---- W9-1: Bash の危険コマンド検査(自傷防止。セキュリティ境界ではない)----
+function dangerousBash(command: string): boolean {
+  return config.dangerousBash.some((re) => re.test(command));
+}
+
+// ---- W9-1: タスク台帳の永続化(P2: 再起動で依頼が消えないように)----
+const TASKS_PATH = join(homedir(), '.talkingclaw', 'tasks.json');
+function saveTasks(): void {
+  try {
+    mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+    const tmp = `${TASKS_PATH}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(officeTasks.slice(-50)), { mode: 0o600 });
+    renameSync(tmp, TASKS_PATH);
+  } catch { /* 台帳が書けなくても作業は続ける */ }
+}
+function loadTasks(): OfficeTask[] {
+  try {
+    const rows = JSON.parse(readFileSync(TASKS_PATH, 'utf8')) as OfficeTask[];
+    // 前回 working のまま落ちた = worker はもういない。board が嘘をつかないよう interrupted に倒す
+    return rows.map((t) => (t.status === 'working' ? { ...t, status: 'interrupted' as const } : t));
+  } catch { return []; }
+}
+
 // ---- W9-2: クロエの長期記憶(daemon 再起動・Brain 再生成を跨いで残る)----
 const MEMORY_PATH = join(homedir(), '.talkingclaw', 'chloe-memory.md');
 const MEMORY_MAX_LINES = 100; // 肥大化対策(ultraplan 精製): 末尾 100 行だけ注入
@@ -674,10 +697,10 @@ function loadWorkerMcp(): { mcpServers: Record<string, unknown>; allow: string[]
 // ---- W8-2/3: office tasks(見る = board の元データ。導出 + 起票の 2 系統)----
 type OfficeTask = {
   id: number; agent: string; agentName: string; request: string; project?: string;
-  status: 'queued' | 'working' | 'done' | 'failed'; notes: string[]; artifacts: string[]; at: string;
+  status: 'queued' | 'working' | 'done' | 'failed' | 'interrupted'; notes: string[]; artifacts: string[]; at: string;
 };
-const officeTasks: OfficeTask[] = [];
-let taskSeq = 0;
+const officeTasks: OfficeTask[] = loadTasks(); // W9-1: 台帳は再起動を跨ぐ
+let taskSeq = officeTasks.reduce((m, t) => Math.max(m, t.id), 0);
 const agentNotes = new Map<string, string[]>(); // 外部 agent の 'none' 実況(最新 5 件)
 
 store.onAppend((ev) => {
@@ -756,6 +779,7 @@ function startChloe(): void {
     };
     officeTasks.push(task);
     while (officeTasks.length > 50) officeTasks.shift();
+    saveTasks();
     taskQueue.push(task);
     void pumpTasks();
     return task;
@@ -773,7 +797,9 @@ function startChloe(): void {
       while (taskQueue.length > 0) {
         const task = taskQueue.shift()!;
         task.status = 'working';
+        saveTasks();
         await runTask(task);
+        saveTasks();
       }
     } finally {
       workerBusy = false;
@@ -800,8 +826,11 @@ function startChloe(): void {
       const opts = {
         systemPrompt: config.workerPrompt, model: workerSettings.workerModel,
         allowedTools: allowList,
-        // W8-8: allow-list 外は自動拒否でなく声でユーザーに確認する
+        // W8-8/W9-1: allow-list 外は自動拒否でなく声で確認。Bash は内容が安全なら自動許可
         canUseTool: async (name: string, input: Record<string, unknown>) => {
+          if (name === 'Bash' && !dangerousBash(String(input.command ?? ''))) {
+            return { behavior: 'allow' as const, updatedInput: input };
+          }
           const ok = await askUserPermission(describeTool(name, input));
           return ok
             ? { behavior: 'allow' as const, updatedInput: input }
@@ -951,6 +980,16 @@ function startChloe(): void {
       void drain(channel);
     }
   });
+
+  // W9-1: 前回やり残しの申告(自動再開はしない — 内容が古い可能性がある)
+  const pending = officeTasks.filter((t) => t.status === 'queued' || t.status === 'interrupted');
+  if (pending.length > 0) {
+    const what = pending.slice(-3).map((t) => t.request.slice(0, 30)).join('、');
+    store.append({
+      type: 'agent_speech', from: chloePid, name: chloe.assignedName, channel: 'work',
+      text: `前回の作業が途中だったよ。${what}。続きやる?`, audio: null, turnId: 'none',
+    });
+  }
 
   // greeting = Brain warmup(初回コールドスタートを起動時に消化。channel ごとに 1 回)
   const GREETING: Record<Channel, string> = {

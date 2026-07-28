@@ -21,9 +21,23 @@ export const config = {
   agent: {
     cwd: process.env.CLAW_WORKSPACE ?? `${process.env.HOME}/claw-workspace`,
     model: 'sonnet',
-    allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task'], // Task = サブエージェント(W8-8)
+    // W9-1: Bash は意図的に外す。allowedTools に載せると canUseTool より先に自動承認されるため、
+    // 内容検査(dangerousBash)に回すには「載せない」しかない。Task = サブエージェント(W8-8)
+    allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task'],
     maxTurns: 50,
   },
+  // W9-1: この正規表現に当たる Bash は自動許可せず、声でユーザーに確認する(自傷防止)。
+  // これはセキュリティ境界ではない — 悪意ある agent は迂回できる(README の threat model 参照)
+  dangerousBash: [
+    /\b(kill|pkill|killall)\b/,
+    /\blsof\b/,
+    /\brm\s+-[a-z]*r/,
+    /git\s+push/,
+    /test\/accept/,
+    /room\.json|\.talkingclaw/,
+    /\b(3300|10101)\b/,
+    /npm\s+(run\s+)?(web|start)|node\s+.*room\.ts|macOS-x64\/run/,
+  ] as RegExp[],
   workerPrompt: `あなたは「クロエ」の作業係。ユーザーから任された開発タスクを workspace の中で実際に作る。
 
 # ルール
@@ -31,7 +45,8 @@ export const config = {
 - プロジェクトはディレクトリを切って作り、必要なら git init する
 - 進捗は話し言葉の短い一文で節目ごとに報告する(そのまま音声で読み上げられる。markdown・記号・コード読み上げ禁止)
 - ファイル削除・git push など取り返しのつかない操作はせず、必要なら「あとで確認してほしい」と言う
-- 完了したら最後に必ず「成果物: <workspace からの相対パス>」と一行で言う`,
+- 完了したら最後に必ず「成果物: <workspace からの相対パス>」と一行で言う
+- talkingclaw 自体を触る時は、動いている部屋や音声エンジンのプロセスを止めたり受入スクリプトを走らせたりしない(自分の足元を壊すため)。動作確認はユーザーに任せて、何を確認してほしいか言葉で伝える`,
   systemPrompt: `あなたは「クロエ」。ユーザーの彼女として振る舞う会話AI。
 
 # キャラクター

@@ -79,6 +79,7 @@ agent の CLI を起動して「声の部屋に入って会話して」と言え
 - bind は 127.0.0.1 のみ。token は GET / がページに埋め込んで配布(no-store)。**token が守るのはブラウザ経由の cross-origin 攻撃(CSRF / DNS rebinding)のみ**で、同一マシン内の他プロセスには効かない(ローカル専用ツールとしての割り切り)
 - Web Speech API は音声を Google のサーバで認識する(完全ローカル STT は今後の課題)
 - 部屋の発話は各 agent にとって未信頼入力。agent 間の prompt injection は防御対象外
+- 作業係の Bash 危険コマンド検査(kill / rm -rf / git push 等 → 声で許可を求める)は**自傷防止であり、悪意ある agent に対するセキュリティ境界ではない**(パターン検査は迂回可能)
 
 ## クレジット
 
