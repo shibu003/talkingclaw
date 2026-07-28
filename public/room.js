@@ -434,6 +434,7 @@ const previewTitle = document.getElementById('previewTitle');
 const previewOpen = document.getElementById('previewOpen');
 document.getElementById('previewClose').onclick = () => { previewEl.classList.remove('open'); previewFrame.src = 'about:blank'; };
 function showPreview(relPath) {
+  void post('/ui-state', { preview: relPath, board: boardOpen }); // W10-2: クロエが画面を把握できるように
   const url = '/files/' + encodeURIComponent(relPath).replace(/%2F/g, '/') + '?token=' + TOKEN;
   previewTitle.textContent = relPath;
   previewOpen.href = url;

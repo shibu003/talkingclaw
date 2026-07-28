@@ -615,6 +615,9 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
   timer.unref();
 }
 
+// ---- W10-2: ブラウザの画面状態(クロエが「今きみが見てる画面」を把握するため)----
+let uiState: { preview?: string; board?: boolean; at?: string } = {};
+
 // ---- W9-1: Bash の危険コマンド検査(自傷防止。セキュリティ境界ではない)----
 function dangerousBash(command: string): boolean {
   return config.dangerousBash.some((re) => re.test(command));
@@ -853,7 +856,11 @@ function startChloe(): void {
       }
     }
     try {
-      const askP = worker.ask(task.request, workerSay(task));
+      const others = officeTasks.filter((t) => t.id !== task.id && (t.status === 'queued' || t.status === 'working'));
+      const brief = others.length > 0
+        ? `(同じ作業場で他にも依頼が並んでる: ${others.map((t) => t.request.slice(0, 40)).join(' / ')}。同じファイルを壊し合わないよう、既存の変更を確認してから作業して)\n`
+        : '';
+      const askP = worker.ask(brief + task.request, workerSay(task));
       const result = await Promise.race([askP, timeoutMarker(600_000)]);
       if (result === TIMEOUT) {
         await worker.interrupt().catch(() => {});
@@ -865,7 +872,13 @@ function startChloe(): void {
       }
       task.status = 'done';
       const m = String(result).match(/成果物[:：]\s*(\S+)/);
-      if (m) task.artifacts.push(m[1].replace(/[、。]$/, ''));
+      if (m) task.artifacts.push(m[1].replace(/[、。`]+$/, '').replace(/^`/, ''));
+      // W10-4: まとめてでなく、終わったものから個別に報告する
+      const head = task.request.slice(0, 24);
+      enqueueJob({
+        pid: chloePid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+        text: task.artifacts.length > 0 ? `${head}、できたよ。画面に出しておくね。` : `${head}、できたよ。`,
+      });
     } catch (error) {
       task.status = 'failed';
       task.notes.push(`エラー: ${(error as Error).message}`);
@@ -877,6 +890,26 @@ function startChloe(): void {
     name: 'office',
     version: '1.0.0',
     tools: [
+      tool(
+        'room_status',
+        '部屋の今の状態(在室者・作業の待ち行列と進捗・ユーザーが見ている画面・声の状態)を確認する。作業状況を聞かれたら必ずこれで確認してから答えること。',
+        {},
+        async () => {
+          const tasks = officeTasks.slice(-8).map((t, i) => ({
+            request: t.request.slice(0, 60), status: t.status,
+            queuePosition: t.status === 'queued' ? officeTasks.filter((x) => x.status === 'queued').indexOf(t) + 1 : undefined,
+            latestNote: t.notes[t.notes.length - 1], artifacts: t.artifacts, project: t.project ?? 'workspace',
+          }));
+          const people = registry.all().map((p) => ({
+            name: p.assignedName, presence: registry.presence(p, waiters.has(p.participantId)), voice: p.voice.status,
+          }));
+          return { content: [{ type: 'text', text: JSON.stringify({
+            note: '作業係は 1 人だけで、タスクは 1 件ずつ順番に処理される(並行実行はしていない)。この事実に反することを言わないこと。',
+            workerBusyWith: officeTasks.find((t) => t.status === 'working')?.request?.slice(0, 60) ?? null,
+            tasks, people, userScreen: uiState, engine: engineState, activeChannel,
+          }, null, 1) }] };
+        },
+      ),
       tool(
         'remember',
         'ユーザーとの約束・好み・「今後こうして」という恒久ルールを書き留める。再起動しても思い出せる。短く 1 行で。',
@@ -904,8 +937,8 @@ function startChloe(): void {
       systemPrompt: config.systemPrompt + config.rooms[channel], model: config.model,
       mcpServers: { office: officeServer } as Record<string, unknown>,
       allowedTools: channel === 'work'
-        ? ['mcp__office__delegate_task', 'mcp__office__remember']
-        : ['mcp__office__remember'],
+        ? ['mcp__office__delegate_task', 'mcp__office__remember', 'mcp__office__room_status']
+        : ['mcp__office__remember', 'mcp__office__room_status'],
       maxTurns: 8, // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
       // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
       canUseTool: async (name: string, input: Record<string, unknown>) => {
@@ -1271,6 +1304,12 @@ const server = createServer(async (req, res) => {
     chloeResetWorker?.(); // 次の task から新設定(実行中の task は続行)
     const ext = loadWorkerMcp();
     return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers), projects: Object.keys(loadProjects()) });
+  }
+
+  if (path === '/ui-state') {
+    uiState = { preview: body.preview ? String(body.preview).slice(0, 200) : undefined,
+                board: body.board === true, at: new Date().toISOString() };
+    return json(res, 200, { ok: true });
   }
 
   if (path === '/tasks') {
