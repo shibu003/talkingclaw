@@ -32,11 +32,11 @@ exit(0 if ok else 1)" && GREET=1 && break
 done
 [ $GREET = 1 ] && ok "greeting(クロエの agent_speech)" || ng "greeting なし(90s)"
 
-echo "[2] 雑談: chat → クロエの応答(最大 45s)+ ack"
+echo "[2] 雑談: chat → クロエの応答(最大 120s。LLM + 直列 TTS 込み)"
 LAST=$(sse 1 | tail -1 | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',0))" 2>/dev/null || echo 0)
 curl -s -X POST "$B/chat" -H "$H" -H "$T" -d '{"text":"こんにちは、ぼくの好きな色は青だよ"}' >/dev/null
 REPLY=0
-for i in $(seq 1 15); do
+for i in $(seq 1 40); do
   sse 2 "$LAST" | python3 -c "
 import json,sys
 evs=[json.loads(l) for l in sys.stdin if l.strip()]
@@ -44,7 +44,7 @@ ok=any(e.get('type')=='agent_speech' and e.get('name')=='クロエ' and not e.ge
 exit(0 if ok else 1)" && REPLY=1 && break
   sleep 3
 done
-[ $REPLY = 1 ] && ok "クロエが応答" || ng "応答なし(45s)"
+[ $REPLY = 1 ] && ok "クロエが応答" || ng "応答なし(120s)"
 
 echo "[3] MCP agent 同席でも default はクロエ"
 J=$(curl -s -X POST "$B/join" -H "$H" -H "$T" -d '{"requestedName":"コハク","voice":"コハク/ノーマル"}')

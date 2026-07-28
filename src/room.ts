@@ -743,6 +743,10 @@ import { z } from 'zod';
 
 let chloePid: string | null = null;
 let chloeResetWorker: (() => void) | null = null;
+// W9-2: 本番は 180s(sonnet + delegate の長 turn を誤殺しない)。テストは短縮して回転を速く
+// テスト時も「通常応答(context 注入込みで 20-40s)は切らず、ハングだけ捕まえる」値にする
+const ASK_GUARD_MS = Number(process.env.ASK_GUARD_MS ?? (process.env.ROOM_TEST_HOOKS === '1' ? 45_000 : 180_000));
+const ASK_GRACE_MS = process.env.ROOM_TEST_HOOKS === '1' ? 5_000 : 10_000;
 const TIMEOUT = Symbol('timeout');
 function timeoutMarker(ms: number): Promise<typeof TIMEOUT> {
   return new Promise((r) => setTimeout(() => r(TIMEOUT), ms));
@@ -913,9 +917,9 @@ function startChloe(): void {
     };
   }
 
-  type ChannelState = { brain: Brain; inbox: RoomEvent[]; busy: boolean; needsContext: boolean };
+  type ChannelState = { brain: Brain; inbox: RoomEvent[]; busy: boolean; needsContext: boolean; chain: Promise<void> };
   const channelState: Record<Channel, ChannelState> = Object.fromEntries(
-    CHANNELS.map((c) => [c, { brain: new Brain(makeConvBrainOpts(c)), inbox: [], busy: false, needsContext: true }]),
+    CHANNELS.map((c) => [c, { brain: new Brain(makeConvBrainOpts(c)), inbox: [], busy: false, needsContext: true, chain: Promise.resolve() }]),
   ) as Record<Channel, ChannelState>; // W8-1: boot/再生成後の最初の ask に直近ログを注入(channel ごと)
 
   // W9-2: 記憶忘れの根治 — memory 全文 + 直近ログを Brain 生成のたびに注入する
@@ -937,16 +941,25 @@ function startChloe(): void {
     };
   };
 
-  // ask を 60s で見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
-  async function askGuarded(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
+  // W9-2: 同一チャンネルの ask は必ず 1 本ずつ(greeting warmup 中にユーザー発話が来て
+  // Brain.ask が「前の返答を待っています」で弾かれる事故の根治)
+  function askGuarded(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
+    const cs = channelState[channel];
+    const run = cs.chain.catch(() => {}).then(() => askOnce(channel, text, turnId));
+    cs.chain = run.catch(() => {}); // 後続は前の失敗を引き継がない
+    return run;
+  }
+
+  // ask を見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
+  async function askOnce(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
     const cs = channelState[channel];
     const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
     if (cs.needsContext) { text = contextPrefix(channel) + text; cs.needsContext = false; }
     const ask = hang ? new Promise<string>(() => {}) : cs.brain.ask(text, speakStreamed(channel, turnId));
-    if ((await Promise.race([ask, timeoutMarker(180_000)])) !== TIMEOUT) return; // W9-2: 長 turn を誤殺しない
-    console.error(`クロエ(${channel})の応答が 180s 超過 → interrupt`);
+    if ((await Promise.race([ask, timeoutMarker(ASK_GUARD_MS)])) !== TIMEOUT) return; // W9-2: 長 turn を誤殺しない
+    console.error(`クロエ(${channel})の応答が ${ASK_GUARD_MS / 1000}s 超過 → interrupt`);
     if (!hang) await cs.brain.interrupt().catch(() => {});
-    if ((await Promise.race([ask.catch(() => ''), timeoutMarker(10_000)])) !== TIMEOUT) return;
+    if ((await Promise.race([ask.catch(() => ''), timeoutMarker(ASK_GRACE_MS)])) !== TIMEOUT) return;
     void cs.brain.close().catch(() => {});
     cs.brain = new Brain(makeConvBrainOpts(channel));
     cs.needsContext = true; // 再生成 = 文脈喪失 → 次の ask でログ注入

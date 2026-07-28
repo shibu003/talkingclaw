@@ -55,7 +55,7 @@ cp /tmp/memory.bak ~/.talkingclaw/chloe-memory.md 2>/dev/null || rm -f ~/.talkin
 echo "[3] 静的: 生エラーを読み上げない / remember tool / ガード 180s"
 grep -q "考えすぎちゃった" src/room.ts && ! grep -q 'text: `ごめん、エラーが出ちゃった' src/room.ts && ok "友好エラー(生エラーは system のみ)" || ng "生エラー読み上げが残存"
 grep -q "'remember'" src/room.ts && grep -q "mcp__office__remember" src/room.ts && ok "remember tool" || ng "remember なし"
-grep -q "timeoutMarker(180_000)" src/room.ts && ok "応答ガード 180s" || ng "ガードが 60s のまま"
+grep -q "180_000" src/room.ts && grep -q "ASK_GUARD_MS" src/room.ts && ok "応答ガード 180s(テスト時のみ短縮)" || ng "ガードが 60s のまま"
 grep -q "enginePortOccupied" src/room.ts && ok "lsof による port 確認" || ng "port 確認なし"
 
 echo
