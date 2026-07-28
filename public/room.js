@@ -96,11 +96,58 @@ function addLine(host, from, name, text, at) {
   }
   const line = document.createElement('div');
   line.className = 'tx';
-  line.textContent = text;
+  setTextWithLinks(line, text);
   host.appendChild(line);
   trimLog();
   log.scrollTop = log.scrollHeight;
   return line;
+}
+
+// 本文中の URL だけをリンクにする。innerHTML は使わず、文字は textContent のまま置く(S9 規律)
+function setTextWithLinks(el, text) {
+  const src = String(text ?? '');
+  const re = /https?:\/\/[^\s、。」）)]+/g;
+  let at = 0;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    if (m.index > at) el.appendChild(document.createTextNode(src.slice(at, m.index)));
+    const a = document.createElement('a');
+    a.href = m[0];
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    a.textContent = m[0];
+    el.appendChild(a);
+    at = m.index + m[0].length;
+  }
+  if (at < src.length) el.appendChild(document.createTextNode(src.slice(at)));
+}
+
+// 送った添付を会話の中に出す。画像はそのまま絵で、それ以外は開けるボタンで
+function renderSentFiles(host, files) {
+  const box = document.createElement('div');
+  box.className = 'att';
+  for (const name of files) {
+    const url = '/uploads/' + encodeURIComponent(name) + '?token=' + TOKEN;
+    const shown = String(name).replace(/^\d+-/, '');
+    if (artifactKind(shown) === 'image') {
+      const img = document.createElement('img');
+      img.className = 'shot';
+      img.loading = 'lazy';
+      img.alt = shown;
+      img.src = url;
+      img.onerror = () => img.remove();
+      img.onclick = () => window.open(url);
+      box.appendChild(img);
+    } else {
+      const a = document.createElement('a');
+      a.href = url;
+      a.target = '_blank';
+      a.textContent = '📎 ' + shown;
+      box.appendChild(a);
+    }
+  }
+  host.appendChild(box);
+  log.scrollTop = log.scrollHeight;
 }
 
 // 古い塊から捨てる(読み上げ中・再生待ちの行は残す)。ブラウザ側に上限が無かった
@@ -230,6 +277,7 @@ function render(ev) {
     // 短い相槌(「うん」等)では溜まった読み上げを捨てない。長い発話 = 話題転換とみなして捨てる
     if (!isReplay && (ev.text ?? '').length >= 8) audioQueue.length = 0;
     addLine(turnHost(ev), 'user', 'あなた', ev.text ?? '', ev.at);
+    if ((ev.files ?? []).length > 0) renderSentFiles(lastGroup?.host ?? log, ev.files);
     if (ev.targets && ev.targets.length > 0 && lastGroup) {
       const to = document.createElement('span');
       to.className = 'to';
@@ -288,11 +336,76 @@ async function send(text) {
   if (handleNav(text)) return; // 音声ナビ: 画面移動の指示は会話に流さず、その場で画面を動かす
   setStatus('届けたよ');
   try {
-    const res = await post('/chat', { text });
+    const res = await post('/chat', { text, files: attached.map((a) => a.name) });
+    attached.length = 0;
+    renderAttached();
     if (res.status === 401) return void checkRestart();
     if (!res.ok) addSys('送信エラー: ' + res.status);
   } catch { addSys('サーバに繋がらないみたい'); }
 }
+// ---- こちらから画像・ファイルを送る(📎 / ドラッグ&ドロップ / 貼り付け)----
+// 送り先は ~/.talkingclaw/uploads。作業先の git を汚さない場所に置いて、agent には実パスで渡す
+const attached = [];              // { name, localName, url }
+const attachedEl = document.getElementById('attached');
+const composerEl = document.getElementById('composer');
+const fileInput = document.getElementById('fileInput');
+const uploadUrl = (name) => '/uploads/' + encodeURIComponent(name) + '?token=' + TOKEN;
+
+function renderAttached() {
+  attachedEl.replaceChildren();
+  for (const a of attached) {
+    const chip = document.createElement('button');
+    chip.title = '押すと外すよ';
+    if (artifactKind(a.localName) === 'image') {
+      const img = document.createElement('img');
+      img.src = uploadUrl(a.name);
+      img.alt = '';
+      img.onerror = () => img.remove();
+      chip.appendChild(img);
+    }
+    const label = document.createElement('span');
+    label.textContent = a.localName;
+    chip.appendChild(label);
+    const x = document.createElement('span');
+    x.textContent = '✕';
+    chip.appendChild(x);
+    chip.onclick = () => { attached.splice(attached.indexOf(a), 1); renderAttached(); };
+    attachedEl.appendChild(chip);
+  }
+}
+
+async function attachFiles(files) {
+  for (const f of [...files].slice(0, 8)) {
+    if (attached.length >= 8) { addSys('添付は 8 個までだよ'); break; }
+    try {
+      const r = await fetch('/upload?name=' + encodeURIComponent(f.name), {
+        method: 'POST', headers: { 'x-room-token': TOKEN }, body: f,
+      });
+      const d = await r.json();
+      if (!r.ok) { addSys(d.error ?? '送れなかった'); continue; }
+      attached.push({ name: d.name, localName: f.name, url: uploadUrl(d.name) });
+    } catch { addSys('サーバに繋がらないみたい'); }
+  }
+  renderAttached();
+  textInput.focus();
+}
+
+document.getElementById('attachBtn').onclick = () => fileInput.click();
+fileInput.onchange = () => { void attachFiles(fileInput.files); fileInput.value = ''; };
+for (const type of ['dragenter', 'dragover']) {
+  document.addEventListener(type, (e) => { e.preventDefault(); composerEl.classList.add('drop'); });
+}
+document.addEventListener('dragleave', (e) => { if (e.relatedTarget === null) composerEl.classList.remove('drop'); });
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  composerEl.classList.remove('drop');
+  if (e.dataTransfer?.files?.length) void attachFiles(e.dataTransfer.files);
+});
+textInput.addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files ?? [])];
+  if (files.length > 0) { e.preventDefault(); void attachFiles(files); }
+});
+
 textInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.isComposing) { void send(textInput.value); textInput.value = ''; }
 });

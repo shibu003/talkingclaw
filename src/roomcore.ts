@@ -20,6 +20,7 @@ export type RoomEvent = {
   broadcast?: true;
   routing?: { method: 'name' | 'selection' | 'floor' | 'last_responder' | 'default'; matchedAlias?: string };
   channel?: Channel; // 未指定は 'work' 扱い(既存 event との後方互換)
+  files?: string[];  // ユーザーが送った添付(~/.talkingclaw/uploads のファイル名)
 };
 
 const MAX_LOG = 1000;

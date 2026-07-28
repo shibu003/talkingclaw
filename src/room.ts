@@ -16,6 +16,7 @@ const PORT = Number(process.env.PORT ?? 3300);
 const LISTEN_MAX_S = 48; // S2: server 内部 deadline 上限
 const TEXT_MAX = 4000;
 const BODY_MAX = 64 * 1024;
+const UPLOAD_MAX = 20 * 1024 * 1024; // こちらから送るファイルの上限
 
 const store = new EventStore();
 const registry = new Registry();
@@ -603,6 +604,14 @@ function looksIncomplete(text: string): boolean {
 }
 
 // 確定待ちに積む。確定したら userSpeech を呼ぶ。戻り値は「今すぐ確定したか」
+// 添付(画像・ファイル)は /chat と一緒に来る。次の user_speech に載せて、Brain には実パスを渡す
+let pendingFiles: string[] = [];
+const uploadDir = (): string => pathMod.join(homedir(), '.talkingclaw', 'uploads');
+function attachmentNote(files: string[] | undefined): string {
+  if (!files || files.length === 0) return '';
+  return `\n(添付ファイル。必要なら Read で開いて: ${files.map((f) => pathMod.join(uploadDir(), f)).join(', ')})`;
+}
+
 function acceptUtterance(text: string): RoomEvent | null {
   const merged = pending ? `${pending.text} ${text}` : text;
   const firstAt = pending?.firstAt ?? Date.now();
@@ -670,7 +679,8 @@ function userSpeech(rawText: string): RoomEvent {
   speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
   const { targets, routing } = routeTargets(text);
   const turnId = `T${++turnSeq}`;
-  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel: activeChannel });
+  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel: activeChannel, files: pendingFiles.length > 0 ? pendingFiles : undefined });
+  pendingFiles = [];
   metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
     trackTurn(turnId, targets[0], text, activeChannel);
@@ -1473,7 +1483,7 @@ function startChloe(): void {
     try {
       while (cs.inbox.length > 0) {
         const ev = cs.inbox.shift()!;
-        await askGuarded(channel, ev.text ?? '', ev.turnId).catch((e: Error) => {
+        await askGuarded(channel, (ev.text ?? '') + attachmentNote(ev.files), ev.turnId).catch((e: Error) => {
           // W9-2(P3): 生エラー文字列は読み上げない — 画面には残し、声は友好文に
           store.append({ type: 'system', from: 'room', text: `クロエのエラー: ${e.message}`, channel });
           store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと考えすぎちゃった。もう一回言ってくれる?', audio: null, turnId: ev.turnId, channel });
@@ -1620,6 +1630,29 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  // 送った添付を画面に出すための配信(uploads の中だけ。作業先には触れない)
+  if (req.method === 'GET' && path.startsWith('/uploads/')) {
+    if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' });
+    const name = pathMod.basename(decodeURIComponent(path.slice('/uploads/'.length)));
+    const target = pathMod.join(uploadDir(), name);
+    try {
+      const types: Record<string, string> = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+        '.svg': 'image/svg+xml', '.webp': 'image/webp', '.pdf': 'application/pdf',
+        '.html': 'text/html; charset=utf-8', '.json': 'application/json',
+      };
+      const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+      const buf = await readFile(target); // 先に読む(失敗しても header を書いていない状態で 404 に落とせる)
+      res.writeHead(200, {
+        'content-type': types[ext] ?? 'text/plain; charset=utf-8',
+        'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      });
+      return res.end(buf);
+    } catch {
+      return json(res, 404, { error: 'not found' });
+    }
+  }
+
   if (req.method === 'GET' && (path === '/files' || path.startsWith('/files/'))) {
     if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' }); // 無認証ゾーンより前に置かれているため明示検証
     const { resolve, sep } = await import('node:path');
@@ -1728,6 +1761,27 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method !== 'POST') return json(res, 404, { error: 'not found' });
+
+  // こちらから画像・ファイルを送る。~/.talkingclaw/uploads に置き、agent には実パスで渡す
+  // (作業先の git を汚さないよう、workspace や project の中には置かない)
+  if (path === '/upload') {
+    const raw = url.searchParams.get('name') ?? 'file';
+    const safe = pathMod.basename(raw).replace(/[^\w.\-ぁ-んァ-ヶ一-龥]/gu, '_').slice(-80) || 'file';
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > UPLOAD_MAX) { req.destroy(); return json(res, 413, { error: 'ファイルが大きすぎます(20MB まで)' }); }
+      chunks.push(chunk as Buffer);
+    }
+    if (size === 0) return json(res, 400, { error: 'からのファイルです' });
+    const dir = uploadDir();
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const name = `${Date.now()}-${safe}`;
+    writeFileSync(pathMod.join(dir, name), Buffer.concat(chunks), { mode: 0o600 });
+    return json(res, 200, { ok: true, name, size });
+  }
+
   const body = await readJson(req);
   if (body === null) return json(res, 400, { error: 'JSON body が必要です(64KB 以内)' });
 
@@ -1765,6 +1819,10 @@ const server = createServer(async (req, res) => {
   if (path === '/chat') {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
+    // 添付は次の user_speech に載せる(送信の直前に確定するので pending で持つ)
+    if (Array.isArray(body.files)) {
+      pendingFiles = body.files.map(String).map((f) => pathMod.basename(f)).filter(Boolean).slice(0, 8);
+    }
     // W11-1: 断片は確定バッファでまとめる。immediate:true(テキスト入力など)は素通し
     const ev = body.immediate === true ? userSpeech(text) : acceptUtterance(text);
     return json(res, 200, ev ? { ok: true, eventId: ev.id, turnId: ev.turnId } : { ok: true, pending: true });

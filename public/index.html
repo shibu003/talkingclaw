@@ -219,8 +219,23 @@
   #mic.on { background: var(--accent); color: var(--accent-ink); }
   #mic.listening { background: var(--hot); color: #fff; animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { transform: scale(1.08); } }
-  #text { flex: 1; min-width: 0; padding: 14px 18px; border-radius: 999px; border: 1px solid var(--line);
+  #composer { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+  #composer.drop #text { border-color: var(--accent); }
+  #text { width: 100%; min-width: 0; padding: 14px 18px; border-radius: 999px; border: 1px solid var(--line);
           background: var(--surface-2); font-size: var(--fs-body); line-height: 1.5; outline: none; }
+  /* 送る前の添付。押すと外せる */
+  #attached:empty { display: none; }
+  #attached { display: flex; flex-wrap: wrap; gap: 8px; }
+  #attached button { display: flex; align-items: center; gap: 6px; max-width: 16em;
+                     padding: 5px 12px; border-radius: 999px; border: 1px solid var(--line);
+                     background: var(--surface-2); color: var(--text); font-size: var(--fs-small); line-height: 1.5; }
+  #attached button:hover { border-color: var(--hot); }
+  #attached img { width: 26px; height: 20px; object-fit: cover; border-radius: 3px; background: #fff; }
+  #attached span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 送った添付(会話の中)*/
+  .att { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 0 3.7em; max-width: var(--measure); }
+  .att .shot { width: auto; max-width: 220px; max-height: 140px; margin-top: 0; }
+  .att a { color: var(--accent); font-size: var(--fs-small); align-self: center; }
   #text::placeholder { color: var(--muted); }
   #text:focus { border-color: var(--accent); }
   #send { width: 46px; height: 46px; border-radius: 50%; border: 1px solid var(--line);
@@ -369,7 +384,12 @@
 <div id="log"></div>
 <footer>
   <button id="mic" title="ハンズフリー会話 ON/OFF">🎤</button>
-  <input id="text" placeholder="話しかけてね(「部屋一覧見せて」で画面も動くよ)" autocomplete="off">
+  <div id="composer">
+    <div id="attached"></div>
+    <input id="text" placeholder="話しかけてね(画像やファイルはドロップ・貼り付けでも送れるよ)" autocomplete="off">
+  </div>
+  <button id="attachBtn" class="hbtn" title="画像やファイルを送る">📎</button>
+  <input id="fileInput" type="file" multiple hidden>
   <button id="send" title="送信">➤</button>
 </footer>
 <script src="/vad/vad-web.js"></script>
