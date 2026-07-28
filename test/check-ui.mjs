@@ -18,4 +18,32 @@ if (/\.style\.display\s*=/.test(js.replace(/noticeEl\.style\.display\s*=\s*'bloc
   console.log('  ❌ パネルの開閉が style.display 直書きに戻ってる(openPanel に一本化して)'); fail = 1;
 } else console.log('  ✅ パネル開閉は openPanel に一本化されてる');
 
+// 読みやすさ: 文字と背景のコントラストが WCAG AA(4.5:1)を割ってないか
+const varOf = (name) => html.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, 'i'))?.[1];
+const lum = (hex) => {
+  const ch = [1, 3, 5].map((i) => {
+    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+};
+const ratio = (a, b) => {
+  const [x, y] = [lum(a) + 0.05, lum(b) + 0.05].sort((p, q) => q - p);
+  return x / y;
+};
+const pairs = [
+  ['本文', varOf('text'), varOf('bg')],
+  ['本文(吹き出し上)', varOf('text'), varOf('surface-2')],
+  ['補助文字', varOf('muted'), varOf('bg')],
+  ['補助文字(パネル上)', varOf('muted'), varOf('surface')],
+  ['話者名', varOf('accent'), varOf('surface-2')],
+  ['選択チップ', varOf('accent-ink'), varOf('accent')],
+];
+for (const [name, fg, bg] of pairs) {
+  if (!fg || !bg) { console.log(`  ❌ 色の変数が見つからない: ${name}`); fail = 1; continue; }
+  const r = ratio(fg, bg);
+  if (r < 4.5) { console.log(`  ❌ ${name} のコントラストが ${r.toFixed(1)}:1(4.5 未満)`); fail = 1; }
+}
+if (fail === 0) console.log('  ✅ 文字と背景のコントラストは全部 4.5:1 以上');
+
 process.exit(fail);
