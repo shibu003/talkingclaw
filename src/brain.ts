@@ -1,4 +1,27 @@
 import { query, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+// コスト実測: SDK の result に付いてくる実費と token 数を 1 行ずつ残す。
+// 並列化などコストが絡む判断は、勘ではなくこの実測から試算する(npm run cost)。
+function recordCost(model: string, msg: Record<string, unknown>): void {
+  try {
+    const usage = (msg.usage ?? {}) as Record<string, number>;
+    const dir = join(homedir(), '.talkingclaw');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    appendFileSync(join(dir, 'cost.jsonl'), JSON.stringify({
+      at: new Date().toISOString(), model,
+      usd: msg.total_cost_usd ?? null,
+      ms: msg.duration_ms ?? null,
+      turns: msg.num_turns ?? null,
+      input: usage.input_tokens ?? 0,
+      output: usage.output_tokens ?? 0,
+      cacheRead: usage.cache_read_input_tokens ?? 0,
+      cacheWrite: usage.cache_creation_input_tokens ?? 0,
+    }) + '\n', { mode: 0o600 });
+  } catch { /* 計測が失敗しても会話は続ける */ }
+}
 
 // Claude Agent SDK の streaming input mode で 1 セッションを維持する「頭脳」担当。
 // Claude Code の認証を継承するので API key 不要。会話文脈はセッション内で続く。
@@ -9,6 +32,7 @@ export class Brain {
   #buffer = '';
   #streamBuffer = '';
   #onSentence: ((sentence: string) => void) | null = null;
+  #model: string;
 
   constructor(opts: {
     systemPrompt: string; model: string;
@@ -20,6 +44,7 @@ export class Brain {
       { behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }
     >;
   }) {
+    this.#model = opts.model;
     this.#query = query({
       prompt: this.#input,
       options: {
@@ -82,6 +107,7 @@ export class Brain {
             if (block.type === 'text') this.#buffer += block.text;
           }
         } else if (msg.type === 'result') {
+          recordCost(this.#model, msg as unknown as Record<string, unknown>);
           const waiting = this.#waiting;
           this.#waiting = null;
           const remainder = this.#streamBuffer.trim();

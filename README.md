@@ -26,6 +26,20 @@ npm run metrics      # レイテンシ・被覆率レポート(~/.talkingclaw/me
 bash test/accept-3a1ai.sh などで受入テスト一式
 ```
 
+### コストを見てから決める(`npm run cost`)
+
+会話・作業のたびに SDK が返す実費と token 数を `~/.talkingclaw/cost.jsonl` に 1 行ずつ残す。
+コストが絡む判断(作業係の並列化、モデル選び、常時起動)は勘でなくこの実測から試算する。
+
+```sh
+npm run cost                          # 実測 + 1/2/3/5 人並列の試算
+npm run cost -- --workers 4 --hours 3 # 人数と時間を指定
+npm run cost -- --yen 0               # 円換算を出さない
+```
+
+実測が無いうちは公開単価([pricing](https://platform.claude.com/docs/en/about-claude/pricing))と
+想定タスク量で試算し、実測が溜まると自動でそちらに切り替わる。
+
 ### 相談してから着手する(相談モード・既定 ON)
 
 作業を頼んでも、いきなりタスク登録して走り出さない。まずクロエが会話で「何を・どうやって・どこまで」を
