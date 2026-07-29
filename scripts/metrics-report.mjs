@@ -12,19 +12,29 @@ const pct = (a, p) => { const s = [...a].sort((x, y) => x - y); return s.length 
 const stt = rows.filter((r) => r.kind === 'stt_final_delay').map((r) => r.ms);
 console.log(`STT final 遅延: n=${stt.length} p50=${pct(stt, 50)}ms p95=${pct(stt, 95)}ms`);
 
-// turn 集計
-const turns = new Map();
-for (const r of rows) {
+// turn 集計。
+// turnId は T1 / T2 ... の連番で、部屋を再起動するとリセットされる。一方 metrics.jsonl は
+// 複数セッション(複数日)ぶんが 1 本に積まれるので、turnId だけでグループ化すると
+// 別セッションの turn_created と play_started がペアになる。
+// (実測 2026-07-29: turnId は 80 種しかないのにイベント 1586 件、T1 に turn_created が 94 回。
+//  その結果 初音 p50 が 5 分、p95 が 8.5 時間という測れていない値が出ていた)
+// 時刻順に読み、同じ turnId の次の turn_created が来たらそこで区切る。
+const sorted = [...rows].sort((a, b) => ts(a) - ts(b));
+const openTurns = new Map();
+const turns = [];
+for (const r of sorted) {
   if (!r.turnId) continue;
-  const t = turns.get(r.turnId) ?? { events: [] };
-  t.events.push(r);
-  turns.set(r.turnId, t);
+  if (r.kind === 'turn_created') {
+    const t = { id: r.turnId, t0: ts(r), events: [r] };
+    openTurns.set(r.turnId, t);
+    turns.push(t);
+  } else {
+    openTurns.get(r.turnId)?.events.push(r); // 対応する turn_created が無いものは測れない
+  }
 }
 const ackLat = [], firstPlay = [], covered = [];
-for (const [id, t] of turns) {
-  const created = t.events.find((e) => e.kind === 'turn_created');
-  if (!created) continue;
-  const t0 = ts(created);
+for (const t of turns) {
+  const t0 = t.t0;
   const ackPlay = t.events.find((e) => e.kind === 'play_started' && e.filler === 'ack');
   if (ackPlay) ackLat.push(ts(ackPlay) - t0);
   const respPlay = t.events.find((e) => e.kind === 'play_started' && !e.filler);
