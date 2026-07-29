@@ -7,3 +7,4 @@ node_modules/
 engine/
 tools/claw-listen
 .gstack/
+.playwright-mcp/

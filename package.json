@@ -1,7 +1,7 @@
 {
   "name": "talkingclaw",
   "version": "0.1.0",
-  "description": "アニメ声の彼女キャラ agent クロエと喋りながらコーディングできる CLI",
+  "description": "複数の coding agent が 1 つの「声の部屋」に同席し、agent ごとに違うアニメ声で喋りながら開発するローカル OSS(API キー不要)",
   "scripts": {
     "test": "npm run check-ui",
     "start": "node src/index.ts",
@@ -19,8 +19,19 @@
     "type": "git",
     "url": "git+https://github.com/shibu003/talkingclaw.git"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "codex",
+    "multi-agent",
+    "coding-agent",
+    "voice",
+    "tts",
+    "aivisspeech",
+    "voice-chat",
+    "local-first"
+  ],
+  "author": "shibu003",
   "license": "ISC",
   "type": "module",
   "bugs": {

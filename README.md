@@ -1,5 +1,8 @@
 # talkingclaw — 声の部屋
 
+[![check](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml)
+[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
+
 アニメ声の agent たちと**喋りながらコーディングする**ローカル OSS。Claude Code / Codex / Gemini CLI など MCP 対応の coding agent が 1 つの「声の部屋」に同席し、agent ごとに違うアニメ声(AivisSpeech)で返事や作業実況をする。**API キー不要 — 各 CLI のログイン(サブスク)と無料のローカル TTS / ブラウザ STT だけで動く。**
 
 - 部屋に agent が 1 人なら一対一の音声会話(**talkingclaw**)、複数入れば名前で呼び分けるマルチ agent ルーム(**talking orchestra**)。モード切替は不要 — 参加者数がモード。
@@ -135,6 +138,12 @@ npm run cli   # 部屋が無ければ自動で起動する
 
 **音声入力(マイク)だけはブラウザ専用** — 認識に使う Web Speech API がブラウザの機能のため。
 喋りたい時はブラウザ、打ち込みたい時は terminal、と使い分けられる(同じ部屋・同じ記憶)。
+
+## おまけ: ゲーム部屋
+
+声で遊べる麻雀 / ポーカー / ブラックジャックが入っている(`src/mahjong*.ts` `src/poker.ts` `src/blackjack.ts` `src/casino.ts`)。
+**声だけで状態を持つ対話を進められるか**の検証として作った簡易実装で、このプロジェクトの主題ではない。
+主題は上の「相談してから着手する」「出来上がったら git に残す」— **話しながら仕事を進める** 側にある。
 
 ## 体感を作っている仕組み
 
