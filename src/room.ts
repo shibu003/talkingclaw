@@ -103,6 +103,23 @@ let engineSpawnedAt = 0;
 const engineSpawnLog: number[] = [];
 let synthFailStreak = 0;
 
+// ---- 合成の成否報告(会話OS §4 の抽出。設計: docs/conversation-os-v0.1.md)----
+// スケジューラは「この 1 回の合成が通ったか」だけを報告する。連続失敗の数え方・fail-fast の
+// 閾値・down への遷移・その告知は、状態を持っている側(ここ)が決める = 判定した者が告知する。
+// 戻り値: この報告でエンジンを down に倒したか(true なら呼び側は retry せず即 text-only)
+function reportSynthResult(ok: boolean): boolean {
+  if (ok) { synthFailStreak = 0; return false; }
+  synthFailStreak++;
+  if (synthFailStreak >= 3 && engineState === 'ready') {
+    engineState = 'down'; // S5 engineDown: fail-fast(15s 連鎖を断つ)
+    store.append({ type: 'system', from: 'room', text: '声がうまく出せない。復旧するまで文字で続けるね' });
+    return true;
+  }
+  return false;
+}
+// スケジューラ / filler が読むのはこれだけ。engineState を直接見せない
+const isEngineReady = (): boolean => engineState === 'ready';
+
 // W9-0: 生死判定は 3 値。timeout(= 合成でビジーの可能性)と refused(= 本当に死亡)を区別する
 type EngineProbe = 'ok' | 'busy' | 'refused';
 async function engineProbe(): Promise<EngineProbe> {
@@ -283,7 +300,7 @@ function fireAck(target: string, turnId: string | undefined, utterance = ''): vo
   const p = registry.get(target);
   const pool = ackPools.get(target) ?? [];
   if (!p || !registry.alive(p)) return; // gone の相手の声で相槌しない(偽生存の防止)
-  if (p.voice.status !== 'ready' || pool.length === 0 || engineState !== 'ready') return;
+  if (p.voice.status !== 'ready' || pool.length === 0 || !isEngineReady()) return;
   if (utterance.length <= 4) return; // 「はい」等の短い発話に相槌は不要
   if (Date.now() - (lastAckAt.get(target) ?? 0) < 8_000) return; // 連発防止
   lastAckAt.set(target, Date.now());
@@ -345,11 +362,11 @@ async function runJob(job: SynthJob): Promise<void> {
   // stale drop: 2 世代以上前の未合成分だけ捨てる。直前の返事は相槌で消さない
   // (本当の割り込みはブラウザ側の barge-in が担当する)
   if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null);
-  if (engineState !== 'ready' || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
+  if (!isEngineReady() || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const wav = await voice.synthesizeWav(job.text, speaker);
-      synthFailStreak = 0;
+      reportSynthResult(true);
       if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null); // stale drop: 合成中に 2 世代進んだ
       if (!wav) return emitSpeech(null);
       const url = putAudio(wav, job.kind === 'ack-pool');
@@ -357,12 +374,8 @@ async function runJob(job: SynthJob): Promise<void> {
       else emitSpeech(url);
       return;
     } catch (error) {
-      synthFailStreak++;
-      if (synthFailStreak >= 3 && engineState === 'ready') {
-        engineState = 'down'; // S5 engineDown: fail-fast(15s 連鎖を断つ)
-        store.append({ type: 'system', from: 'room', text: '声がうまく出せない。復旧するまで文字で続けるね' });
-        return emitSpeech(null);
-      }
+      // 数えるのも倒すのも告知するのも EngineManager 側。ここは報告して結果に従うだけ
+      if (reportSynthResult(false)) return emitSpeech(null);
       if (attempt === 1) {
         console.error(`合成失敗(text-only): ${(error as Error).message}`);
         return emitSpeech(null);
