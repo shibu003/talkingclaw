@@ -252,7 +252,10 @@ function buildNarrationPool(): void {
   void resolveVoice('まお/ノーマル').then((speaker) => {
     if (speaker === null) return;
     for (const [key, text] of Object.entries(NARRATION_TEXTS)) {
-      enqueueJob({ pid: `__narration_${key}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work' }); // ack-pool は事前合成のみ・channel は不使用
+      enqueueJob({
+        pid: `__narration_${key}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work', // ack-pool は事前合成のみ・channel は不使用
+        onReady: (url) => { narrationAudio.set(key, url); if (key === 'undelivered') narrationPool.push(url); },
+      });
     }
   });
 }
@@ -264,8 +267,16 @@ const contextPools = new Map<string, string[]>();
 function buildAckPool(pid: string, speaker: number): void {
   if (ackPools.has(pid)) return;
   ackPools.set(pid, []);
-  for (const text of ACK_TEXTS) enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work' }); // ack-pool は事前合成のみ・channel は不使用
-  for (const text of CONTEXT_TEXTS) enqueueJob({ pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work' });
+  // ack-pool は事前合成のみ・channel は不使用
+  for (const text of ACK_TEXTS) {
+    enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work', onReady: (url) => { ackPools.get(pid)?.push(url); } });
+  }
+  for (const text of CONTEXT_TEXTS) {
+    enqueueJob({
+      pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work',
+      onReady: (url) => { const pool = contextPools.get(pid) ?? []; pool.push(url); contextPools.set(pid, pool); },
+    });
+  }
 }
 
 function fireAck(target: string, turnId: string | undefined, utterance = ''): void {
@@ -287,7 +298,10 @@ function fireAck(target: string, turnId: string | undefined, utterance = ''): vo
 // stale drop: user 発話ごとに speechEpoch を進め、古い epoch の speech job は合成せず text-only で流す。
 // テキストは transcript に残る(不喪失)が、遅れた読み上げで会話がズレるのを防ぐ。
 let speechEpoch = 0;
-type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string; epoch?: number; channel: Channel };
+// onReady: 事前合成(ack-pool)が出来上がった時の置き場。以前は runJob 側が pid の文字列
+// プレフィックス(__narration_ / __context_)を見て置き場を決めていたが、それだと
+// スケジューラが filler の内部状態を知ってしまう。置き場はジョブを作る側が持つ。
+type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string; epoch?: number; channel: Channel; onReady?: (url: string) => void };
 const jobQueues = new Map<string, SynthJob[]>();
 const rrOrder: string[] = [];
 let pumping = false;
@@ -339,18 +353,7 @@ async function runJob(job: SynthJob): Promise<void> {
       if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null); // stale drop: 合成中に 2 世代進んだ
       if (!wav) return emitSpeech(null);
       const url = putAudio(wav, job.kind === 'ack-pool');
-      if (job.kind === 'ack-pool') {
-        if (job.pid.startsWith('__narration_')) {
-          const key = job.pid.slice('__narration_'.length, -2);
-          narrationAudio.set(key, url);
-          if (key === 'undelivered') narrationPool.push(url);
-        } else if (job.pid.startsWith('__context_')) {
-          const pid = job.pid.slice('__context_'.length, -2);
-          const pool = contextPools.get(pid) ?? [];
-          pool.push(url);
-          contextPools.set(pid, pool);
-        } else ackPools.get(job.pid)?.push(url);
-      }
+      if (job.kind === 'ack-pool') job.onReady?.(url); // 置き場はジョブを作った側が知っている
       else emitSpeech(url);
       return;
     } catch (error) {
