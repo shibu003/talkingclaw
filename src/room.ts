@@ -10,8 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
 import { archiveIndexTail, archiveRead, archiveSession, markArchiveBaseline } from './archive.ts';
 import { EventStore, Registry, kanaNormalize, type Channel, type RoomEvent } from './roomcore.ts';
-import { UserSpeechState } from './convos/speech.ts';
-import { Voice, splitSentences } from './voice.ts';
+import { SpeechPlane, UserSpeechState } from './convos/speech.ts';
+import { Voice } from './voice.ts'; // splitSentences は音声平面(convos/speech.ts)へ移った
 import * as casino from './casino.ts';
 
 const PORT = Number(process.env.PORT ?? 3300);
@@ -175,7 +175,7 @@ async function engineLoop(): Promise<void> {
   for (;;) {
     await new Promise((r) => setTimeout(r, 5000));
     // 合成中は判定しない — 単一ロックでビジーなだけの生きたエンジンを殺さない(W9-0)
-    if (pumping) { probeFailStreak = 0; continue; }
+    if (speech.busy) { probeFailStreak = 0; continue; }
 
     const probe = await engineProbe();
     if (probe === 'ok') {
@@ -235,14 +235,14 @@ async function resolveVoice(requested: string): Promise<number | null> {
 }
 
 async function onEngineReady(): Promise<void> {
-  buildNarrationPool();
+  speech.buildNarrationPool();
   for (const p of registry.all()) {
     if (p.voice.status === 'ready') continue;
     const speaker = await resolveVoice(p.voice.requested);
     p.voice.resolvedSpeaker = speaker;
     p.voice.status = speaker === null ? 'voice_unavailable' : 'ready';
     store.append({ type: 'presence', from: p.participantId, name: p.assignedName, text: `voice:${p.voice.status}` });
-    if (speaker !== null) buildAckPool(p.participantId, speaker);
+    if (speaker !== null) speech.buildAckPool(p.participantId, speaker);
   }
 }
 
@@ -251,160 +251,14 @@ async function onEngineReady(): Promise<void> {
 // ここを見る(状態源を 2 つ持たない)。
 const userSpeech = new UserSpeechState();
 
-// ---- FillerEngine(S6): 相槌は事前合成プールのみ。動的合成は本応答だけ ----
-const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
-const ackPools = new Map<string, string[]>();
-let ackRotate = 0;
-const lastAckAt = new Map<string, number>(); // 実機フィードバック: 相槌の連発防止
-// ナレーション(未達通知・状況報告)= まお/ノーマル固定(S6)。engineReady で合成
-const NARRATION_TEXTS = {
-  undelivered: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
-  status: 'まだ作業中みたい。もう少し待ってね',
-} as const;
-const narrationAudio = new Map<string, string>(); // key → /audio path
-const narrationPool: string[] = []; // 後方互換(未達通知 = undelivered)
+// ---- 音声平面(会話OS §4.1/§4.3): TtsScheduler + FillerEngine ----
+// 実装は src/convos/speech.ts。EngineManager は room.ts に残したまま、エンジンの生死は
+// getter(isEngineReady)と報告 callback(reportSynthResult)だけを渡す(C1-①c で切った境界)。
+const speech = new SpeechPlane({
+  store, registry, voice, putAudio, isEngineReady, reportSynthResult, resolveVoice,
+  metric, turnChannel, userSpeech,
+});
 
-function buildNarrationPool(): void {
-  if (narrationAudio.size > 0) return;
-  void resolveVoice('まお/ノーマル').then((speaker) => {
-    if (speaker === null) return;
-    for (const [key, text] of Object.entries(NARRATION_TEXTS)) {
-      enqueueJob({
-        pid: `__narration_${key}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work', // ack-pool は事前合成のみ・channel は不使用
-        onReady: (url) => { narrationAudio.set(key, url); if (key === 'undelivered') narrationPool.push(url); },
-      });
-    }
-  });
-}
-
-// 文脈 filler(target の声・事前合成)— S6
-const CONTEXT_TEXTS = ['ん、いま考えてるところ。', 'ちょっと確認してるね。'];
-const contextPools = new Map<string, string[]>();
-
-function buildAckPool(pid: string, speaker: number): void {
-  if (ackPools.has(pid)) return;
-  ackPools.set(pid, []);
-  // ack-pool は事前合成のみ・channel は不使用
-  for (const text of ACK_TEXTS) {
-    enqueueJob({ pid, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work', onReady: (url) => { ackPools.get(pid)?.push(url); } });
-  }
-  for (const text of CONTEXT_TEXTS) {
-    enqueueJob({
-      pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work',
-      onReady: (url) => { const pool = contextPools.get(pid) ?? []; pool.push(url); contextPools.set(pid, pool); },
-    });
-  }
-}
-
-function fireAck(target: string, turnId: string | undefined, utterance = ''): void {
-  const p = registry.get(target);
-  const pool = ackPools.get(target) ?? [];
-  if (!p || !registry.alive(p)) return; // gone の相手の声で相槌しない(偽生存の防止)
-  if (p.voice.status !== 'ready' || pool.length === 0 || !isEngineReady()) return;
-  if (utterance.length <= 4) return; // 「はい」等の短い発話に相槌は不要
-  if (Date.now() - (lastAckAt.get(target) ?? 0) < 8_000) return; // 連発防止
-  lastAckAt.set(target, Date.now());
-  ackRotate += 1 + Math.floor(Math.random() * ACK_TEXTS.length); // 機械的ローテを崩す
-  const text = ACK_TEXTS[ackRotate % ACK_TEXTS.length];
-  const audio = pool[ackRotate % pool.length];
-  const ackEv = store.append({ type: 'agent_speech', from: target, name: p.assignedName, text, audio, filler: 'ack', turnId, channel: turnChannel(turnId) });
-  metric('ack_emitted', { turnId, eventId: ackEv.id });
-}
-
-// ---- TtsScheduler(S5): participant 内 FIFO、participant 間は (priority, round-robin) ----
-// stale drop: user 発話ごとに speechEpoch を進め、古い epoch の speech job は合成せず text-only で流す。
-// テキストは transcript に残る(不喪失)が、遅れた読み上げで会話がズレるのを防ぐ。
-let speechEpoch = 0;
-// onReady: 事前合成(ack-pool)が出来上がった時の置き場。以前は runJob 側が pid の文字列
-// プレフィックス(__narration_ / __context_)を見て置き場を決めていたが、それだと
-// スケジューラが filler の内部状態を知ってしまう。置き場はジョブを作る側が持つ。
-type SynthJob = { pid: string; priority: 1 | 2 | 3; kind: 'speech' | 'ack-pool'; text: string; speaker?: number; turnId?: string; epoch?: number; channel: Channel; onReady?: (url: string) => void };
-const jobQueues = new Map<string, SynthJob[]>();
-const rrOrder: string[] = [];
-let pumping = false;
-
-function enqueueJob(job: SynthJob): void {
-  const q = jobQueues.get(job.pid) ?? [];
-  if (job.kind === 'speech' && q.filter((j) => j.kind === 'speech').length >= 20) {
-    const p = registry.get(job.pid);
-    store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio: null, turnId: job.turnId, channel: job.channel });
-    return; // per-participant 上限: 古い順でなく新規を text-only(FIFO 順序を保つ)
-  }
-  // priority inversion 防止: pickNext はキュー先頭しか見ないので、speech を先頭の ack-pool 群より
-  // 前に差し込む(でないと再起動直後、本発話が自分のプール事前合成の後ろで数分待たされる)。
-  // speech 同士の FIFO と ack-pool 同士の順序はどちらも保たれる
-  const poolIdx = job.kind === 'speech' ? q.findIndex((j) => j.kind === 'ack-pool') : -1;
-  if (poolIdx >= 0) q.splice(poolIdx, 0, job);
-  else q.push(job);
-  jobQueues.set(job.pid, q);
-  if (!rrOrder.includes(job.pid)) rrOrder.push(job.pid);
-  void pump();
-}
-
-function pickNext(): SynthJob | null {
-  let best: { pid: string; prio: number } | null = null;
-  for (const pid of rrOrder) {
-    const head = jobQueues.get(pid)?.[0];
-    if (!head) continue;
-    if (!best || head.priority < best.prio) best = { pid, prio: head.priority };
-  }
-  if (!best) return null;
-  rrOrder.push(...rrOrder.splice(rrOrder.indexOf(best.pid), 1)); // 使った participant を末尾へ(round-robin)
-  return jobQueues.get(best.pid)!.shift()!;
-}
-
-async function runJob(job: SynthJob): Promise<void> {
-  const p = registry.get(job.pid);
-  const speaker = job.speaker ?? p?.voice.resolvedSpeaker ?? null;
-  const emitSpeech = (audio: string | null) => {
-    if (job.kind === 'speech') store.append({ type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text, audio, turnId: job.turnId, channel: job.channel });
-  };
-  // stale drop: 2 世代以上前の未合成分だけ捨てる。直前の返事は相槌で消さない
-  // (本当の割り込みはブラウザ側の barge-in が担当する)
-  if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null);
-  if (!isEngineReady() || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const wav = await voice.synthesizeWav(job.text, speaker);
-      reportSynthResult(true);
-      if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < speechEpoch - 1) return emitSpeech(null); // stale drop: 合成中に 2 世代進んだ
-      if (!wav) return emitSpeech(null);
-      const url = putAudio(wav, job.kind === 'ack-pool');
-      if (job.kind === 'ack-pool') job.onReady?.(url); // 置き場はジョブを作った側が知っている
-      else emitSpeech(url);
-      return;
-    } catch (error) {
-      // 数えるのも倒すのも告知するのも EngineManager 側。ここは報告して結果に従うだけ
-      if (reportSynthResult(false)) return emitSpeech(null);
-      if (attempt === 1) {
-        console.error(`合成失敗(text-only): ${(error as Error).message}`);
-        return emitSpeech(null);
-      }
-    }
-  }
-}
-
-async function pump(): Promise<void> {
-  if (pumping) return;
-  pumping = true;
-  try {
-    for (;;) {
-      const job = pickNext();
-      if (!job) break;
-      await userSpeech.waitUntilDone(); // ユーザー発話中は AI 側の音声(本応答・filler 問わず)を先に進めない
-      await runJob(job);
-    }
-  } finally {
-    pumping = false;
-  }
-}
-
-function speakSentences(from: string, name: string, text: string, turnId: string | undefined, channel: Channel): void {
-  const sentences = splitSentences(text);
-  sentences.forEach((sentence, i) => {
-    enqueueJob({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch, channel });
-  });
-}
 
 // ---- listen waiter(participant 毎 1 つ。新 listen が旧を no_speech 解決)----
 type Waiter = { resolve: (body: object) => void; timer: NodeJS.Timeout };
@@ -691,7 +545,7 @@ function tryGame(text: string): number | null {
     store.append({ type: 'system', from: 'room', text: line, channel: activeChannel });
   }
   const name = registry.get(chloePid)?.assignedName ?? config.character.name;
-  for (const line of reply.say) speakSentences(chloePid, name, line, turnId, activeChannel);
+  for (const line of reply.say) speech.speakSentences(chloePid, name, line, turnId, activeChannel);
   return ev.id;
 }
 
@@ -767,7 +621,7 @@ function userSpeech(rawText: string): RoomEvent {
     void askUserPermission('テスト機能').then((ok) => store.append({ type: 'system', from: 'room', text: `perm:${ok}` }));
     return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
   }
-  speechEpoch++; // stale drop: これ以前に積まれた speech job は読み上げない
+  speech.advanceEpoch(); // stale drop: これ以前に積まれた speech job は読み上げない
   const { targets, routing } = routeTargets(text);
   const turnId = `T${++turnSeq}`;
   const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel: activeChannel, files: pendingFiles.length > 0 ? pendingFiles : undefined });
@@ -775,7 +629,7 @@ function userSpeech(rawText: string): RoomEvent {
   metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
     trackTurn(turnId, targets[0], text, activeChannel);
-    fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
+    speech.fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
     scheduleEscalation(turnId, targets[0], 1, 3_500); // /played で前倒し、無ければ fallback
     scheduleUndeliveredNotice(turnId, targets[0]);
   }
@@ -793,8 +647,8 @@ function askUserPermission(desc: string): Promise<boolean> {
     pendingPermission = { resolve, timer, desc };
     store.append({ type: 'system', from: 'room', text: `許可待ち: ${desc}(「いいよ」/「だめ」で答えてね)` });
     if (chloePid) {
-      speechEpoch++; // 直前の読み上げ待ちより優先して届ける
-      enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', epoch: speechEpoch, channel: 'work' });
+      speech.advanceEpoch(); // 直前の読み上げ待ちより優先して届ける
+      speech.enqueue({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', epoch: speech.epoch, channel: 'work' });
     }
   });
 }
@@ -804,7 +658,7 @@ function finishPermission(ok: boolean, say: string): void {
   clearTimeout(pendingPermission.timer);
   pendingPermission.resolve(ok);
   pendingPermission = null;
-  if (chloePid) enqueueJob({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', epoch: speechEpoch, channel: 'work' });
+  if (chloePid) speech.enqueue({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', epoch: speech.epoch, channel: 'work' });
 }
 
 const PERM_YES = /^(はい|うん|いいよ|いいですよ|おっけ|オッケー|ok|オーケー|許可|どうぞ|やって|承認)/i;
@@ -837,18 +691,17 @@ function scheduleEscalation(turnId: string, target: string, stage: number, delay
     if (!t || t.responded || !t.delivered) return; // 応答済み/未配送(未達経路が担当)は終了
     const p = registry.get(target);
     if (stage === 1) {
-      const pool = contextPools.get(target) ?? [];
+      const cue = speech.contextCue(target, statusRotate);
       const ev = store.append({
         type: 'agent_speech', from: target, name: p?.assignedName,
-        text: CONTEXT_TEXTS[statusRotate % CONTEXT_TEXTS.length],
-        audio: pool[statusRotate % Math.max(1, pool.length)] ?? null, filler: 'context', turnId, channel: t.channel,
+        text: cue.text, audio: cue.audio, filler: 'context', turnId, channel: t.channel,
       });
       metric('filler_emitted', { turnId, stage, eventId: ev.id });
       scheduleEscalation(turnId, target, 2, 8_000); // /played が来れば前倒し(下の onPlayed 経由)
     } else if (stage <= 3) {
       const ev = store.append({
         type: 'agent_speech', from: 'room', name: 'ナレーション',
-        text: NARRATION_TEXTS.status, audio: narrationAudio.get('status') ?? null, filler: 'status', turnId, channel: t.channel,
+        ...speech.statusCue(), filler: 'status', turnId, channel: t.channel,
       });
       metric('filler_emitted', { turnId, stage, eventId: ev.id });
       if (stage < 3) scheduleEscalation(turnId, target, stage + 1, 8_000);
@@ -885,8 +738,7 @@ function scheduleUndeliveredNotice(turnId: string, target: string): void {
     lastNoticeAt.set(target, Date.now());
     store.append({
       type: 'agent_speech', from: 'room', name: 'ナレーション',
-      text: '呼んだ相手は今手が離せないみたい。届いたら読んでもらうね',
-      audio: narrationPool[0] ?? null, filler: 'status', turnId, channel: t.channel,
+      ...speech.undeliveredCue(), filler: 'status', turnId, channel: t.channel,
     });
     if (floorOwner === target) floorOwner = null;
   }, 12_000);
@@ -1145,7 +997,7 @@ function startChloe(): void {
       if (speaker === null) return;
       chloe.voice.resolvedSpeaker = speaker;
       chloe.voice.status = 'ready';
-      buildAckPool(chloePid!, speaker);
+      speech.buildAckPool(chloePid!, speaker);
     });
   }
 
@@ -1196,8 +1048,8 @@ function startChloe(): void {
     if (n <= unreadNotified) return;
     unreadNotified = n;
     if (n >= 2) {
-      enqueueJob({
-        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+      speech.enqueue({
+        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speech.epoch, channel: 'work',
         text: `報告が ${n} 件たまってるよ。読んでほしい時は「報告読んで」って言ってね。`,
       });
     }
@@ -1248,8 +1100,8 @@ function startChloe(): void {
         const task = taskQueue.shift()!;
         task.status = 'working';
         saveTasks();
-        enqueueJob({
-          pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+        speech.enqueue({
+          pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speech.epoch, channel: 'work',
           text: `${task.request.slice(0, 20)}、始めるね。`,
         });
         await runTask(task, slot);
@@ -1374,8 +1226,8 @@ function startChloe(): void {
       saveTasks();
       notifyUnread();
       const firstCan = task.report.can[0] ? `${task.report.can[0]} ` : '';
-      enqueueJob({
-        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
+      speech.enqueue({
+        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speech.epoch, channel: 'work',
         text: `${task.report.headline}、できたよ。${firstCan}確かめかたは報告に入れておくね。`,
       });
     } catch (error) {
@@ -1580,7 +1432,7 @@ function startChloe(): void {
     let first = true;
     return (sentence) => {
       if (first && turnId) markResponded(turnId);
-      enqueueJob({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speechEpoch, channel });
+      speech.enqueue({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speech.epoch, channel });
       first = false;
     };
   };
@@ -1932,7 +1784,7 @@ const server = createServer(async (req, res) => {
       const speaker = await resolveVoice(p.voice.requested);
       p.voice.resolvedSpeaker = speaker;
       p.voice.status = speaker === null ? 'voice_unavailable' : 'ready';
-      if (speaker !== null) buildAckPool(p.participantId, speaker);
+      if (speaker !== null) speech.buildAckPool(p.participantId, speaker);
     }
     if (mode === 'takeover') {
       // S3: 旧 session の pending waiter を即 unknown_participant で解決 + superseded 通知
@@ -2283,7 +2135,7 @@ const server = createServer(async (req, res) => {
     }
     const resolvedTurn = attributeTurn(p.participantId, body.turnId ? String(body.turnId) : undefined);
     const speakTurnId = resolvedTurn === 'none' ? undefined : resolvedTurn;
-    speakSentences(p.participantId, p.assignedName, text, speakTurnId, turnChannel(speakTurnId));
+    speech.speakSentences(p.participantId, p.assignedName, text, speakTurnId, turnChannel(speakTurnId));
     return json(res, 200, { status: engineState === 'ready' && p.voice.status === 'ready' ? 'ok' : 'text_only' });
   }
 
