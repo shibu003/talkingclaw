@@ -963,11 +963,14 @@ function loadProjects(): Record<string, string> {
 
 // ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
 const SETTINGS_PATH = join(homedir(), '.talkingclaw', 'settings.json');
-type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string; consultMode: boolean; autoCommit: boolean; autoPush: boolean };
+type WorkerSettings = { workerModel: string; workerEffort: string; useUserSettings: boolean; chatModel: string; chatEffort: string; consultMode: boolean; autoCommit: boolean; autoPush: boolean; workers: number };
 function loadSettings(): WorkerSettings {
   const defaults: WorkerSettings = {
     workerModel: config.agent.model, workerEffort: '', useUserSettings: false,
     chatModel: config.model, chatEffort: '',
+    // W25: 同時に動かす作業係の人数。既定 1 = 従来どおり 1 件ずつ。
+    // 増やすとコストも人数ぶん増える(npm run cost で試算できる)ので、明示的に上げた時だけ並列になる
+    workers: 1,
     consultMode: true, // 既定は相談モード: いきなり着手せず、まず進め方を相談して合意してから登録する
     autoCommit: true,  // 作業が終わったら作業先フォルダで commit まで
     autoPush: false,   // push は取り返しがつかないので、明示 ON にした時だけ
@@ -979,6 +982,8 @@ function loadSettings(): WorkerSettings {
   }
 }
 let workerSettings = loadSettings();
+// W25: 同時に動かす作業係の人数。設定値をそのまま信じず 1〜4 に丸める
+const workerCount = (): number => Math.max(1, Math.min(4, Number(workerSettings.workers) || 1));
 function saveSettings(): void {
   try { writeFileSync(SETTINGS_PATH, JSON.stringify(workerSettings), { mode: 0o600 }); } catch { /* */ }
 }
@@ -1161,8 +1166,10 @@ function startChloe(): void {
 
   // --- W8-2: worker(実作業係)。会話 Brain とは別セッションで並行動作 ---
   mkdirSync(config.agent.cwd, { recursive: true });
-  let worker: Brain | null = null;
-  let workerBusy = false;
+  // W25: 作業係のスロット。1 スロット = 1 セッション(Brain)+ その作業先。
+  // 空いているスロットが queue から次を取るので、人数を増やすとそのぶん同時に進む。
+  type WorkerSlot = { brain: Brain | null; cwd: string; busy: boolean };
+  const slots: WorkerSlot[] = [{ brain: null, cwd: '', busy: false }];
   const taskQueue: OfficeTask[] = [];
 
   function delegate(description: string, project?: string): OfficeTask {
@@ -1214,14 +1221,26 @@ function startChloe(): void {
     store.append({ type: 'system', from: 'room', text: `会話の設定を切り替えたよ(モデル ${workerSettings.chatModel} / 相談モード ${workerSettings.consultMode ? 'あり' : 'なし'})` });
   };
 
+  // 設定を変えたら、空いているスロットのセッションだけ作り直す(作業中のものは触らない)
   chloeResetWorker = () => {
-    if (!workerBusy && worker) { void worker.close().catch(() => {}); worker = null; }
-    else if (!workerBusy) worker = null;
+    for (const slot of slots) {
+      if (slot.busy) continue;
+      if (slot.brain) void slot.brain.close().catch(() => {});
+      slot.brain = null;
+    }
+    void pumpTasks(); // 人数を増やした直後に、待っている依頼を配り直す
   };
 
+  // 空きスロットに queue の先頭から配る。人数ぶん同時に走る(既定 1 人なら従来どおり直列)
   async function pumpTasks(): Promise<void> {
-    if (workerBusy) return;
-    workerBusy = true;
+    while (slots.length < workerCount()) slots.push({ brain: null, cwd: '', busy: false });
+    for (const slot of slots.slice(0, workerCount())) {
+      if (!slot.busy && taskQueue.length > 0) void runSlot(slot);
+    }
+  }
+
+  async function runSlot(slot: WorkerSlot): Promise<void> {
+    slot.busy = true;
     try {
       while (taskQueue.length > 0) {
         const task = taskQueue.shift()!;
@@ -1231,15 +1250,13 @@ function startChloe(): void {
           pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speechEpoch, channel: 'work',
           text: `${task.request.slice(0, 20)}、始めるね。`,
         });
-        await runTask(task);
+        await runTask(task, slot);
         saveTasks();
       }
     } finally {
-      workerBusy = false;
+      slot.busy = false;
     }
   }
-
-  let workerCwd = '';
 
   // ---- 作業が終わったら git に残す(相談 → 実行 → 記録 を繋ぐ)----
   // 既定はローカル commit まで。push は取り返しがつかないので ⚙ で明示 ON にした時だけ。
@@ -1294,12 +1311,12 @@ function startChloe(): void {
     // W12: 途中経過は会話ストリームに流さない。スレッド(notes)に溜めて INBOX で読む
   };
 
-  async function runTask(task: OfficeTask): Promise<void> {
+  async function runTask(task: OfficeTask, slot: WorkerSlot): Promise<void> {
     const projects = loadProjects();
     const cwd = (task.project && projects[task.project]) || config.agent.cwd;
-    if (worker && workerCwd !== cwd) { void worker.close().catch(() => {}); worker = null; } // プロジェクト切替
-    if (!worker) {
-      workerCwd = cwd;
+    if (slot.brain && slot.cwd !== cwd) { void slot.brain.close().catch(() => {}); slot.brain = null; } // プロジェクト切替
+    if (!slot.brain) {
+      slot.cwd = cwd;
       const ext = loadWorkerMcp();
       const allowList = [...(config.agent.allowedTools as unknown as string[]), ...ext.allow];
       const opts = {
@@ -1321,12 +1338,13 @@ function startChloe(): void {
         ...(workerSettings.workerEffort ? { effort: workerSettings.workerEffort } : {}),
       };
       try {
-        worker = new Brain(opts);
+        slot.brain = new Brain(opts);
       } catch {
         delete (opts as Record<string, unknown>).effort; // SDK が effort 未対応でも作業は続ける
-        worker = new Brain(opts);
+        slot.brain = new Brain(opts);
       }
     }
+    const brain = slot.brain;
     try {
       const others = officeTasks.filter((t) => t.id !== task.id && (t.status === 'queued' || t.status === 'working'));
       const brief = others.length > 0
@@ -1335,12 +1353,12 @@ function startChloe(): void {
       const followUp = (task.replies ?? []).length > 0
         ? `(この作業の続き。前回の報告: ${task.report?.headline ?? '(なし)'})\n追加の依頼: ${task.replies![task.replies!.length - 1].text}\n`
         : '';
-      const askP = worker.ask(brief + followUp + task.request, workerSay(task));
+      const askP = brain.ask(brief + followUp + task.request, workerSay(task));
       const result = await Promise.race([askP, timeoutMarker(600_000)]);
       if (result === TIMEOUT) {
-        await worker.interrupt().catch(() => {});
+        await brain.interrupt().catch(() => {});
         const grace = await Promise.race([askP.catch(() => ''), timeoutMarker(15_000)]);
-        if (grace === TIMEOUT) { void worker.close().catch(() => {}); worker = null; }
+        if (grace === TIMEOUT) { void brain.close().catch(() => {}); slot.brain = null; }
         task.status = 'failed';
         store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、作業が長引きすぎたから一旦止めたよ。', audio: null, turnId: 'none', channel: 'work' });
         return;
@@ -1383,8 +1401,9 @@ function startChloe(): void {
             name: p.assignedName, presence: registry.presence(p, waiters.has(p.participantId)), voice: p.voice.status,
           }));
           return { content: [{ type: 'text', text: JSON.stringify({
-            note: '作業係は 1 人だけで、タスクは 1 件ずつ順番に処理される(並行実行はしていない)。この事実に反することを言わないこと。',
-            workerBusyWith: officeTasks.find((t) => t.status === 'working')?.request?.slice(0, 60) ?? null,
+            note: `作業係は今 ${workerCount()} 人。同時に動くのは最大 ${workerCount()} 件で、あふれた依頼は queued のまま待つ。動いている件数も待っている件数も、下の workingNow と tasks のとおりに答えること。数を盛らない・減らさない。`,
+            workerCount: workerCount(),
+            workingNow: officeTasks.filter((t) => t.status === 'working').map((t) => t.request.slice(0, 60)),
             consultMode: workerSettings.consultMode,
             planUnderDiscussion: plan, // 相談中の案(まだ着手していない)
             tasks, people, userScreen: uiState, engine: engineState, activeChannel,
@@ -1505,12 +1524,20 @@ function startChloe(): void {
       model: workerSettings.chatModel,
       ...(workerSettings.chatEffort ? { effort: workerSettings.chatEffort } : {}),
       mcpServers: { office: officeServer } as Record<string, unknown>,
-      allowedTools: channel === 'work'
-        ? [...workTools, 'mcp__office__read_inbox', 'mcp__office__mark_read', 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']
-        : ['mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word'],
-      maxTurns: 8, // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
-      // 会話 Brain は実作業ツールを使わない。組み込みツールへの誘惑は却下 + 誘導
+      allowedTools: [
+        // W24: 読むだけの道具はどちらの部屋でも持たせる。
+        // 「推測で答えない」と指示しておきながら調べる手段が無いのが、精度の一番の天井だった
+        ...config.convReadTools,
+        ...(channel === 'work'
+          ? [...workTools, 'mcp__office__read_inbox', 'mcp__office__mark_read', 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']
+          : ['mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']),
+      ],
+      // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
+      // W24: 読んでから答える分の往復が増えたので 8 → 12(必要な分しか使わない)
+      maxTurns: 12,
+      // 会話 Brain は「読む」までは自分でやる。書き換え(Write / Edit / Bash)は却下して作業係へ誘導
       canUseTool: async (name: string, input: Record<string, unknown>) => {
+        if (config.convReadTools.includes(name)) return { behavior: 'allow' as const, updatedInput: input };
         if (name === 'mcp__office__remember' || name === 'mcp__office__room_status') return { behavior: 'allow' as const, updatedInput: input };
         if (channel === 'work' && workTools.includes(name)) return { behavior: 'allow' as const, updatedInput: input };
         if (name === 'mcp__office__delegate_task' && channel === 'work') {
@@ -1978,6 +2005,8 @@ const server = createServer(async (req, res) => {
     if (typeof body.consultMode === 'boolean') workerSettings.consultMode = body.consultMode;
     if (typeof body.autoCommit === 'boolean') workerSettings.autoCommit = body.autoCommit;
     if (typeof body.autoPush === 'boolean') workerSettings.autoPush = body.autoPush;
+    // W25: 同時に動かす作業係の人数(1〜4)。増やすとコストも人数ぶん増える
+    if (typeof body.workers === 'number' && body.workers >= 1 && body.workers <= 4) workerSettings.workers = Math.floor(body.workers);
     const beforeChat = `${workerSettings.chatModel}/${workerSettings.chatEffort}`;
     if (typeof body.chatModel === 'string' && allowedModels.includes(body.chatModel)) workerSettings.chatModel = body.chatModel;
     if (typeof body.chatEffort === 'string' && ['', 'low', 'medium', 'high', 'xhigh', 'max'].includes(body.chatEffort)) workerSettings.chatEffort = body.chatEffort;

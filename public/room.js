@@ -2021,6 +2021,16 @@ async function renderSettings() {
   }
   chatEffortSel.onchange = () => void post('/settings', { chatEffort: chatEffortSel.value });
   mk('会話 effort:', chatEffortSel);
+  // 同時に動く作業係の人数。増やすとコストも人数ぶん増えるので、数字の横に注意を出す
+  const workersSel = document.createElement('select');
+  for (const n of [1, 2, 3, 4]) {
+    const o = document.createElement('option');
+    o.value = String(n); o.textContent = n === 1 ? '1 人(順番に)' : `${n} 人(同時に)`;
+    if (Number(d.workers ?? 1) === n) o.selected = true;
+    workersSel.appendChild(o);
+  }
+  workersSel.onchange = () => void post('/settings', { workers: Number(workersSel.value) });
+  mk('同時に動く作業係(コストも人数ぶん増える):', workersSel);
   const consult = document.createElement('input');
   consult.type = 'checkbox'; consult.checked = d.consultMode !== false;
   consult.onchange = () => void post('/settings', { consultMode: consult.checked });
