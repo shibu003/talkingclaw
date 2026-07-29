@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
 import { archiveIndexTail, archiveRead, archiveSession, markArchiveBaseline } from './archive.ts';
 import { EventStore, Registry, kanaNormalize, type Channel, type RoomEvent } from './roomcore.ts';
+import { UserSpeechState } from './convos/speech.ts';
 import { Voice, splitSentences } from './voice.ts';
 import * as casino from './casino.ts';
 
@@ -228,25 +229,10 @@ async function onEngineReady(): Promise<void> {
   }
 }
 
-// ---- UserSpeechState: 「ユーザーが今話しているか」の単一の状態源 ----
-// ブラウザの STT interim 結果を /speech-state で報告させて保持する。AI 側の音声出力(TtsScheduler の
-// pump / filler escalation)はこれを見て、ユーザーが話し終わるまで先に進めない。/participants で読めるので
-// 画面状態を認知したい他機能からも再利用できる。client からの更新が途切れても STALE_MS で自動解除(deadlock 防止)。
-let userSpeaking = false;
-let userSpeakingAt = 0;
-const USER_SPEAKING_STALE_MS = 4_000;
-function isUserSpeaking(): boolean {
-  return userSpeaking && Date.now() - userSpeakingAt < USER_SPEAKING_STALE_MS;
-}
-function waitUntilUserDone(): Promise<void> {
-  return new Promise((resolve) => {
-    const check = (): void => {
-      if (!isUserSpeaking()) return resolve();
-      setTimeout(check, 200);
-    };
-    check();
-  });
-}
+// ---- UserSpeechState(会話OS §4.8)----
+// 実装は src/convos/speech.ts。/participants からも読めるので、画面状態を知りたい他機能も
+// ここを見る(状態源を 2 つ持たない)。
+const userSpeech = new UserSpeechState();
 
 // ---- FillerEngine(S6): 相槌は事前合成プールのみ。動的合成は本応答だけ ----
 const ACK_TEXTS = ['ん、見てみるね。', 'うん、ちょっと待ってて。', 'はーい、確認するね。'];
@@ -389,7 +375,7 @@ async function pump(): Promise<void> {
     for (;;) {
       const job = pickNext();
       if (!job) break;
-      await waitUntilUserDone(); // ユーザー発話中は AI 側の音声(本応答・filler 問わず)を先に進めない
+      await userSpeech.waitUntilDone(); // ユーザー発話中は AI 側の音声(本応答・filler 問わず)を先に進めない
       await runJob(job);
     }
   } finally {
@@ -707,11 +693,11 @@ function acceptUtterance(text: string): RoomEvent | null {
   if (pending?.timer) clearTimeout(pending.timer);
 
   const heldTooLong = Date.now() - firstAt >= FRAGMENT_MAX_HOLD_MS;
-  if (!looksIncomplete(text) && !isUserSpeaking()) {
+  if (!looksIncomplete(text) && !userSpeech.active) {
     pending = null;
     return userSpeech(merged); // 言い切っていて、もう話していない → 即確定
   }
-  if (heldTooLong && !isUserSpeaking()) {
+  if (heldTooLong && !userSpeech.active) {
     pending = null;
     return userSpeech(merged);
   }
@@ -726,7 +712,7 @@ function armPending(delayMs: number): void {
   if (pending.timer) clearTimeout(pending.timer);
   const timer = setTimeout(() => {
     if (!pending) return;
-    if (isUserSpeaking() && Date.now() - pending.firstAt < FRAGMENT_MAX_HOLD_MS) {
+    if (userSpeech.active && Date.now() - pending.firstAt < FRAGMENT_MAX_HOLD_MS) {
       armPending(500); // まだ喋ってる → もう少し待つ
       return;
     }
@@ -746,7 +732,7 @@ function flushPending(): void {
 
 function userSpeech(rawText: string): RoomEvent {
   const text = applyDict(rawText);
-  userSpeaking = false; // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
+  userSpeech.clear(); // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
   // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う
   if (pendingPermission) {
     const t = text.trim();
@@ -830,7 +816,7 @@ function scheduleEscalation(turnId: string, target: string, stage: number, delay
   cancelEscalation(turnId);
   const timer = setTimeout(() => {
     escalations.delete(turnId);
-    if (isUserSpeaking()) return scheduleEscalation(turnId, target, stage, 500); // ユーザーが話し続けてる間は先送り
+    if (userSpeech.active) return scheduleEscalation(turnId, target, stage, 500); // ユーザーが話し続けてる間は先送り
     const t = turns.get(turnId);
     if (!t || t.responded || !t.delivered) return; // 応答済み/未配送(未達経路が担当)は終了
     const p = registry.get(target);
@@ -1873,7 +1859,7 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && path === '/participants') {
     return json(res, 200, {
       selected: selectedPid,
-      userSpeaking: isUserSpeaking(),
+      userSpeaking: userSpeech.active,
       channel: activeChannel,
       participants: registry.all().map((p) => ({
         participantId: p.participantId,
@@ -2144,7 +2130,7 @@ const server = createServer(async (req, res) => {
     // 在室者・誰と話しているか(routing)・発話中/待機中・作業ボード・直近ログを 1 回でまとめて返す
     return json(res, 200, {
       bootId: store.bootId,
-      userSpeaking: isUserSpeaking(), // ユーザーの現在の発話状態(単一の状態源。UserSpeechState 参照)
+      userSpeaking: userSpeech.active, // ユーザーの現在の発話状態(単一の状態源。UserSpeechState 参照)
       participants: registry.all().map((p) => ({
         participantId: p.participantId,
         name: p.assignedName,
@@ -2230,12 +2216,10 @@ const server = createServer(async (req, res) => {
 
   if (path === '/speech-state') {
     // ブラウザ側の STT interim/final から「ユーザーが今話しているか」を報告させる。認証はトークンのみ(participant 不問)。
-    const wasSpeaking = userSpeaking;
-    userSpeaking = body.speaking === true;
+    const speaking = body.speaking === true;
     // W11-1: 話し終わった瞬間に、溜めていた断片を 1 発話として確定する
-    if (wasSpeaking && !userSpeaking) setTimeout(() => flushPending(), 250).unref();
-    userSpeakingAt = Date.now();
-    return json(res, 200, { ok: true, userSpeaking });
+    if (userSpeech.report(speaking)) setTimeout(() => flushPending(), 250).unref();
+    return json(res, 200, { ok: true, userSpeaking: speaking });
   }
 
   if (path === '/played') {
