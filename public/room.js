@@ -633,6 +633,7 @@ async function refreshRoster() {
       };
       rosterEl.appendChild(chip);
     }
+    updateRailMe();   // 相手を変えたらレール下部の表示も合わせる(名前が出揃った後に呼ぶ)
   } catch { /* 次の更新で */ }
 }
 // 別の部屋にいる相手を呼ぶかどうかを、その場で選ばせる(勝手に動かさない)
@@ -816,6 +817,7 @@ function renderRoomsExtra() {
       const d = await r.json();
       if (!r.ok) { addSys(d.error ?? '部屋を操作できなかった'); return; }
       input.value = '';
+      box.classList.remove('open');   // 作れたら吹き出しは畳む(出しっぱなしは会話を覆う)
       if (action === 'create') { await renderRooms(); await enterRoom(d.channel); }
       else { await renderRooms(); updateRoomBtn(); }
     } catch { addSys('サーバに繋がらないみたい'); }
@@ -834,7 +836,12 @@ function renderRailTools() {
   const host = document.getElementById('roomList');
   if (!wideLayout()) return;
   for (const [icon, label, run] of [
-    ['＋', '作る', () => { showPanelForce('rooms'); voiceTarget('room-name-input')?.focus(); }],
+    // レールでは #rooms は常設なのでパネルを開く意味がない。
+    // 隠れている入力欄そのものを出す(出さないと focus も効かず、押しても無反応になる)
+    ['＋', '作る', () => {
+      document.getElementById('roomsExtra').classList.add('open');
+      voiceTarget('room-name-input')?.focus();
+    }],
     ['📄', '記録', () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel)],
   ]) {
     const b = document.createElement('button');
@@ -850,13 +857,81 @@ function renderRailTools() {
   }
 }
 
+// 部屋の性格で束ねる。作業と雑談と遊びは別のものなので、混ぜて並べると選べない
+const ROOM_GROUP = { work: '作業', chat: '話す', game: '遊ぶ' };
+const GROUP_ORDER = ['作業', '話す', '遊ぶ', 'その他'];
+
+// 絞り込み。部屋が少ないうちは欄そのものを出さない(空欄が場所を取るだけ)
+function applyRoomFilter() {
+  const el = document.getElementById('roomFilter');
+  const list = document.getElementById('roomList');
+  const q = (el.value ?? '').trim().toLowerCase();
+  for (const btn of list.querySelectorAll('.room')) {
+    btn.hidden = q !== '' && !btn.title.toLowerCase().includes(q);
+  }
+  // 中身が全部消えた区切りは、見出しだけ残さない
+  for (const h of list.querySelectorAll('.rgroup')) {
+    let n = h.nextElementSibling, any = false;
+    while (n && !n.classList.contains('rgroup')) {
+      if (n.classList.contains('room') && !n.hidden) { any = true; break; }
+      n = n.nextElementSibling;
+    }
+    h.hidden = !any;
+  }
+}
+document.getElementById('roomFilter').addEventListener('input', applyRoomFilter);
+
+// レールの一番下「いま話している相手」。声の部屋なので、これが見えないと誰に向かって話すか分からない
+function updateRailMe() {
+  const el = document.getElementById('railMe');
+  el.hidden = !wideLayout();
+  const name = selectedPid === null ? 'みんな' : (pidNames.get(selectedPid) ?? 'みんな');
+  el.querySelector('.rmename').textContent = name;
+  el.title = `いま話している相手: ${name}(押すと変えられる)`;
+}
+document.getElementById('railMe').onclick = () => {
+  rosterEl.classList.remove('hidden');       // 相手が 1 人でも「みんな(自動)」は選べる
+  rosterEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  // 話す相手の行はもう画面に出ていることが多い。光らせないと「押しても何も起きない」に見える
+  rosterEl.classList.add('flash');
+  setTimeout(() => rosterEl.classList.remove('flash'), 1400);
+  rosterEl.querySelector('.chip')?.focus();
+};
+// 「作る」の吹き出しは Escape と外側クリックで閉じる(閉じられないと会話を覆ったままになる)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') document.getElementById('roomsExtra').classList.remove('open');
+});
+document.addEventListener('pointerdown', (e) => {
+  const box = document.getElementById('roomsExtra');
+  if (!box.classList.contains('open')) return;
+  if (!box.contains(e.target) && !e.target.closest('.railbtn')) box.classList.remove('open');
+});
+
 async function renderRooms() {
   await fetchRooms();
   updateRoomBtn();
   renderRoomsExtra();
   const list = document.getElementById('roomList');
   list.replaceChildren();
+  const filterEl = document.getElementById('roomFilter');
+  filterEl.hidden = roomList.length < 6;
+  if (filterEl.hidden) filterEl.value = '';
+  // 種類ごとに束ねる。1 種類しか無いなら見出しは付けない(区切る相手が居ない)
+  const grouped = new Map();
   for (const room of roomList) {
+    const g = ROOM_GROUP[room.channel] ?? 'その他';
+    if (!grouped.has(g)) grouped.set(g, []);
+    grouped.get(g).push(room);
+  }
+  const ordered = GROUP_ORDER.filter((g) => grouped.has(g));
+  for (const g of ordered) {
+    if (ordered.length > 1) {
+      const h = document.createElement('div');
+      h.className = 'rgroup';
+      h.textContent = g;
+      list.appendChild(h);
+    }
+  for (const room of grouped.get(g)) {
     const btn = document.createElement('button');
     btn.className = 'room' + (room.channel === currentChannel ? ' here' : '');
     // レール表示で使うアイコン(名前の先頭の絵文字。無ければ部屋ごとの既定)
@@ -892,6 +967,9 @@ async function renderRooms() {
     btn.onclick = () => void enterRoom(room.channel);
     list.appendChild(btn);
   }
+  }   // ← 種類ごとの繰り返し
+  applyRoomFilter();
+  updateRailMe();
   renderRailTools();
 }
 async function enterRoom(next) {

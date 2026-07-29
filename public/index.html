@@ -459,6 +459,17 @@
     body.side-open .lane.side { display: flex; }
     .lane > * { margin: 0 var(--pad); width: auto; max-height: none; flex-shrink: 0; }
     .lane #rooms, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
+    /* 部屋の絞り込み・種類の区切り・いま話している相手。
+       どれも「部屋が増えた時に迷子にならない」ための部品 */
+    #roomFilter { width: 100%; background: var(--surface-2); color: var(--text);
+                  border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+                  margin-bottom: 8px; }
+    #roomFilter:focus { border-color: var(--accent); outline: none; }
+    .rgroup { font-size: 12px; color: var(--muted); padding: 8px 4px 2px; }
+    #railMe { display: none; }   /* レール表示の時だけ出す(下で上書き) */
+    /* レール下部を押した時、話す相手の行はもう画面に出ている。
+       animation ではなく outline で示す(reduced-motion でも消えないように) */
+    #roster.flash { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 10px; }
     /* ---- 左はアイコンのレール(Genspark 型)----
        罫線ではなく背景色の差で分ける。名前はアイコンの下に小さく、
        入りきらないぶんは title で読める */
@@ -478,6 +489,15 @@
     .lane.nav .room.here .rmain b { color: var(--accent); font-weight: 700; }
     /* 作成・名前変更・記録は「もっと」から開く(レールには置かない)*/
     .lane.nav #roomsExtra, .lane.nav .rlinks { display: none; }
+    /* ただし「作る」を押した時は出す。84px には収まらないのでレールの右に重ねる。
+       ここが display:none のままだと、押しても入力欄が出ず focus も効かない(W20 からの穴) */
+    .lane.nav #roomsExtra.open {
+      display: flex; flex-direction: column; gap: 8px;
+      position: fixed; left: 92px; bottom: 16px; width: 280px; z-index: 40;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: 14px; padding: 14px; box-shadow: 0 12px 32px #0008;
+    }
+    .lane.nav #roomsExtra.open input { width: 100%; }
     /* 在室は中央のヘッダで見る。進捗はレールでは潰れるので「作業」タブに任せる */
     .lane.nav #roster, .lane.nav #progress { display: none; }
     /* レールの下: 部屋を作る / 記録 */
@@ -486,6 +506,22 @@
                background: transparent; color: var(--muted); font-size: 12px; line-height: 1.3; }
     .railbtn:hover { background: var(--surface-2); color: var(--text); }
     .railbtn .ricon { font-size: 19px; line-height: 1.1; }
+    /* レールでの絞り込み: 幅 84px に収める。中央寄せで「探す」だけ読ませる */
+    .lane.nav #roomFilter { margin: 0 6px 6px; width: calc(100% - 12px);
+                            padding: 6px 6px; font-size: 12px; text-align: center; }
+    /* 種類の区切り(作業/話す/遊ぶ)。h2「部屋」は消しているが、これは選ぶ材料になる */
+    .lane.nav .rgroup { display: block; text-align: center; font-size: 12px;
+                        margin: 8px 6px 2px; padding: 0; }
+    .lane.nav .rgroup:first-child { margin-top: 0; }
+    /* いま誰と話しているか。margin-top:auto でレールの一番下に貼り付ける */
+    .lane.nav #railMe { display: flex; flex-direction: column; align-items: center; gap: 2px;
+                        margin: auto 6px 0; padding: 8px 4px; border-radius: 12px; border: 0;
+                        background: transparent; color: var(--muted); font-size: 12px;
+                        line-height: 1.3; min-width: 0; }
+    .lane.nav #railMe:hover { background: var(--surface-2); color: var(--text); }
+    .lane.nav #railMe .ricon { font-size: 19px; line-height: 1.1; }
+    .lane.nav #railMe .rmename { max-width: 100%; overflow: hidden;
+                                 text-overflow: ellipsis; white-space: nowrap; }
     #roster { padding: 0; }
     .lane.side #board { max-height: 55%; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; }
     /* ゲーム中は卓を切らない(高さ制限を外して全部見せる)*/
@@ -529,6 +565,8 @@
 <nav class="lane nav" aria-label="部屋">
 <div id="rooms" class="panel">
   <h2>部屋</h2>
+  <!-- 部屋が増えるとレールから探せなくなる。数が増えた時だけ出す(少ない時は邪魔) -->
+  <input id="roomFilter" type="search" placeholder="部屋を探す" aria-label="部屋を絞り込む" hidden>
   <div id="roomList"></div>
   <!-- 部屋の作成 / 名前変更の操作部品はここに載せる。音声ナビからも押せるよう
        data-voice="create-room" / "rename-room" / "room-name-input" を付けること -->
@@ -540,6 +578,11 @@
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
 <button id="progress" title="進行中の作業を開く"></button>
+<!-- 声の部屋なのに「今どの声と話しているか」が画面に無かった。レールの下に常時出す -->
+<button id="railMe" data-voice="who-am-i" hidden>
+  <span class="ricon">🎙</span>
+  <span class="rmename">みんな</span>
+</button>
 <div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
 </nav>
 <!-- 右レーン: 作業スペース(何ができたか)。中央の会話とは場所を取り合わない -->
