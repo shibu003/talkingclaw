@@ -43,6 +43,13 @@ guard authStatus == .authorized else {
 }
 guard recognizer.isAvailable else { fail("音声認識が今は使えません(ネットワーク or 言語データ)", 4) }
 
+// 認識器の状態を出す。ここが分からないと「音は来ているのに認識が動かない」で詰まる。
+// onDevice: 端末内モデルの有無。ON_DEVICE=1 でサーバ経由をやめて端末内に固定できる
+let wantOnDevice = env["ON_DEVICE"] == "1"
+FileHandle.standardError.write(
+    "claw-listen: locale=\(localeId) available=\(recognizer.isAvailable) onDeviceSupported=\(recognizer.supportsOnDeviceRecognition) useOnDevice=\(wantOnDevice)\n"
+        .data(using: .utf8)!)
+
 let lock = NSLock()
 var latest = ""
 var lastUpdate = Date()
@@ -56,7 +63,7 @@ var task: SFSpeechRecognitionTask?
 func startSession() {
     let req = SFSpeechAudioBufferRecognitionRequest()
     req.shouldReportPartialResults = true
-    req.requiresOnDeviceRecognition = false // 端末内モデルが無い言語でも動くようにする
+    req.requiresOnDeviceRecognition = wantOnDevice // ON_DEVICE=1 で端末内に固定(サーバ経由が通らない環境の逃げ道)
 
     lock.lock()
     latest = ""
@@ -83,7 +90,12 @@ func startSession() {
             }
             if result.isFinal { finished = true }
         }
-        if error != nil { finished = true }
+        // エラーを握りつぶすと「即座に終了するが理由が分からない」状態になる。必ず出す
+        if let error = error {
+            FileHandle.standardError.write(
+                "claw-listen: 認識が止まりました: \(error.localizedDescription)\n".data(using: .utf8)!)
+            finished = true
+        }
         lock.unlock()
         if let p = firstPartial { emit("PARTIAL \(p)") } // lock の外で書く
     }
@@ -96,31 +108,97 @@ let input = engine.inputNode
 
 // エコーキャンセル。これが無いと、AI が喋っている最中にマイクを開けない(自分の声を認識してしまう)。
 // 割り込み(barge-in)は「再生中もマイクが生きている」ことが前提なので、ここが土台になる。
-// 失敗しても致命的ではないので警告だけ出して続ける(録音自体は可能)。
-do {
-    try input.setVoiceProcessingEnabled(true)
-} catch {
-    FileHandle.standardError.write(
-        "claw-listen: エコーキャンセルを有効にできませんでした(再生中の割り込みは不安定になります): \(error.localizedDescription)\n"
-            .data(using: .utf8)!)
+// ただし有効にすると入力フォーマットが変わり、音声認識が発火しなくなる環境がある。
+// NO_EC=1 で切って切り分けられるようにしてある。
+if env["NO_EC"] != "1" {
+    do {
+        try input.setVoiceProcessingEnabled(true)
+    } catch {
+        FileHandle.standardError.write(
+            "claw-listen: エコーキャンセルを有効にできませんでした(再生中の割り込みは不安定になります): \(error.localizedDescription)\n"
+                .data(using: .utf8)!)
+    }
 }
 
 let format = input.outputFormat(forBus: 0)
 guard format.sampleRate > 0 else { fail("マイクが見つかりません(システム設定 → プライバシー → マイク で Terminal を許可)", 5) }
+// 入力レベルの実測。macOS はマイク権限が拒否されていると **エラーではなく無音を流す**ので、
+// これが無いと「マイクは開けたのに何も聞こえない」で原因が特定できない。
+// LEVEL=1 の時だけ 1 秒ごとに peak を出す(常時出すと認識表示を潰す)。
+let showLevel = env["LEVEL"] == "1"
+var levelPeak: Float = 0
+var levelAt = Date()
+
+// ★ 認識に渡す形は 1ch に落とす。内蔵マイクはマイクアレイで **5ch** を返すことがあり、
+// SFSpeechAudioBufferRecognitionRequest に多チャンネルのバッファを渡すと
+// **エラーも結果も返さず沈黙する**(これが「音は届くのに認識が動かない」の正体だった)。
+let monoFormat = AVAudioFormat(
+    commonFormat: .pcmFormatFloat32, sampleRate: format.sampleRate, channels: 1, interleaved: false)
+let _unusedConverterRemoved = false
+let converter: AVAudioConverter? = {
+    guard let mono = monoFormat, format.channelCount != 1 else { return nil }
+    return AVAudioConverter(from: format, to: mono)
+}()
+if converter != nil {
+    FileHandle.standardError.write(
+        "claw-listen: \(format.channelCount)ch → 1ch に変換して認識に渡します\n".data(using: .utf8)!)
+}
+
 input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+    if showLevel, let ch = buffer.floatChannelData?[0] {
+        var peak: Float = 0
+        for i in 0..<Int(buffer.frameLength) { peak = max(peak, abs(ch[i])) }
+        lock.lock()
+        levelPeak = max(levelPeak, peak)
+        let elapsed = Date().timeIntervalSince(levelAt)
+        let show = elapsed >= 1.0
+        let p = levelPeak
+        if show { levelPeak = 0; levelAt = Date() }
+        lock.unlock()
+        if show {
+            let bars = String(repeating: "#", count: min(40, Int(p * 200)))
+            FileHandle.standardError.write(
+                "  level \(String(format: "%.4f", p)) \(bars)\n".data(using: .utf8)!)
+        }
+    }
     lock.lock()
     let req = request
     lock.unlock()
-    req?.append(buffer)
+    guard let req = req else { return }
+
+    // サンプルレートは同じなので変換は要らない。1ch 目をそのままコピーするだけ。
+    // AVAudioConverter を使うと frameLength が設定されず、空のバッファを渡して
+    // 認識が沈黙する(実測)。ここは素朴なコピーが正しい。
+    guard let mono = monoFormat, format.channelCount != 1 else {
+        req.append(buffer) // 既に 1ch ならそのまま
+        return
+    }
+    let frames = buffer.frameLength
+    guard frames > 0,
+          let out = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: frames),
+          let src = buffer.floatChannelData?[0],
+          let dst = out.floatChannelData?[0]
+    else { return }
+    out.frameLength = frames // ← これを設定しないと「長さ 0 の音声」になる
+    memcpy(dst, src, Int(frames) * MemoryLayout<Float>.size)
+    req.append(out)
 }
 engine.prepare()
 do { try engine.start() } catch { fail("マイクを開けませんでした: \(error.localizedDescription)", 5) }
+// フォーマットを出す。認識に渡すバッファの形が合っていないと、エラーも結果も返らず
+// 沈黙するだけになるため、ここが見えないと切り分けられない
+FileHandle.standardError.write(
+    "claw-listen: マイク開始 \(Int(format.sampleRate))Hz ch=\(format.channelCount) fmt=\(format.commonFormat.rawValue) interleaved=\(format.isInterleaved)。話しかけてください…\n"
+        .data(using: .utf8)!)
 
 // 1 発話ぶん待つ。戻り値は確定テキスト(空 = 何も聞き取れなかった)
 func awaitUtterance(deadline: Double) -> String {
     let started = Date()
     while true {
-        usleep(100_000)
+        // usleep でスレッドを寝かせてはいけない。SFSpeechRecognizer のコールバックは
+        // メインキューにディスパッチされるので、RunLoop を回さないと認識結果が
+        // 一度も配送されない(音は installTap で届いているのに「聞いてる…」が出ない状態になる)。
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         lock.lock()
         let hasText = !latest.isEmpty
         let quietFor = Date().timeIntervalSince(lastUpdate)
@@ -136,7 +214,7 @@ func awaitUtterance(deadline: Double) -> String {
     lock.unlock()
     req?.endAudio()
     task?.finish()
-    usleep(300_000) // 最後の確定を待つ
+    RunLoop.current.run(until: Date().addingTimeInterval(0.4)) // 最後の確定を待つ(ここも RunLoop で回す)
     lock.lock()
     let text = latest.trimmingCharacters(in: .whitespacesAndNewlines)
     lock.unlock()
