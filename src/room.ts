@@ -250,14 +250,14 @@ async function onEngineReady(): Promise<void> {
 // ---- UserSpeechState(会話OS §4.8)----
 // 実装は src/convos/speech.ts。/participants からも読めるので、画面状態を知りたい他機能も
 // ここを見る(状態源を 2 つ持たない)。
-const userSpeech = new UserSpeechState();
+const mic = new UserSpeechState(); // マイクの状態(§4.8)。既存の userSpeech() 関数と名前が衝突するので mic
 
 // ---- 音声平面(会話OS §4.1/§4.3): TtsScheduler + FillerEngine ----
 // 実装は src/convos/speech.ts。EngineManager は room.ts に残したまま、エンジンの生死は
 // getter(isEngineReady)と報告 callback(reportSynthResult)だけを渡す(C1-①c で切った境界)。
 const speech = new SpeechPlane({
   store, registry, voice, putAudio, isEngineReady, reportSynthResult, resolveVoice,
-  metric, userSpeech,
+  metric, userSpeech: mic,
   // turn → channel の解決は Floor/Turn 層が持つ。下で定義される turn を実行時に読む
   turnChannel: (turnId) => turn.channelOf(turnId),
 });
@@ -303,7 +303,7 @@ store.onAppend((ev) => {
 // 依存する room.ts 側の状態なので、ここに残して getter として渡す。
 // filler の音声(事前合成プール)は音声平面が持つので cue 経由で受け取る(①で引いた線を跨がない)。
 const turn = new TurnPlane({
-  store, registry, metric, userSpeech,
+  store, registry, metric, userSpeech: mic,
   contextCue: (pid, rotate) => speech.contextCue(pid, rotate),
   statusCue: () => speech.statusCue(),
   undeliveredCue: () => speech.undeliveredCue(),
@@ -497,11 +497,11 @@ function acceptUtterance(text: string): RoomEvent | null {
   if (pending?.timer) clearTimeout(pending.timer);
 
   const heldTooLong = Date.now() - firstAt >= FRAGMENT_MAX_HOLD_MS;
-  if (!looksIncomplete(text) && !userSpeech.active) {
+  if (!looksIncomplete(text) && !mic.active) {
     pending = null;
     return userSpeech(merged); // 言い切っていて、もう話していない → 即確定
   }
-  if (heldTooLong && !userSpeech.active) {
+  if (heldTooLong && !mic.active) {
     pending = null;
     return userSpeech(merged);
   }
@@ -516,7 +516,7 @@ function armPending(delayMs: number): void {
   if (pending.timer) clearTimeout(pending.timer);
   const timer = setTimeout(() => {
     if (!pending) return;
-    if (userSpeech.active && Date.now() - pending.firstAt < FRAGMENT_MAX_HOLD_MS) {
+    if (mic.active && Date.now() - pending.firstAt < FRAGMENT_MAX_HOLD_MS) {
       armPending(500); // まだ喋ってる → もう少し待つ
       return;
     }
@@ -536,7 +536,7 @@ function flushPending(): void {
 
 function userSpeech(rawText: string): RoomEvent {
   const text = applyDict(rawText);
-  userSpeech.clear(); // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
+  mic.clear(); // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
   // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う
   if (pendingPermission) {
     const t = text.trim();
@@ -1586,7 +1586,7 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && path === '/participants') {
     return json(res, 200, {
       selected: turn.selected,
-      userSpeaking: userSpeech.active,
+      userSpeaking: mic.active,
       channel: activeChannel,
       participants: registry.all().map((p) => ({
         participantId: p.participantId,
@@ -1857,7 +1857,7 @@ const server = createServer(async (req, res) => {
     // 在室者・誰と話しているか(routing)・発話中/待機中・作業ボード・直近ログを 1 回でまとめて返す
     return json(res, 200, {
       bootId: store.bootId,
-      userSpeaking: userSpeech.active, // ユーザーの現在の発話状態(単一の状態源。UserSpeechState 参照)
+      userSpeaking: mic.active, // ユーザーの現在の発話状態(単一の状態源。UserSpeechState 参照)
       participants: registry.all().map((p) => ({
         participantId: p.participantId,
         name: p.assignedName,
@@ -1945,7 +1945,7 @@ const server = createServer(async (req, res) => {
     // ブラウザ側の STT interim/final から「ユーザーが今話しているか」を報告させる。認証はトークンのみ(participant 不問)。
     const speaking = body.speaking === true;
     // W11-1: 話し終わった瞬間に、溜めていた断片を 1 発話として確定する
-    if (userSpeech.report(speaking)) setTimeout(() => flushPending(), 250).unref();
+    if (mic.report(speaking)) setTimeout(() => flushPending(), 250).unref();
     return json(res, 200, { ok: true, userSpeaking: speaking });
   }
 
