@@ -37,7 +37,8 @@
 
 | ファイル | 行数 | 役割 |
 |---|---|---|
-| `src/room.ts` | 2,345 | daemon 本体。**カーネル相当の機構とアプリが同居**（抽出対象） |
+| `src/room.ts` | 2,197 | daemon 本体。**カーネル相当の機構とアプリが同居**（抽出対象）。①で 154 行を convos へ出した |
+| `src/convos/speech.ts` | 308 | **音声平面（①で抽出済み）**：`UserSpeechState`（①a）/ `SpeechPlane` = TtsScheduler + FillerEngine（①d） |
 | `src/roomcore.ts` | 192 | 純ロジック層（I/O なし）：EventStore / Registry。**抽出は既に始まっている** |
 | `src/brain.ts` | 173 | Claude Agent SDK streaming セッション。文単位 onSentence、interrupt、コスト実測 |
 | `src/voice.ts` | 178 | AivisSpeech 合成 + afplay。文Nの再生中に文N+1を合成するパイプライン |
@@ -53,9 +54,9 @@ room.ts 内の機構（行番号は現時点。抽出時の索引に使う）：
 |---|---|---|
 | audio 置き場 + 相槌プール保護 | 73〜 | 事前合成 WAV の evict 管理 |
 | EngineManager | 92〜203 | AivisSpeech の保有・監視・自動復旧（S5） |
-| UserSpeechState | 231〜249 | 「ユーザーが今話しているか」の**単一状態源**。pump がこれで停止 |
-| FillerEngine | 251〜298 | 相槌＝事前合成プールのみ。ack/context/status の3種 |
-| TtsScheduler | 300〜405 | participant 内 FIFO / 間は (priority, RR)。**speechEpoch stale drop**。queue上限20→text-only |
+| UserSpeechState | **→ `convos/speech.ts`（①a 済）** | 「ユーザーが今話しているか」の**単一状態源**。pump がこれで停止 |
+| FillerEngine | **→ `convos/speech.ts`（①d 済）** | 相槌＝事前合成プールのみ。ack/context/status の3種 |
+| TtsScheduler | **→ `convos/speech.ts`（①d 済）** | participant 内 FIFO / 間は (priority, RR)。**epoch stale drop**。queue上限20→text-only |
 | listen waiter | 407〜440 | long-poll 配送。at-least-once、cursor_expired |
 | Router / Turn | 444〜531 | 名前 > UI選択 > floor > last_responder > default。turnId / delivered / responded |
 | 報告パーサ | 532〜 | テンプレ準拠なら構造化、逸脱は notes から組立（W12） |
@@ -68,6 +69,20 @@ room.ts 内の機構（行番号は現時点。抽出時の索引に使う）：
 | 相談モード | 1034〜 | propose_plan / confirm_plan（案→合意→登録） |
 | startChloe | 1132〜1660 | 会話Brain(channel毎) / workerスロット / askGuarded(ハング監督) / 文脈再注入 |
 | archive | 2334〜 | 6hごとのセッション区切り保存 |
+
+**①の抽出で見つかった構造（切断が正しい線に入った証拠。②以降の地図を読むときの手掛かり）**：
+
+- **スケジューラ ⇄ filler は双方向だった**。filler が `enqueueJob` で事前合成を依頼し、`runJob` が
+  完成した音声を **pid の文字列プレフィックス**（`__narration_` / `__context_`）で判別して
+  filler のプールに書き戻していた。置き場をジョブ側に持たせる（`onReady`）と 10 行の分岐が 1 行になった
+- **スケジューラがエンジンの生死を決めていた**。合成失敗を自分で数え、閾値 3 で `engineState='down'` に
+  書き換え、告知まで出していた。数える・倒す・告知するを所有者（EngineManager）へ戻した
+- **`down` の告知は 2 種類ある**（合成 3 連続失敗＝「声がうまく出せない。復旧するまで文字で続けるね」／
+  プロセス死亡＝「音声エンジンが落ちたみたい。しばらく文字だけで続けるね」）。経路が別なので両方残す。
+  ここを 1 つに畳むと、エンジンが生きているのに合成だけ失敗している状態を言い分けられなくなる
+- **escalation（②の範囲）が filler の内部プールを直接読んでいた**。cue メソッド越しにしたら、
+  未達通知の文言が `NARRATION_TEXTS.undelivered` と**同じ文字列のハードコード重複**だったことが判明して消えた。
+  重複が浮き上がるのは、境界を正しい線で引けたときの副産物
 
 既にある計測資産（回帰と評価に使う）：`~/.talkingclaw/metrics.jsonl`（初音・barge_in 等）、`cost.jsonl`（SDK実費）、`test/accept-*.sh` / `test/check-*.mjs`（受入・UI検査）。
 
@@ -221,6 +236,7 @@ ingest_utterance(raw) -> RoomEvent | null   // 辞書適用 + 確定バッファ
 
 - **C0：計測の基線を取る。** 変更前に metrics.jsonl から現状値を記録（初音 ms 分布、ack 被覆率、barge_in 件数）。抽出の成否はこの回帰で判定する
 - **C1：抽出（挙動不変）。** room.ts から §2 の機構を `src/convos/`（仮）へ移す。順序は結合の薄い順：①TtsScheduler+FillerEngine+UserSpeechState → ②Router/Turn/escalation → ③確定バッファ+辞書 → ④permission → ⑤session 監督(askGuarded/page_in) → ⑥永続化群。roomcore.ts の「I/O なし純ロジック」規律を全体に適用し、各段で check-ui / accept を通す。**ゲーム・相談モード・git 自動 commit はアプリ層に残す**（動かさない）
+  - **切断パターン（①で確立。②以降もこれに従う）**：**読み取りは注入 getter、状態変更は所有者への callback、告知は判定した者が出す。** 移す前に結合を切る（切らずに移すと結合ごと convos へ持っていく）
 - **C2：§6 の WAL 化 + §7-2/3 の承認束縛・remember 可視化。** ここだけが挙動変更。それぞれ独立 PR
 - **C3：2つ目のアプリで検証。** ゲーム1本（blackjack が最小）を convos プリミティブだけで書き直し、エスケープハッチ数を数える（FALSIFICATION 判定）
 - **C4：仕様化。** 安定した syscall だけを §5 の形で成文化。metrics 基線との差分を付す
@@ -274,9 +290,17 @@ room work {
 - daemon 強制終了 → 再起動で、tasks / 承認待ち / 会話が WAL から復元される
 
 失敗（設計修正）：
-- 抽出後に room.ts＋convos の合計行数・相互 import が抽出前より増える
+- **[C1 完了時に判定]** room.ts + src/convos/ の合計行数（生の行数、除外なし）が 2,345（C0 時点）の **+15%（2,700 行）を超える**、または相互 import が発生している → 失敗。中間段での増加は判定対象外だが、各段の commit メッセージに増分の内訳（型/公開面/実装）を記録する
+- **[C3 完了時に判定]** blackjack 移植後の合計行数が **2,345 を下回らない** → 失敗。抽出の削減効果はここで回収されるべきで、回収されないなら公開面が過剰
 - レイテンシ回帰が出て契約型では表現できない
 - ゲーム移植でエスケープハッチが 3 箇所を超える
+
+**指標について（事前登録）**：行数は**生の行数**で測る。型宣言・コメント・公開面を除外しない。
+除外したくなる場面は必ず来る（実際 C1-① で +160 のうち大半が型と公開面だった）が、
+**増えた中身が分かった後に条件から除外するのは、反証条件を結果に合わせて削る動き**である。
+型・公開面の肥大は実在する失敗モードで、§3 の仮説 (b)「新アプリがアプリ層のコードだけで書ける」に
+直接跳ね返る。`SpeechDeps` や cue 群が増え続けるなら、それは生の行数が捕まえるべき劣化。
+**天井 2,700 を動かせるのは v0.2 を書いた今この時点だけ**。②以降の実測を見てからの変更は禁止。
 
 ---
 
@@ -290,4 +314,21 @@ room work {
 ---
 
 ## 変更履歴
-- v0.1（本書）：talkingclaw コードレビューから初版起草。agent-runtime との分離を明文化
+- v0.1：talkingclaw コードレビューから初版起草。agent-runtime との分離を明文化
+- **v0.2（本書）**：C1-① 完了時点の判定。合計行数が 2,345 → 2,505（**+160**）で、旧 §11 の
+  「抽出後に合計行数が増える → 失敗」に形式的に触れた。判定は**失敗ではない**とした。理由は 2 つ:
+  (1) 旧条件の「抽出後」は素直に読めば C1 完了後（⑥まで）であって①完了時点ではない、
+  (2) §11 の成功条件が別項目で「blackjack 移植で room.ts 側の該当コードが消える」と立てている以上、
+  この文書自身が**削減の回収は C3** と言っている。C1 は §5 が要求する「命名と公開面の明示」の工程なので、
+  各段で行数が増えるのは抽出が正しく進んでいる兆候であり、①の +160 を失敗と数えることは
+  §5 が要求したことを罰することになる。
+  一方で「実装行数（型・コメントを除く）」への指標変更は**採らなかった** —
+  増えた中身が型だと分かった後に型を除外するのは、反証条件を結果に合わせて削る動きそのものであり、
+  型・公開面の肥大は §3 の仮説 (b) に直接跳ね返る実在の失敗モードだから。
+  代わりに**指標は生の行数のまま、測定点を C1 完了時・C3 完了時に固定し、天井 2,700（+15%）を事前登録**した。
+  +15% の根拠：①の +160 を⑥段まで単純外挿すると過大（①はクラス骨格・`SpeechDeps` 型など
+  一回きりの固定費を多く含む）、一方 +5% では②の Router/Turn で turnId 周りの型を書き出すだけで尽きる、その間。
+  **この天井を動かせるのは v0.2 を書いた時点だけで、②以降の実測を見てからの変更は禁止。**
+  ①の増分内訳：型定義（`SynthJob` / `FillerCue` / `SpeechDeps`）・クラス骨格・公開面の cue 3 つ・
+  設計への参照コメント。減：pid プレフィックス分岐（-9）、未達通知の文字列重複（-1）。
+  あわせて §9 C1 に①で確立した切断パターンを、§2 に①で見つかった構造を記録した。
