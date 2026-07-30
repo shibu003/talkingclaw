@@ -180,6 +180,10 @@ async function handsfreeLoop(): Promise<void> {
       if (line.startsWith('PARTIAL ')) {
         // 人間が声を出した時点で黙る。確定を待たない — 待つと数十秒喋り続けることになる
         if (player) { stopAudio(); console.log(c.dim('  (割り込み)')); }
+        else if (process.env.VDEBUG) {
+          // VDEBUG=1: 届いているのに割り込めないのか、そもそも届いていないのかを切り分ける
+          console.log(c.dim(`  [partial 受信・再生中でないので何もしない] ${line.slice(8, 40)}`));
+        }
         continue;
       }
       if (line.startsWith('FINAL ')) {
