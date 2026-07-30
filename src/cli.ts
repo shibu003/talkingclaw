@@ -78,15 +78,26 @@ let player: ChildProcess | null = null;
 let playChain: Promise<void> = Promise.resolve();
 let fileSeq = 0;
 
+// 割り込みは「鳴っている音を止める」だけでは効かない。合成に十数秒かかるので
+// **まだ鳴っていない時間帯の方が長く**、そこで割り込んでも捨てるものが無いまま
+// あとから届いた音声が鳴ってしまう。世代番号を進めることで、取得中・書き込み中の
+// ものも含めて「割り込みより前に決まった音声」を全部落とす
+let audioGen = 0;
+let pendingAudio = 0; // まだ鳴らし終えていない音声の数(合成待ち・取得中を含む)
+
 function enqueueAudio(path: string): void {
   if (MUTE) return;
+  const gen = audioGen;
+  pendingAudio++;
   playChain = playChain
     .then(async () => {
+      if (gen !== audioGen) return; // 順番待ちの間に割り込まれた
       const res = await fetch(`http://127.0.0.1:${room!.port}${path}?token=${room!.token}`);
-      if (!res.ok) return;
+      if (!res.ok || gen !== audioGen) return; // 取得中に割り込まれた
       tmpDir ??= await mkdtemp(join(tmpdir(), 'claw-cli-'));
       const file = join(tmpDir, `${fileSeq++}.wav`);
       await writeFile(file, Buffer.from(await res.arrayBuffer()));
+      if (gen !== audioGen) return; // 書き込み中に割り込まれた
       await new Promise<void>((resolve) => {
         const p = spawn('afplay', [file], { stdio: 'ignore' });
         player = p;
@@ -94,13 +105,18 @@ function enqueueAudio(path: string): void {
         p.on('error', () => resolve());
       });
     })
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => { pendingAudio--; });
 }
 
-function stopAudio(): void {
+// 捨てるものがあった場合に true。呼び出し側が「割り込み」表示を出すかの判断に使う
+function stopAudio(): boolean {
+  const had = player !== null || pendingAudio > 0;
+  audioGen++;
   playChain = Promise.resolve();
   player?.kill('SIGKILL');
   player = null;
+  return had;
 }
 
 // ---- 音声入力(macOS Speech。tools/claw-listen を呼ぶ)----
@@ -178,12 +194,9 @@ async function handsfreeLoop(): Promise<void> {
       if (!line || !handsfree) continue;
 
       if (line.startsWith('PARTIAL ')) {
-        // 人間が声を出した時点で黙る。確定を待たない — 待つと数十秒喋り続けることになる
-        if (player) { stopAudio(); console.log(c.dim('  (割り込み)')); }
-        else if (process.env.VDEBUG) {
-          // VDEBUG=1: 届いているのに割り込めないのか、そもそも届いていないのかを切り分ける
-          console.log(c.dim(`  [partial 受信・再生中でないので何もしない] ${line.slice(8, 40)}`));
-        }
+        // 人間が声を出した時点で黙る。確定を待たない — 待つと数十秒喋り続けることになる。
+        // 再生中かどうかは見ない(合成待ちのものを捨てるのが割り込みの本体)
+        if (stopAudio()) console.log(c.dim('  (割り込み)'));
         continue;
       }
       if (line.startsWith('FINAL ')) {
