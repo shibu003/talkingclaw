@@ -103,7 +103,7 @@ let engineSpawnedAt = 0;
 const engineSpawnLog: number[] = [];
 let synthFailStreak = 0;
 
-// ---- 合成の成否報告(会話OS §4 の抽出。設計: docs/conversation-os-v0.1.md)----
+// ---- 合成の成否報告(会話OS §4 の抽出。設計: docs/kaiwa-os-design.md)----
 // スケジューラは「この 1 回の合成が通ったか」だけを報告する。連続失敗の数え方・fail-fast の
 // 閾値・down への遷移・その告知は、状態を持っている側(ここ)が決める = 判定した者が告知する。
 // 戻り値: この報告でエンジンを down に倒したか(true なら呼び側は retry せず即 text-only)

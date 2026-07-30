@@ -1,4 +1,4 @@
-// 会話OS / 音声平面（設計: docs/conversation-os-v0.1.md §4.1, §4.3, §4.8）
+// 会話OS / 音声平面（設計: docs/kaiwa-os-design.md §4.1, §4.3, §4.8）
 //
 // ここに置くのは「発話の音声側」に関わる機構だけ。テキスト平面（EventStore への append）は
 // roomcore.ts が持つ。両者を分けているのが二平面発話の骨格 —
