@@ -134,6 +134,14 @@ guard format.sampleRate > 0 else { fail("マイクが見つかりません(シ�
 let showLevel = env["LEVEL"] == "1"
 var levelPeak: Float = 0
 var levelAt = Date()
+// 「喋り終わった」の判定は認識テキストの更新ではなく **音そのもの** を見る。
+// テキストの更新間隔で判定すると、認識が一瞬詰まっただけで発話が切られ、
+// 「Can you hear me」が「You」「Can you」「Can you hear me」の 3 発話に割れる(実測)。
+// 割れた数だけ AI が応答するので、体感の遅さの主因にもなっていた。
+// STT_GATE: 声とみなす音量の下限。マイクと環境で変わるので調整できるようにしてある
+//           (LEVEL=1 で実測値が見える)
+let soundGate = Float(env["STT_GATE"] ?? "0.02") ?? 0.02
+var lastSoundAt = Date()
 
 // ★ 認識に渡す形は 1ch に落とす。内蔵マイクはマイクアレイで **5ch** を返すことがあり、
 // SFSpeechAudioBufferRecognitionRequest に多チャンネルのバッファを渡すと
@@ -151,9 +159,17 @@ if converter != nil {
 }
 
 input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-    if showLevel, let ch = buffer.floatChannelData?[0] {
-        var peak: Float = 0
-        for i in 0..<Int(buffer.frameLength) { peak = max(peak, abs(ch[i])) }
+    // 音量は毎回測る(無音判定に使うので LEVEL=1 の時だけでは足りない)。
+    // 4 サンプルおきで十分 — ピークの検出に全サンプルは要らない
+    var peak: Float = 0
+    if let ch = buffer.floatChannelData?[0] {
+        for i in stride(from: 0, to: Int(buffer.frameLength), by: 4) { peak = max(peak, abs(ch[i])) }
+    }
+    lock.lock()
+    if peak > soundGate { lastSoundAt = Date() }
+    lock.unlock()
+
+    if showLevel {
         lock.lock()
         levelPeak = max(levelPeak, peak)
         let elapsed = Date().timeIntervalSince(levelAt)
@@ -164,7 +180,8 @@ input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
         if show {
             let bars = String(repeating: "#", count: min(40, Int(p * 200)))
             FileHandle.standardError.write(
-                "  level \(String(format: "%.4f", p)) \(bars)\n".data(using: .utf8)!)
+                "  level \(String(format: "%.4f", p)) \(bars) gate=\(String(format: "%.3f", soundGate))\n"
+                    .data(using: .utf8)!)
         }
     }
     lock.lock()
@@ -200,6 +217,9 @@ FileHandle.standardError.write(
 // 1 発話ぶん待つ。戻り値は確定テキスト(空 = 何も聞き取れなかった)
 func awaitUtterance(deadline: Double) -> String {
     let started = Date()
+    // 前の発話の「最後に音があった時刻」を持ち越すと、次の発話が始まる前に
+    // 無音時間を満たしてしまう。1 発話ごとに測り直す
+    lock.lock(); lastSoundAt = Date(); lock.unlock()
     while true {
         // usleep でスレッドを寝かせてはいけない。SFSpeechRecognizer のコールバックは
         // メインキューにディスパッチされるので、RunLoop を回さないと認識結果が
@@ -207,7 +227,8 @@ func awaitUtterance(deadline: Double) -> String {
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         lock.lock()
         let hasText = !latest.isEmpty
-        let quietFor = Date().timeIntervalSince(lastUpdate)
+        // 静かになったかは音で測る。認識テキストの更新(lastUpdate)ではない
+        let quietFor = Date().timeIntervalSince(lastSoundAt)
         let done = finished
         lock.unlock()
         if done { break }
