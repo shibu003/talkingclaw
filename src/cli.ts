@@ -159,18 +159,46 @@ function listenOnce(maxSec = 30): Promise<string | null> {
   });
 }
 
+// 聞き続けるループ。以前は「再生中は聞かない」で割り込みが構造的に不可能だった。
+// いまは claw-listen を --continuous で 1 本だけ起動し、マイクを開いたままにする
+// (エコーは Swift 側の setVoiceProcessingEnabled で消す)。
+//   PARTIAL = 喋り始めた合図 → その場で読み上げを止める(割り込み)
+//   FINAL   = 確定した 1 発話 → 部屋に送る
 async function handsfreeLoop(): Promise<void> {
-  while (handsfree) {
-    if (player) { await new Promise((r) => setTimeout(r, 400)); continue; } // 再生中は聞かない(エコー防止)
-    const text = await listenOnce(30);
-    if (!handsfree) break;
-    if (!text) continue;
-    if (isEcho(text)) { console.log(c.dim(`  (自分たちの声っぽいので無視: ${text.slice(0, 20)})`)); continue; }
-    console.log(`${c.you('あなた(声)')} ${text}`);
-    stopAudio();
-    await api('/chat', { text }).catch(() => ({}));
-    await new Promise((r) => setTimeout(r, 600)); // 相手が話し始めるまで少し待つ
-  }
+  const p = spawn(LISTEN_BIN, ['--continuous', '600'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  listening = true;
+  let buf = '';
+  p.stdout.on('data', (d) => {
+    buf += d.toString();
+    for (;;) {
+      const nl = buf.indexOf('\n');
+      if (nl < 0) break;
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || !handsfree) continue;
+
+      if (line.startsWith('PARTIAL ')) {
+        // 人間が声を出した時点で黙る。確定を待たない — 待つと数十秒喋り続けることになる
+        if (player) { stopAudio(); console.log(c.dim('  (割り込み)')); }
+        continue;
+      }
+      if (line.startsWith('FINAL ')) {
+        const text = line.slice('FINAL '.length).trim();
+        if (!text) continue;
+        // エコーキャンセルを抜けてきた自分たちの声への保険
+        if (isEcho(text)) { console.log(c.dim(`  (自分たちの声っぽいので無視: ${text.slice(0, 20)})`)); continue; }
+        console.log(`${c.you('あなた(声)')} ${text}`);
+        stopAudio();
+        void api('/chat', { text }).catch(() => ({}));
+      }
+    }
+  });
+  p.on('close', () => { listening = false; });
+  p.on('error', () => { listening = false; });
+
+  while (handsfree) await new Promise((r) => setTimeout(r, 200));
+  p.kill('SIGTERM');
+  listening = false;
 }
 
 // ---- タイムライン購読(SSE)----

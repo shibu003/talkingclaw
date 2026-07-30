@@ -309,6 +309,12 @@ ingest_utterance(raw) -> RoomEvent | null   // 辞書適用 + 確定バッファ
 
 **破壊禁止（CLAUDE.md rule 4 準拠）**：稼働中の部屋(port 3300)・音声エンジン(port 10101)を止めない。accept-*.sh を勝手に実行しない。サーバ変更は再起動が要る旨をユーザーに伝える（勝手に再起動しない）。
 
+> **例外（判定 003 / 2026-07-30）**：**司令塔が自律実行する間に限り**、部屋とエンジンの
+> 起動・停止・再起動を許可する。ただし **`test/accept-*.sh` の実行禁止は維持**し、
+> `~/.talkingclaw/` 配下の実データ（tasks.json / transcript-*.jsonl / room.json）の削除も禁止のまま。
+> 理由：部屋の停止は可逆だが、受入スクリプトは実データを壊す。「止める」と「壊す」は性質が違う。
+> 人間が介入する体制に戻ったらこの例外は失効する。詳細は `.kaiwa-loop/judgments/003.md`。
+
 - **C0：計測の基線を取る。** 変更前に metrics.jsonl から現状値を記録（初音 ms 分布、ack 被覆率、barge_in 件数）。抽出の成否はこの回帰で判定する
 - **C1：抽出（挙動不変）。** room.ts から §2 の機構を `src/convos/`（仮）へ移す。順序は結合の薄い順：①TtsScheduler+FillerEngine+UserSpeechState → ②Router/Turn/escalation → ③確定バッファ+辞書 → ④permission → ⑤session 監督(askGuarded/page_in) → ⑥永続化群。roomcore.ts の「I/O なし純ロジック」規律を全体に適用し、各段で check-ui / accept を通す。**ゲーム・相談モード・git 自動 commit はアプリ層に残す**（動かさない）
   - **切断パターン（①で確立。②以降もこれに従う）**：**読み取りは注入 getter、状態変更は所有者への callback、告知は判定した者が出す。** 移す前に結合を切る（切らずに移すと結合ごと convos へ持っていく）
