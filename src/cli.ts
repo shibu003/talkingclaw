@@ -329,6 +329,19 @@ async function main(): Promise<void> {
   console.log(c.dim('/help でコマンド一覧\n'));
   void keepSubscribed();
 
+  // 起動引数に /v があればそのままハンズフリーで始める。
+  // `npm run cli /v on` は引数として渡るだけで対話コマンドにならず、
+  // 「起動したつもりが起動していない」まま話し続けることになる(実際に 2 回起きた)
+  if (process.argv.slice(2).some((a) => a === '/v' || a === '-v' || a === '--voice')) {
+    if (await ensureListenBin()) {
+      handsfree = true;
+      console.log(c.sys('  * ハンズフリー開始(話しかけてね。止める時は /v off + Enter)'));
+      void handsfreeLoop();
+    } else {
+      console.log(c.sys('  音声入力をビルドできませんでした(swiftc が要ります)'));
+    }
+  }
+
   const rl = readline.createInterface({ input: stdin, output: stdout });
   rl.on('SIGINT', () => { stopAudio(); rl.close(); });
   for (;;) {

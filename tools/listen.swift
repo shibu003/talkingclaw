@@ -90,10 +90,16 @@ func startSession() {
             }
             if result.isFinal { finished = true }
         }
-        // エラーを握りつぶすと「即座に終了するが理由が分からない」状態になる。必ず出す
+        // エラーを握りつぶすと「即座に終了するが理由が分からない」状態になる。原則は出す。
+        // ただし「No speech detected」だけは違う — これは異常ではなく「まだ喋っていない」。
+        // 連続モードでは無音のたびに出るので、そのまま表示すると本物のエラーが埋もれる
         if let error = error {
-            FileHandle.standardError.write(
-                "claw-listen: 認識が止まりました: \(error.localizedDescription)\n".data(using: .utf8)!)
+            let ns = error as NSError
+            let isSilence = ns.localizedDescription.contains("No speech detected")
+            if !isSilence {
+                FileHandle.standardError.write(
+                    "claw-listen: 認識が止まりました: \(error.localizedDescription)\n".data(using: .utf8)!)
+            }
             finished = true
         }
         lock.unlock()
