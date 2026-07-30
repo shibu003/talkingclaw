@@ -128,7 +128,10 @@ export class Voice {
     // (以降の合成が一切走らない)。abort → 呼び出し側の retry / text-only 経路へ。
     // synthesis の上限はモデル cold load 実測 83s × 1.8(短くすると初回合成を殺してフラッピングする)
     const params = new URLSearchParams({ text, speaker: String(speaker) });
-    const queryRes = await fetch(`${this.#url}/audio_query?${params}`, { method: 'POST', signal: AbortSignal.timeout(15_000) });
+    // audio_query も cold load を踏む(モデル load はここで起きる)。15s だと起動直後の
+    // 初回発話が必ず abort し、3 連続で engineState='down' に倒れて「声が出せない」になる。
+    // synthesis と同じ上限にする(cold load 実測 83s × 1.8)
+    const queryRes = await fetch(`${this.#url}/audio_query?${params}`, { method: 'POST', signal: AbortSignal.timeout(150_000) });
     if (!queryRes.ok) throw new Error(`AivisSpeech audio_query が失敗しました (${queryRes.status})`);
     const audioQuery = (await queryRes.json()) as { speedScale: number };
     audioQuery.speedScale = this.#speedScale;
