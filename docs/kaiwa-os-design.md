@@ -118,6 +118,22 @@ room.ts 内の機構（行番号は現時点。抽出時の索引に使う）：
 - Turn = { turnId, target, delivered, responded, channel }。応答窓と未応答通知（escalation）を持つ
 - floor は「audio なしで応答した者へ進む」（room.ts:428 の floorAdvance）
 
+**v0.3 の規範**：`responded` の boolean 1 つで二平面を表すのをやめ、**平面ごとに状態を持つ**。
+
+```ts
+text:  'pending' | 'answered'
+voice: 'none' | 'queued' | 'synthesizing' | 'playing' | 'played' | 'revoked'
+```
+
+理由と実測は §7-5。要点は **「応答した」は平面ごとに違う時刻に起きる**ということ。
+テキストは 23 秒で届き、音声は 2 分 56 秒後に鳴る、という状態が実在する。
+1 つの bool はそのどちらかしか表せず、escalation（音声の穴を埋める機構）が
+テキスト側の完了で止まると、音声側の穴が丸ごと空く。
+
+**帰属は状態ではなく構造で保つ**：turnId を各層が手で持ち回るのではなく、
+`utter()` が返す `UtteranceLease` に載せる（§5）。手で持ち回る限り、どこかの層で落ちる
+（実際 transcript で落ちていた）。
+
 ### 4.3 レイテンシ契約（deadline スケジューリング）
 発話への応答は段階的な締切列を持つ：
 ```
@@ -155,6 +171,8 @@ room.ts が現にやっていることの命名。**新機能を足さない**�
 
 ```ts
 // --- 発話（二平面） ---
+// ⚠ v0.3 注記: この utter/lease は §5 の中で唯一「room.ts が現にやっていること」ではない。
+// 実装は store.append で終わっていて lease を返していない。C2-① で実装する（§7-5）。
 utter(pid, text, { turnId?, channel, priority }) -> UtteranceLease
   // テキスト平面へは即 append（不喪失）。音声平面はリース
 lease.status: 'queued' | 'synthesizing' | 'playing' | 'played' | 'revoked'
@@ -214,6 +232,63 @@ ingest_utterance(raw) -> RoomEvent | null   // 辞書適用 + 確定バッファ
 3. **`remember` が無審査の永続書き込み**：モデル出力が chloe-memory.md に直行し毎回注入される（記憶汚染面）。会話OS側の最小修正：remember を `MemoryAppended` イベント化＋画面に可視化＋声で取り消せる（「さっきのは覚えなくていい」→ 削除）。信頼分類はしない（カーネルの領分）
 4. **コストは観測のみ**：cost.jsonl は enforce されない。会話OSは**閾値通知フック**だけ持つ（「今日はもう $X 使ってるよ」）。停止の強制はしない（カーネルの領分）
 
+5. **二平面の速度差が状態として表現されていない（v0.3 で追加・最重要）**
+
+   `Turn.responded` は **boolean 1 つ**で、テキスト平面と音声平面の両方を表している。
+   §4.1 で二平面を最重要と置きながら、状態はそれを分けていない。実測（2026-07-30）:
+
+   ```
+   04:34:36  turn_created T10                      user「1から50まで数えて」
+   04:34:59  turn_window_closed T10 reason=responded   ← テキスト到着で「応答済み」
+   04:36:57  play_started T10                      ← 音声の 1 文目（2 分 20 秒後）
+   04:37:33  play_started T10                      ← 音声の 2 文目（2 分 56 秒後）
+   ```
+
+   escalation（＝音声の穴を埋める仕組み）が `responded` を見て止まるため、
+   **2 分の無音が丸ごと空く**。C0 で測った「filler 被覆率 16%・84% の turn で 6 秒超の無音」の正体はこれ。
+   合成が遅いことが原因ではない（合成の遅さは下記の通り変えられない）。**穴を埋める仕組みが、
+   埋めるべき時間帯に自分から降りている**のが原因である。
+
+   派生して 2 つの症状が出る:
+
+   - **帰属が表示層に届かない**。`transcript-*.jsonl` のキーは `["at","who","text"]` で
+     **turnId が落ちている**。`RoomEvent` は turnId を持っているのに、書き出す時点で捨てている。
+     結果、2 分後に届いた返答が別の質問の答えに見える。実測では
+     「今日あったこと聞かせてよ」が `play_started turn=T10`（1から50への 2 文目）なのに、
+     時系列上は直前の別発話（T11「ABC 全て発音して」）への返答に見えていた。
+     さらに 04:27:16 には T5（挨拶）と T9（数えて）への返答 5 文が**同じ秒に混ざって**出ている
+   - **`speak` の自動帰属も同じ bool を見る**ため、テキストの応答窓と音声の応答窓を区別できない
+
+   **合成の実測（この設計の前提。変えられない側）**:
+
+   ```
+   audio_query   2,958ms
+   synthesis    46,661ms   ← 3.4 秒の音声に 47 秒（リアルタイム比 14 倍）
+   直列 2 文     44,428ms
+   並列 2 文     52,772ms   ← 直列より遅い = エンジンは単一ロック。並列化は無効
+   ```
+
+   短文（「てすと」）なら 11 秒。**文が長いほど急激に遅くなる**。
+   したがって「速くする」道は無く、**待ちを隠す／遅れても混ざらない**が設計の目標になる。
+
+   **修正の方向（C2）**: `responded: boolean` を平面ごとに分ける。
+
+   ```ts
+   text:  'pending' | 'answered'                                   // テキスト平面（不喪失）
+   voice: 'none' | 'queued' | 'synthesizing' | 'playing' | 'played' | 'revoked'  // 音声平面（リース）
+   ```
+
+   | 機構 | 現在の参照先 | 修正後 |
+   |---|---|---|
+   | escalation の停止 | `responded` | **`voice === 'playing'`**（鳴り始めるまで filler を出し続ける） |
+   | 自動帰属（`attribute`） | `responded` | `text` |
+   | board の「未応答」 | `responded` | `text` |
+   | 打切り通知 | `noticeSent` | 変更なし |
+
+   あわせて §5 の `UtteranceLease` を**実装する**（仕様にあるが未実装で、`store.append` で
+   終わっている）。`utter()` が lease を返せば turnId が lease に載るので、
+   **transcript に turnId を書き忘れる経路が構造上なくなる**。
+
 境界原則：**会話OSが直すのは「対話として壊れている」部分まで。「セキュリティとして壊れている」部分はフックを空けてカーネルに残す。**
 
 ---
@@ -237,7 +312,14 @@ ingest_utterance(raw) -> RoomEvent | null   // 辞書適用 + 確定バッファ
 - **C0：計測の基線を取る。** 変更前に metrics.jsonl から現状値を記録（初音 ms 分布、ack 被覆率、barge_in 件数）。抽出の成否はこの回帰で判定する
 - **C1：抽出（挙動不変）。** room.ts から §2 の機構を `src/convos/`（仮）へ移す。順序は結合の薄い順：①TtsScheduler+FillerEngine+UserSpeechState → ②Router/Turn/escalation → ③確定バッファ+辞書 → ④permission → ⑤session 監督(askGuarded/page_in) → ⑥永続化群。roomcore.ts の「I/O なし純ロジック」規律を全体に適用し、各段で check-ui / accept を通す。**ゲーム・相談モード・git 自動 commit はアプリ層に残す**（動かさない）
   - **切断パターン（①で確立。②以降もこれに従う）**：**読み取りは注入 getter、状態変更は所有者への callback、告知は判定した者が出す。** 移す前に結合を切る（切らずに移すと結合ごと convos へ持っていく）
-- **C2：§6 の WAL 化 + §7-2/3 の承認束縛・remember 可視化。** ここだけが挙動変更。それぞれ独立 PR
+- **C2：§7-5 の二平面分離 + §6 の WAL 化 + §7-2/3 の承認束縛・remember 可視化。** ここだけが挙動変更。それぞれ独立 PR
+  - **C2 の中では §7-5 を先にやる**（v0.3 で追加）。理由は 2 つ。(a) 実測で壊れていることが
+    分かっている唯一の項目で、体験を最も損なっている（2 分の無音）。(b) `UtteranceLease` を
+    実装すると turnId が構造として保存されるので、WAL（§6）に落とす時点で帰属が揃っている。
+    順序が逆だと WAL に帰属なしのイベントが積まれ、後から遡れない
+  - 実装順（実測が効く順）: ① Turn を 2 軸にして escalation の参照先を `voice` に変える
+    → ② `utter()` に lease を返させ、transcript を lease から書く
+    → ③ 散在する定数（`LISTEN_MAX_S` / `ASK_GUARD_MS` / escalation の遅延）を contract 型に集約
 - **C3：2つ目のアプリで検証。** ゲーム1本（blackjack が最小）を convos プリミティブだけで書き直し、エスケープハッチ数を数える（FALSIFICATION 判定）
 - **C4：仕様化。** 安定した syscall だけを §5 の形で成文化。metrics 基線との差分を付す
 - **C5：言語プロトタイプ（§10）。** C4 の後でのみ着手
@@ -247,8 +329,13 @@ ingest_utterance(raw) -> RoomEvent | null   // 辞書適用 + 確定バッファ
 ## 10. 会話言語（TalkScript 仮）— 最後にやる
 
 言語が**静的に保証できて、SDKでは保証できない**もの：
-1. すべての応答経路に latency contract がある（filler 未定義の待ちが存在しない）ことをコンパイル時に検査
-2. すべての発話に turn 帰属がある（帰属なし発話は型エラー、進捗発話は明示の `progress` 構文）
+1. すべての応答経路に latency contract がある（filler 未定義の待ちが存在しない）ことをコンパイル時に検査。
+   **締切の対象は音声平面**（`voice playing`）であって、テキストの到着ではない（v0.3 / §7-5）。
+   テキスト到着で締切を満たしたことにすると、実装が「答えたつもりで 2 分黙る」状態を書けてしまう
+2. すべての発話に turn 帰属がある（帰属なし発話は型エラー、進捗発話は明示の `progress` 構文）。
+   帰属は**手で持ち回らせない** — `say` は lease を返し、記録層は lease から書く。
+   turnId を引数として渡す設計にすると、どこかの層で落ちる（v0.3 で実測: transcript が
+   `["at","who","text"]` になっていて帰属が追えなかった）
 3. 割り込み点の全域性：N 秒を超える非中断区間が書けない
 4. 二平面の分離：`say`（リース）と記録は言語が自動で分け、「テキストを消す」操作が存在しない（CLAUDE.md rule 2 の言語化）
 5. 承認の束縛：`ask permission` は対象式なしでは書けない
@@ -262,7 +349,7 @@ room work {
 
   on utterance from user {
     within 500ms  ack from pool
-    within 8s     first sentence of reply(session: chloe) else filler context
+    within 8s     voice playing else filler context   // ← テキスト到着ではなく「鳴り始めたか」
     within 20s    else filler status
     within 180s   else interrupt session, say "ごめん、固まってた", repage
   }
@@ -332,3 +419,28 @@ room work {
   ①の増分内訳：型定義（`SynthJob` / `FillerCue` / `SpeechDeps`）・クラス骨格・公開面の cue 3 つ・
   設計への参照コメント。減：pid プレフィックス分岐（-9）、未達通知の文字列重複（-1）。
   あわせて §9 C1 に①で確立した切断パターンを、§2 に①で見つかった構造を記録した。
+- **v0.3（本書）**：C1-① / C1-② を実機で動かして出た欠陥を §7-5 として追加し、
+  その解を prompt ではなく**状態の型と syscall**で与えた。
+
+  実測で確定したこと:
+  - `Turn.responded` は boolean 1 つで**テキスト平面と音声平面の両方**を表しており、
+    escalation がテキスト側の完了で止まるため音声側の穴（実測 2 分 20 秒）が丸ごと空く。
+    C0 で測った「filler 被覆率 16%」の正体
+  - `transcript-*.jsonl` のキーが `["at","who","text"]` で **turnId が落ちている**。
+    `RoomEvent` は持っているのに書き出し時に捨てている。結果、2 分後に届いた返答が
+    別の質問の答えに見える（実測: `play_started turn=T10` の 2 文目が、直後の別発話 T11 への
+    返答に見えていた）。同一秒に 2 つの turn への返答 5 文が混ざる例もある
+  - 合成は **audio_query 3.0s + synthesis 46.7s**（3.4 秒の音声にリアルタイム比 14 倍）。
+    **並列 2 文 52.8s > 直列 2 文 44.4s** でエンジンは単一ロック。**並列化は無効**。
+    したがって「速くする」道は無く、設計目標は**待ちを隠す／遅れても混ざらない**になる
+
+  規範として入れたもの:
+  - §4.2: `responded: boolean` → `text` / `voice` の 2 軸。escalation は `voice === 'playing'` を見る
+  - §4.2 / §10-2: **帰属は手で持ち回らせない**。`utter()` が返す lease に載せ、記録層は lease から書く
+  - §5: `utter`/`UtteranceLease` は §5 の中で唯一の**未実装項目**である旨を明記
+  - §9 C2: C2 の中で §7-5 を**最初にやる**。WAL より先でないと、帰属なしのイベントが WAL に積まれる
+  - §10-1: latency contract の締切対象は**音声平面**（`voice playing`）。テキスト到着で
+    締切を満たすことにすると「答えたつもりで 2 分黙る」実装が書けてしまう
+
+  この版で prompt による対処（返答を短くする・案内を減らす等）は**解にしていない**。
+  症状は prompt で薄まるが、原因は状態の表現にあるため再発する。
