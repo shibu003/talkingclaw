@@ -56,17 +56,17 @@ export class UserSpeechState {
 
 // onReady: 事前合成(ack-pool)が出来上がった時の置き場。スケジューラは置き場を知らない
 // （以前は pid の文字列プレフィックスを見て判定していた — C1-①b で切った）。
-export type SynthJob = {
+type SynthJobBase = {
   pid: string;
   priority: 1 | 2 | 3;
-  kind: 'speech' | 'ack-pool';
   text: string;
   speaker?: number;
   turnId?: string;
-  epoch?: number;
   channel: Channel;
-  onReady?: (url: string) => void;
 };
+export type SynthJob =
+  | (SynthJobBase & { kind: 'speech'; revision: number; onReady?: never })
+  | (SynthJobBase & { kind: 'ack-pool'; revision?: never; onReady?: (url: string) => void });
 
 // filler の 1 回分。事前合成が間に合っていなければ audio は null（テキストだけ流れる）
 export type FillerCue = { text: string; audio: string | null };
@@ -90,8 +90,8 @@ export type SpeechDeps = {
 // 1 つの部品にまとめた。外から見えるのは「積む・喋らせる・相槌を撃つ・プールを作る」だけ。
 //
 // TtsScheduler: participant 内 FIFO、participant 間は (priority, round-robin)。
-// stale drop: user 発話ごとに epoch を進め、古い epoch の speech job は合成せず text-only で流す。
-// テキストは transcript に残る（不喪失）が、遅れた読み上げで会話がズレるのを防ぐ。
+// stale drop: user 発話ごとに channel revision を進め、旧 revision の speech job は
+// EventStore にも音声 queue にも出さない。既に表示済みの append-only log だけが残る。
 //
 // FillerEngine: 相槌は事前合成プールのみ。動的合成は本応答だけ。
 export class SpeechPlane {
@@ -112,7 +112,7 @@ export class SpeechPlane {
   #contextPools = new Map<string, string[]>();
 
   // スケジューラの状態
-  #epoch = 0;
+  #revisions = new Map<Channel, number>();
   #jobQueues = new Map<string, SynthJob[]>();
   #rrOrder: string[] = [];
   #pumping = false;
@@ -128,13 +128,15 @@ export class SpeechPlane {
     return this.#pumping;
   }
 
-  get epoch(): number {
-    return this.#epoch;
+  revision(channel: Channel): number {
+    return this.#revisions.get(channel) ?? 0;
   }
 
-  // user が話したら世代を進める = これ以前に積まれた未合成の speech は読み上げない
-  advanceEpoch(): void {
-    this.#epoch++;
+  // channel ごとの user 発話で世代を進める。他の部屋の音声は失効させない。
+  advanceRevision(channel: Channel): number {
+    const next = this.revision(channel) + 1;
+    this.#revisions.set(channel, next);
+    return next;
   }
 
   // ---- filler ----
@@ -218,6 +220,7 @@ export class SpeechPlane {
   enqueue(job: SynthJob): void {
     const q = this.#jobQueues.get(job.pid) ?? [];
     if (job.kind === 'speech' && q.filter((j) => j.kind === 'speech').length >= 20) {
+      if (!this.#isCurrent(job)) return;
       const p = this.#d.registry.get(job.pid);
       this.#d.store.append({
         type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text,
@@ -239,8 +242,12 @@ export class SpeechPlane {
   speakSentences(from: string, name: string, text: string, turnId: string | undefined, channel: Channel): void {
     const sentences = splitSentences(text);
     sentences.forEach((sentence, i) => {
-      this.enqueue({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: this.#epoch, channel });
+      this.enqueue({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, revision: this.revision(channel), channel });
     });
+  }
+
+  #isCurrent(job: SynthJob): boolean {
+    return job.kind !== 'speech' || job.revision === this.revision(job.channel);
   }
 
   #pickNext(): SynthJob | null {
@@ -259,26 +266,29 @@ export class SpeechPlane {
     const p = this.#d.registry.get(job.pid);
     const speaker = job.speaker ?? p?.voice.resolvedSpeaker ?? null;
     const emitSpeech = (audio: string | null): void => {
-      if (job.kind === 'speech') {
+      if (job.kind === 'speech' && this.#isCurrent(job)) {
         this.#d.store.append({
           type: 'agent_speech', from: job.pid, name: p?.assignedName, text: job.text,
           audio, turnId: job.turnId, channel: job.channel,
         });
       }
     };
-    // stale drop: 2 世代以上前の未合成分だけ捨てる。直前の返事は相槌で消さない
-    // (本当の割り込みはブラウザ側の barge-in が担当する)
-    if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < this.#epoch - 1) return emitSpeech(null);
+    // 合成前と emit 直前の二重照合。旧 turn は text-only にもせず完全に失効させる。
+    if (!this.#isCurrent(job)) return;
     if (!this.#d.isEngineReady() || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const wav = await this.#d.voice.synthesizeWav(job.text, speaker);
         this.#d.reportSynthResult(true);
-        if (job.kind === 'speech' && job.epoch !== undefined && job.epoch < this.#epoch - 1) return emitSpeech(null); // stale drop: 合成中に 2 世代進んだ
+        if (!this.#isCurrent(job)) return;
         if (!wav) return emitSpeech(null);
         const url = this.#d.putAudio(wav, job.kind === 'ack-pool');
         if (job.kind === 'ack-pool') job.onReady?.(url); // 置き場はジョブを作った側が知っている
-        else emitSpeech(url);
+        else {
+          if (!this.#isCurrent(job)) return;
+          if (job.turnId && job.turnId !== 'none') this.#d.metric('tts_ready', { turnId: job.turnId, path: 'room' });
+          emitSpeech(url);
+        }
         return;
       } catch (error) {
         // 数えるのも倒すのも告知するのも EngineManager 側。ここは報告して結果に従うだけ

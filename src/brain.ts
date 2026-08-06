@@ -32,6 +32,7 @@ export class Brain {
   #buffer = '';
   #streamBuffer = '';
   #onSentence: ((sentence: string) => void) | null = null;
+  #onFirstToken: (() => void) | null = null;
   #model: string;
 
   constructor(opts: {
@@ -66,13 +67,14 @@ export class Brain {
   }
 
   // onSentence を渡すと、生成途中でも文が完成した端から呼ばれる(先行 TTS 用)。
-  ask(text: string, onSentence?: (sentence: string) => void): Promise<string> {
+  ask(text: string, onSentence?: (sentence: string) => void, onFirstToken?: () => void): Promise<string> {
     if (this.#waiting) return Promise.reject(new Error('前の返答を待っています'));
     return new Promise((resolve, reject) => {
       this.#waiting = { resolve, reject };
       this.#buffer = '';
       this.#streamBuffer = '';
       this.#onSentence = onSentence ?? null;
+      this.#onFirstToken = onFirstToken ?? null;
       this.#input.push({
         type: 'user',
         message: { role: 'user', content: text },
@@ -99,6 +101,11 @@ export class Brain {
         if (msg.type === 'stream_event') {
           const event = msg.event;
           if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+            if (event.delta.text && this.#onFirstToken) {
+              const notify = this.#onFirstToken;
+              this.#onFirstToken = null;
+              notify();
+            }
             this.#streamBuffer += event.delta.text;
             this.#emitCompleteSentences();
           }
@@ -114,6 +121,7 @@ export class Brain {
           if (remainder) this.#onSentence?.(remainder);
           this.#streamBuffer = '';
           this.#onSentence = null;
+          this.#onFirstToken = null;
           const text = this.#buffer.trim();
           this.#buffer = '';
           if (!waiting) continue;
@@ -141,6 +149,7 @@ export class Brain {
     const waiting = this.#waiting;
     this.#waiting = null;
     this.#onSentence = null;
+    this.#onFirstToken = null;
     waiting?.reject(error);
   }
 }

@@ -12,7 +12,7 @@
     "cost": "node scripts/cost-report.mjs",
     "split-log": "node scripts/split-transcript.mjs",
     "cli": "node src/cli.ts",
-    "check-ui": "node test/check-ui.mjs && node test/check-nav.mjs && node test/check-git.mjs && node test/check-artifacts.mjs && node test/check-convos.mjs",
+    "check-ui": "node test/check-ui.mjs && node test/check-nav.mjs && node test/check-git.mjs && node test/check-artifacts.mjs && node test/check-convos.mjs && node test/check-sync-cancel.mjs",
     "setup-stt": "swiftc -O tools/listen.swift -o tools/claw-listen -framework Speech -framework AVFoundation"
   },
   "repository": {

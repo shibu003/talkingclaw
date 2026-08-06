@@ -248,7 +248,11 @@ function playAckNow(url, bubble, eventId, text) {
 // 読み上げを止める。声で割り込んだ時とボタンで押した時で同じ後始末を通す
 // (画面の行は消さない。消えるのは音だけ)
 function stopSpeaking() {
-  if (currentAudio) currentAudio.pause();
+  if (currentAudio) {
+    currentAudio.onended = currentAudio.onerror = currentAudio.onplaying = null;
+    currentAudio.pause();
+  }
+  currentAudio = null;
   audioQueue.length = 0;
   playing = false;
   document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
@@ -283,8 +287,7 @@ function render(ev) {
   if ((ev.type === 'user_speech' || ev.type === 'agent_speech') && ev.channel && ev.channel !== currentChannel) return;
   if (ev.type === 'user_speech') {
     if (!isReplay) lastUserSpokeAt = performance.now();
-    // 短い相槌(「うん」等)では溜まった読み上げを捨てない。長い発話 = 話題転換とみなして捨てる
-    if (!isReplay && (ev.text ?? '').length >= 8) audioQueue.length = 0;
+    if (!isReplay) stopSpeaking(); // 長さに関係なく、同じ部屋の旧 turn の再生中・未再生音声を失効
     addLine(turnHost(ev), 'user', 'あなた', ev.text ?? '', ev.at);
     if ((ev.files ?? []).length > 0) renderSentFiles(lastGroup?.host ?? log, ev.files);
     if (ev.targets && ev.targets.length > 0 && lastGroup) {
@@ -340,17 +343,29 @@ function restartDetected() {
 }
 
 // ---- 発話送信 ----
-async function send(text) {
+async function send(text, options = {}) {
   text = text.trim();
   if (!text) return;
   if (handleNav(text)) return; // 音声ナビ: 画面移動の指示は会話に流さず、その場で画面を動かす
   setStatus('届けたよ');
   try {
-    const res = await post('/chat', { text, files: attached.map((a) => a.name) });
+    const res = await post('/chat', {
+      text, files: attached.map((a) => a.name),
+      ...(options.immediate === true ? { immediate: true } : {}),
+    });
     attached.length = 0;
     renderAttached();
     if (res.status === 401) return void checkRestart();
     if (!res.ok) addSys('送信エラー: ' + res.status);
+    else if (options.sttFinalAt) {
+      const result = await res.json();
+      if (result.turnId) {
+        void post('/metrics', {
+          kind: 'stt_final', ms: 0, eventId: result.eventId, turnId: result.turnId,
+          path: 'room', clientAt: options.sttFinalAt,
+        });
+      }
+    }
   } catch { addSys('サーバに繋がらないみたい'); }
 }
 // ---- こちらから画像・ファイルを送る(📎 / ドラッグ&ドロップ / 貼り付け)----
@@ -503,6 +518,7 @@ if (!SR) {
       log.scrollTop = log.scrollHeight;
     }
     if (finalText) {
+      const sttFinalAt = Date.now();
       sttFails = 0;
       interimUpdatedAt = 0; // final で即クリア(S6)
       reportSpeaking(false);
@@ -518,7 +534,7 @@ if (!SR) {
         speechEndAt = 0;
       }
       interimEl?.remove(); interimEl = null;
-      void send(finalText);
+      void send(finalText, { immediate: true, sttFinalAt });
     }
   };
 }

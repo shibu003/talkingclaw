@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
 import { archiveIndexTail, archiveRead, archiveSession, markArchiveBaseline } from './archive.ts';
 import { EventStore, Registry, type Channel, type RoomEvent } from './roomcore.ts'; // kanaNormalize は Router(convos/turn.ts)へ移った
+import { LatestChannel, TurnMetricClock, type ChannelRun } from './convos/channel.ts';
 import { SpeechPlane, UserSpeechState } from './convos/speech.ts';
 import { TurnPlane } from './convos/turn.ts';
 import { Voice } from './voice.ts'; // splitSentences は音声平面(convos/speech.ts)へ移った
@@ -24,6 +25,8 @@ const UPLOAD_MAX = 20 * 1024 * 1024; // こちらから送るファイルの上�
 const store = new EventStore();
 const registry = new Registry();
 const voice = new Voice(config.tts);
+const turnMetricClock = new TurnMetricClock();
+const TURN_METRICS = new Set(['turn_created', 'stt_final', 'brain_first_token', 'tts_ready', 'play_started', 'turn_cancelled']);
 
 // ---- 部屋分割(会話コンテキストの分離): 作業部屋 / 雑談部屋 ----
 // 単一の EventStore は共有したまま、event に channel を付け会話の記憶(Brain)と transcript だけを隔てる。
@@ -260,6 +263,12 @@ const speech = new SpeechPlane({
   metric, userSpeech: mic,
   // turn → channel の解決は Floor/Turn 層が持つ。下で定義される turn を実行時に読む
   turnChannel: (turnId) => turn.channelOf(turnId),
+});
+
+// user_speech が EventStore に入るたび channel revision を進める。全入口をここで捕まえるため、
+// /chat 以外から追加された発話でも旧音声・旧 Brain callback を同じ規則で失効できる。
+store.onAppend((ev) => {
+  if (ev.type === 'user_speech') speech.advanceRevision(ev.channel ?? 'work');
 });
 
 
@@ -555,12 +564,12 @@ function userSpeech(rawText: string): RoomEvent {
     void askUserPermission('テスト機能').then((ok) => store.append({ type: 'system', from: 'room', text: `perm:${ok}` }));
     return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
   }
-  speech.advanceEpoch(); // stale drop: これ以前に積まれた speech job は読み上げない
   const { targets, routing } = turn.route(text);
   const turnId = turn.nextTurnId("T");
+  beginTurnMetrics(turnId, 'room');
   const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel: activeChannel, files: pendingFiles.length > 0 ? pendingFiles : undefined });
   pendingFiles = [];
-  metric('turn_created', { turnId, method: routing?.method, targets: targets.length });
+  metric('turn_created', { turnId, path: 'room', method: routing?.method, targets: targets.length });
   if (targets.length === 1) {
     turn.track(turnId, targets[0], text, activeChannel);
     speech.fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
@@ -581,8 +590,8 @@ function askUserPermission(desc: string): Promise<boolean> {
     pendingPermission = { resolve, timer, desc };
     store.append({ type: 'system', from: 'room', text: `許可待ち: ${desc}(「いいよ」/「だめ」で答えてね)` });
     if (chloePid) {
-      speech.advanceEpoch(); // 直前の読み上げ待ちより優先して届ける
-      speech.enqueue({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', epoch: speech.epoch, channel: 'work' });
+      const revision = speech.advanceRevision('work'); // 直前の読み上げ待ちより優先して届ける
+      speech.enqueue({ pid: chloePid, priority: 1, kind: 'speech', text: `作業係が${desc}を使いたいって。許可していい?`, turnId: 'none', revision, channel: 'work' });
     }
   });
 }
@@ -592,7 +601,7 @@ function finishPermission(ok: boolean, say: string): void {
   clearTimeout(pendingPermission.timer);
   pendingPermission.resolve(ok);
   pendingPermission = null;
-  if (chloePid) speech.enqueue({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', epoch: speech.epoch, channel: 'work' });
+  if (chloePid) speech.enqueue({ pid: chloePid, priority: 1, kind: 'speech', text: say, turnId: 'none', revision: speech.revision('work'), channel: 'work' });
 }
 
 const PERM_YES = /^(はい|うん|いいよ|いいですよ|おっけ|オッケー|ok|オーケー|許可|どうぞ|やって|承認)/i;
@@ -836,7 +845,6 @@ let chloeReply: ((task: OfficeTask, text: string) => void) | null = null;
 // W9-2: 本番は 180s(sonnet + delegate の長 turn を誤殺しない)。テストは短縮して回転を速く
 // テスト時も「通常応答(context 注入込みで 20-40s)は切らず、ハングだけ捕まえる」値にする
 const ASK_GUARD_MS = Number(process.env.ASK_GUARD_MS ?? (process.env.ROOM_TEST_HOOKS === '1' ? 90_000 : 180_000));
-const ASK_GRACE_MS = process.env.ROOM_TEST_HOOKS === '1' ? 5_000 : 10_000;
 const TIMEOUT = Symbol('timeout');
 function timeoutMarker(ms: number): Promise<typeof TIMEOUT> {
   return new Promise((r) => setTimeout(() => r(TIMEOUT), ms));
@@ -908,7 +916,7 @@ function startChloe(): void {
     unreadNotified = n;
     if (n >= 2) {
       speech.enqueue({
-        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speech.epoch, channel: 'work',
+        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', revision: speech.revision('work'), channel: 'work',
         text: `報告が ${n} 件たまってるよ。読んでほしい時は「報告読んで」って言ってね。`,
       });
     }
@@ -924,13 +932,7 @@ function startChloe(): void {
   };
 
   chloeResetChat = () => {
-    for (const [c, cs] of channelState) {
-      cs.chain = cs.chain.catch(() => {}).then(() => {
-        void cs.brain.close().catch(() => {});
-        cs.brain = new Brain(makeConvBrainOpts(c));
-        cs.needsContext = true; // 記憶 + 直近ログを次の ask で再注入
-      });
-    }
+    for (const cs of channelState.values()) cs.resetBrain();
     store.append({ type: 'system', from: 'room', text: `会話の設定を切り替えたよ(モデル ${workerSettings.chatModel} / 相談モード ${workerSettings.consultMode ? 'あり' : 'なし'})` });
   };
 
@@ -960,7 +962,7 @@ function startChloe(): void {
         task.status = 'working';
         saveTasks();
         speech.enqueue({
-          pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speech.epoch, channel: 'work',
+          pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', revision: speech.revision('work'), channel: 'work',
           text: `${task.request.slice(0, 20)}、始めるね。`,
         });
         await runTask(task, slot);
@@ -1086,7 +1088,7 @@ function startChloe(): void {
       notifyUnread();
       const firstCan = task.report.can[0] ? `${task.report.can[0]} ` : '';
       speech.enqueue({
-        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', epoch: speech.epoch, channel: 'work',
+        pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', revision: speech.revision('work'), channel: 'work',
         text: `${task.report.headline}、できたよ。${firstCan}確かめかたは報告に入れておくね。`,
       });
     } catch (error) {
@@ -1262,24 +1264,46 @@ function startChloe(): void {
     };
   }
 
-  type ChannelState = { brain: Brain; inbox: RoomEvent[]; busy: boolean; needsContext: boolean; chain: Promise<void> };
-  // 部屋ごとの会話 Brain。増やせる部屋に合わせて、入った部屋の分だけ作る(未使用の部屋は持たない)
-  const channelState = new Map<Channel, ChannelState>();
-  function chan(channel: Channel): ChannelState {
+  type ConversationInput = { text: string; turnId?: string; files?: string[]; onDone?: () => void };
+  // 部屋ごとの会話 Brain。revision・最新 inbox・実行中 Brain を 1 部品で持ち、
+  // 新発話時は interrupt の完了を待たず次の Brain を開始する。
+  const channelState = new Map<Channel, LatestChannel<ConversationInput, Brain>>();
+  function chan(channel: Channel): LatestChannel<ConversationInput, Brain> {
     let cs = channelState.get(channel);
     if (!cs) {
-      cs = { brain: new Brain(makeConvBrainOpts(channel)), inbox: [], busy: false, needsContext: true, chain: Promise.resolve() };
-      channelState.set(channel, cs); // W8-1: 最初の ask に記憶 + 直近ログを注入
+      cs = new LatestChannel({
+        makeBrain: () => new Brain(makeConvBrainOpts(channel)),
+        process: async (input, run) => {
+          try {
+            await askOnce(channel, input, run);
+            if (run.isCurrent()) input.onDone?.();
+          } catch (error) {
+            if (!run.isCurrent()) return; // interrupt 後の旧 Brain の reject は画面にも声にも出さない
+            const message = error instanceof Error ? error.message : String(error);
+            store.append({ type: 'system', from: 'room', text: `クロエのエラー: ${message}`, channel });
+            store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと考えすぎちゃった。もう一回言ってくれる?', audio: null, turnId: input.turnId, channel });
+          }
+        },
+        onCancel: (input) => {
+          if (input.turnId) {
+            turn.cancelEscalation(input.turnId);
+            metric('turn_cancelled', { turnId: input.turnId, path: 'room', reason: 'new_user_speech' });
+          }
+        },
+      });
+      channelState.set(channel, cs); // 最初の ask に記憶 + 直近ログを注入
     }
     return cs;
   }
 
   // W9-2: 記憶忘れの根治 — memory 全文 + 直近ログを Brain 生成のたびに注入する
-  function contextPrefix(channel: Channel): string {
+  function contextPrefix(channel: Channel, currentText = ''): string {
     const parts: string[] = [];
     const memo = readMemory();
     if (memo) parts.push(`(あなたが書き留めた大事なこと。必ず踏まえて)\n${memo}`);
     const rows = transcriptTail(channel, 60);
+    const latest = rows[rows.length - 1];
+    if (latest?.who === 'あなた' && latest.text === currentText) rows.pop(); // 現在 prompt との二重投入を避ける
     if (rows.length > 0) parts.push(`(この部屋の直近の会話ログ。文脈の続きとして自然に振る舞って)\n${rows.map((r) => `${r.who}: ${r.text}`).join('\n')}`);
     // 遊んでいる最中なら、いまの場を教える。ユーザーの手札・手牌は brief に入れていない
     const gameBrief = casino.brief(gameSessions.get(channel) ?? null);
@@ -1287,66 +1311,45 @@ function startChloe(): void {
     return parts.length > 0 ? `${parts.join('\n\n')}\n---\n` : '';
   }
 
-  const speakStreamed = (channel: Channel, turnId: string | undefined): ((sentence: string) => void) => {
+  const speakStreamed = (channel: Channel, turnId: string | undefined, run: ChannelRun<Brain>): ((sentence: string) => void) => {
     let first = true;
     return (sentence) => {
+      if (!run.isCurrent()) return;
       if (first && turnId) turn.markResponded(turnId);
-      speech.enqueue({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, epoch: speech.epoch, channel });
+      speech.enqueue({ pid: chloePid!, priority: first ? 1 : 2, kind: 'speech', text: sentence, turnId, revision: run.revision, channel });
       first = false;
     };
   };
 
-  // W9-2: 同一チャンネルの ask は必ず 1 本ずつ(greeting warmup 中にユーザー発話が来て
-  // Brain.ask が「前の返答を待っています」で弾かれる事故の根治)
-  function askGuarded(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
-    const cs = chan(channel);
-    const run = cs.chain.catch(() => {}).then(() => askOnce(channel, text, turnId));
-    cs.chain = run.catch(() => {}); // 後続は前の失敗を引き継がない
-    return run;
-  }
-
-  // ask を見張り、interrupt → 10s 待って駄目なら Brain 再生成(S3C: default 応答者が死なない)
-  async function askOnce(channel: Channel, text: string, turnId: string | undefined): Promise<void> {
-    const cs = chan(channel);
+  // ask を見張る。新 user_speech による中断は LatestChannel が即 detach し、ここで待たない。
+  async function askOnce(channel: Channel, input: ConversationInput, run: ChannelRun<Brain>): Promise<void> {
+    let text = input.text + attachmentNote(input.files);
     const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
-    if (cs.needsContext) { text = contextPrefix(channel) + text; cs.needsContext = false; }
-    const ask = hang ? new Promise<string>(() => {}) : cs.brain.ask(text, speakStreamed(channel, turnId));
-    if ((await Promise.race([ask, timeoutMarker(ASK_GUARD_MS)])) !== TIMEOUT) return; // W9-2: 長 turn を誤殺しない
+    if (run.freshBrain) text = contextPrefix(channel, input.text) + text;
+    const ask = hang ? new Promise<string>(() => {}) : run.brain.ask(
+      text,
+      speakStreamed(channel, input.turnId, run),
+      () => { if (run.isCurrent() && input.turnId) metric('brain_first_token', { turnId: input.turnId, path: 'room' }); },
+    );
+    if ((await Promise.race([ask, timeoutMarker(ASK_GUARD_MS)])) !== TIMEOUT || !run.isCurrent()) return;
     console.error(`クロエ(${channel})の応答が ${ASK_GUARD_MS / 1000}s 超過 → interrupt`);
-    if (!hang) await cs.brain.interrupt().catch(() => {});
-    if ((await Promise.race([ask.catch(() => ''), timeoutMarker(ASK_GRACE_MS)])) !== TIMEOUT) return;
-    void cs.brain.close().catch(() => {});
-    cs.brain = new Brain(makeConvBrainOpts(channel));
-    cs.needsContext = true; // 再生成 = 文脈喪失 → 次の ask でログ注入
+    if (!run.detach()) return;
+    if (input.turnId) metric('turn_cancelled', { turnId: input.turnId, path: 'room', reason: 'brain_timeout' });
     store.append({ type: 'system', from: 'room', text: 'クロエの接続を作り直したよ。少し前の話は忘れちゃったかも', channel });
-    store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId, channel });
-  }
-
-  async function drain(channel: Channel): Promise<void> {
-    const cs = chan(channel);
-    if (cs.busy) return;
-    cs.busy = true;
-    try {
-      while (cs.inbox.length > 0) {
-        const ev = cs.inbox.shift()!;
-        await askGuarded(channel, (ev.text ?? '') + attachmentNote(ev.files), ev.turnId).catch((e: Error) => {
-          // W9-2(P3): 生エラー文字列は読み上げない — 画面には残し、声は友好文に
-          store.append({ type: 'system', from: 'room', text: `クロエのエラー: ${e.message}`, channel });
-          store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと考えすぎちゃった。もう一回言ってくれる?', audio: null, turnId: ev.turnId, channel });
-        });
-      }
-    } finally {
-      cs.busy = false;
-    }
+    store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId: input.turnId, channel });
   }
 
   store.onAppend((ev) => {
-    if (ev.type === 'user_speech' && ev.targets?.includes(chloePid!)) {
-      if (ev.turnId) turn.markDeliveredInProcess(ev.turnId); // in-process = 即配送
-      const channel = ev.channel ?? 'work';
-      chan(channel).inbox.push(ev);
-      void drain(channel);
-    }
+    if (ev.type !== 'user_speech') return;
+    const channel = ev.channel ?? 'work';
+    const targeted = ev.targets?.includes(chloePid!) === true;
+    const cs = channelState.get(channel);
+    if (!targeted && !cs) return;
+    if (targeted && ev.turnId) turn.markDeliveredInProcess(ev.turnId); // in-process = 即配送
+    (cs ?? chan(channel)).receive(
+      speech.revision(channel),
+      targeted ? { text: ev.text ?? '', turnId: ev.turnId, files: ev.files } : undefined,
+    );
   });
 
   // W9-1: 前回やり残しの申告(自動再開はしない — 内容が古い可能性がある)
@@ -1364,8 +1367,10 @@ function startChloe(): void {
   const greeting = activeChannel === 'chat'
     ? '(ユーザーが雑談部屋に来られるようになった。作業の話はせず、あなたらしく短く気楽に一言だけ挨拶して)'
     : `(ユーザーが声の部屋(${roomLabel(activeChannel)})に来られるようになった。あなたらしく短く一言で挨拶して)`;
-  void askGuarded(activeChannel, greeting, undefined)
-    .then(() => console.error(`クロエ(${activeChannel}) warmup 完了`));
+  chan(activeChannel).start({
+    text: greeting,
+    onDone: () => console.error(`クロエ(${activeChannel}) warmup 完了`),
+  });
 }
 
 if (process.env.NO_CHLOE !== '1') startChloe();
@@ -1395,10 +1400,18 @@ function transcriptTail(channel: Channel, lines: number): { at: string; who: str
   }
 }
 
-// 6A: 計測(S10)。サーバ受信時刻で metrics.jsonl に統一記録
-function metric(kind: string, extra: Record<string, unknown> = {}): void {
+function beginTurnMetrics(turnId: string, path: 'room' | 'memo'): void {
+  turnMetricClock.begin(turnId, path);
+}
+
+// 6A: 計測(S10)。turn 系はサーバの turn_created を 0ms とする単調時計へ正規化する。
+function metric(kind: string, extra: Record<string, unknown> = {}, occurredAt = Date.now()): void {
   try {
-    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date().toISOString(), kind, ...extra }) + '\n', { mode: 0o600 });
+    const turnId = typeof extra.turnId === 'string' ? extra.turnId : undefined;
+    const timing = TURN_METRICS.has(kind) && turnId ? turnMetricClock.event(turnId, kind, occurredAt) : null;
+    let normalized = extra;
+    if (timing) normalized = { ...extra, path: extra.path === 'memo' ? 'memo' : timing.path, ms: timing.ms };
+    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date(occurredAt).toISOString(), kind, ...normalized }) + '\n', { mode: 0o600 });
   } catch { /* 計測は本流を止めない */ }
 }
 const seenSpeakSeqs = new Map<string, Set<string>>(); // S2: speak 冪等(participant 毎)
@@ -1879,10 +1892,20 @@ const server = createServer(async (req, res) => {
     // S10: ブラウザ計測(stt_final_delay 等)を JSONL に蓄積
     const kind = String(body.kind ?? '').slice(0, 40);
     const ms = Number(body.ms);
-    if (!kind || !Number.isFinite(ms)) return json(res, 400, { error: 'kind と ms が必要です' });
     const eventId = Number.isFinite(Number(body.eventId)) ? Number(body.eventId) : undefined;
     const evRef = eventId !== undefined ? store.get(eventId) : undefined;
-    appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date().toISOString(), kind, ms, eventId, turnId: evRef?.turnId, filler: evRef?.filler }) + '\n', { mode: 0o600 });
+    const turnId = typeof body.turnId === 'string' ? body.turnId : evRef?.turnId;
+    if (!kind || (!TURN_METRICS.has(kind) && !Number.isFinite(ms))) {
+      return json(res, 400, { error: 'kind と ms が必要です' });
+    }
+    const clientAt = Number(body.clientAt);
+    const occurredAt = kind === 'stt_final' && Number.isFinite(clientAt) && Math.abs(Date.now() - clientAt) < 60_000
+      ? clientAt
+      : Date.now();
+    metric(kind, {
+      ...(Number.isFinite(ms) ? { ms } : {}), eventId, turnId, filler: evRef?.filler,
+      path: body.path === 'memo' ? 'memo' : 'room',
+    }, occurredAt);
     return json(res, 200, { ok: true });
   }
 
@@ -2053,4 +2076,3 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
     process.exit(0);
   });
 }
-
