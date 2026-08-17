@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- talkingclaw 伝言公開用 cloudflared named tunnel の LaunchDaemon。
+     設置先: /Library/LaunchDaemons/ (root:wheel 644)。手順は docs/setup-memo-public.md。
+     LaunchDaemon なのでログイン不要で起動し、KeepAlive で落ちても自動復帰する。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.talkingclaw.cloudflared</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/cloudflared</string>
+    <string>--config</string>
+    <string>/Users/YOUR_USER/.cloudflared/config.yml</string>
+    <string>tunnel</string>
+    <string>run</string>
+  </array>
+
+  <!-- credential (~/.cloudflared/*.json, cert.pem) の持ち主として実行する -->
+  <key>UserName</key>
+  <string>YOUR_USER</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/talkingclaw/cloudflared.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/talkingclaw/cloudflared.log</string>
+</dict>
+</plist>

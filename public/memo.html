@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>伝言 — talkingclaw</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, sans-serif; margin: 0; background: #14151a; color: #e8e8ec; font-size: 17px; }
+  main { max-width: 34em; margin: 0 auto; padding: 1em 1em 9em; }
+  h1 { font-size: 1.1em; color: #9aa0ab; font-weight: 600; }
+  #timeline { display: flex; flex-direction: column; gap: .6em; }
+  .row { padding: .6em .8em; border-radius: 10px; line-height: 1.55; overflow-wrap: anywhere; }
+  .memo { background: #2a3a55; align-self: flex-end; max-width: 90%; }
+  .reply, .note { background: #23242b; align-self: flex-start; max-width: 90%; }
+  .report { background: #1e2f24; border: 1px solid #2f5c40; align-self: flex-start; max-width: 95%; }
+  .meta { font-size: .72em; color: #9aa0ab; margin-bottom: .2em; }
+  form { position: fixed; bottom: 0; left: 0; right: 0; background: #1b1c22; padding: .7em; display: flex; gap: .5em; align-items: flex-end; border-top: 1px solid #2c2d35; }
+  textarea { flex: 1; font-size: 17px; min-height: 2.6em; max-height: 7em; border-radius: 10px; border: 1px solid #3a3b45; background: #14151a; color: #e8e8ec; padding: .5em; resize: none; }
+  button { font-size: 17px; padding: .55em .9em; border-radius: 10px; border: 0; background: #3d6adf; color: #fff; }
+  #mic.on { background: #b3403f; }
+  #status { position: fixed; bottom: 4.6em; left: 0; right: 0; text-align: center; font-size: .8em; color: #e0b34c; pointer-events: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>伝言 — 話すか書くかして送ると、家の agent が動きます <span id="who"></span></h1>
+  <div id="timeline"></div>
+</main>
+<div id="status"></div>
+<form id="f">
+  <button type="button" id="mic" hidden>🎤</button>
+  <textarea id="text" placeholder="伝言を書く(または 🎤 で話す)" required></textarea>
+  <button type="submit">送る</button>
+</form>
+<script>
+  'use strict';
+  const MEMO_USER = "__MEMO_USER_JSON__"; // server が JSON リテラルとして差し替える(G2-F3)
+  const timeline = document.getElementById('timeline');
+  const textEl = document.getElementById('text');
+  const statusEl = document.getElementById('status');
+  const micBtn = document.getElementById('mic');
+  document.getElementById('who').textContent = MEMO_USER && MEMO_USER !== '__MEMO_USER_JSON__' ? '(' + MEMO_USER + ')' : '';
+  let cursor = 0;
+  let clientMessageId = null; // 送信成功(ack)まで同じ id を使い回す = 再送しても二重発注しない
+  const memoSeq = new Map(); // clientMessageId → 伝言の連番(報告の帰属表示に使う)
+
+  // secure context 外(LAN の http)では crypto.randomUUID が無い — 検証環境でページを黙らせない
+  function newId() {
+    if (crypto.randomUUID) return crypto.randomUUID().replace(/-/g, '');
+    return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 12);
+  }
+  function setStatus(t) { statusEl.textContent = t; }
+
+  // __ENTRY_LABEL_START__
+  // 相関表示(G2-F2): 伝言は連番、報告は clientMessageId の root で「伝言#n への報告」と帰属を示す。
+  // 純関数 — テストが同じ実体を抽出して検証する
+  function entryLabel(e, seqOf) {
+    if (e.kind === 'memo') {
+      return 'あなた · 伝言#' + seqOf(e.clientMessageId);
+    }
+    if (e.kind === 'report') {
+      const n = e.clientMessageId ? seqOf(e.clientMessageId, true) : null;
+      return (e.name || 'agent') + ' の作業報告' + (n ? ' → 伝言#' + n : '');
+    }
+    if (e.kind === 'note') return (e.name || 'agent') + '(実況)';
+    return e.name || 'agent';
+  }
+  // __ENTRY_LABEL_END__
+
+  // 描画は textContent のみ(受信文字列を HTML として解釈しない)
+  function render(e) {
+    const seqOf = (cid, lookupOnly) => {
+      if (!memoSeq.has(cid)) {
+        if (lookupOnly) return null; // 報告側は未知 id に番号を発行しない(別 root を捏造しない)
+        memoSeq.set(cid, memoSeq.size + 1);
+      }
+      return memoSeq.get(cid);
+    };
+    const row = document.createElement('div');
+    row.className = 'row ' + e.kind;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = entryLabel(e, seqOf) + ' · ' + new Date(e.at).toLocaleString('ja-JP');
+    const body = document.createElement('div');
+    body.textContent = e.text;
+    row.append(meta, body);
+    timeline.append(row);
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch('/memo/api/log?after=' + cursor, { cache: 'no-store' });
+      if (!r.ok) return;
+      const { entries, cursor: next } = await r.json();
+      for (const e of entries) render(e);
+      if (entries.length > 0) window.scrollTo(0, document.body.scrollHeight);
+      cursor = Math.max(cursor, next || 0);
+    } catch { /* オフライン中は次の poll に任せる */ }
+  }
+
+  document.getElementById('f').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const text = textEl.value.trim();
+    if (!text) { setStatus('伝言が空です'); return; }
+    if (!clientMessageId) clientMessageId = newId();
+    setStatus('送信中…');
+    try {
+      const r = await fetch('/memo/api/say', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text, clientMessageId }),
+      });
+      const out = await r.json().catch(() => ({}));
+      if (r.ok && out.messageId) {
+        // server の ack(messageId)を確認できた時だけ入力を手放す
+        textEl.value = '';
+        clientMessageId = null;
+        setStatus('');
+        await poll();
+      } else {
+        setStatus('送れませんでした: ' + (out.error || r.status) + ' — 内容は残っています。もう一度送れます');
+      }
+    } catch {
+      setStatus('通信に失敗しました — 内容は残っています。電波の良い所でもう一度送ってください');
+    }
+  };
+
+  // 音声入力(Android Chrome で実機確認済み。無い環境はテキストのみ)
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SR) {
+    micBtn.hidden = false;
+    let rec = null;
+    micBtn.onclick = () => {
+      if (rec) { rec.stop(); return; }
+      rec = new SR();
+      rec.lang = 'ja-JP';
+      rec.interimResults = true;
+      micBtn.classList.add('on');
+      setStatus('聞いています…(もう一度押すと停止)');
+      const base = textEl.value;
+      rec.onresult = (e) => {
+        let interim = '', final = '';
+        for (const res of e.results) (res.isFinal ? (final += res[0].transcript) : (interim += res[0].transcript));
+        textEl.value = base + final + interim;
+      };
+      rec.onerror = (e) => setStatus('認識エラー: ' + e.error);
+      rec.onend = () => { rec = null; micBtn.classList.remove('on'); if (statusEl.textContent.startsWith('聞いて')) setStatus(''); };
+      rec.start();
+    };
+  }
+
+  poll();
+  setInterval(poll, 30_000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+</script>
+</body>
+</html>

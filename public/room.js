@@ -1,5 +1,11 @@
 // 声の部屋のブラウザ端末。描画は textContent のみ(S9 XSS 規律 — innerHTML 禁止)。
 const TOKEN = document.querySelector('meta[name="room-token"]').content;
+// PBI-040: ゲストか否かは**起動時に**分かる（後から分かる形だと、分かる前にホスト用の口を叩いて 403 を撒く）
+const IS_GUEST = document.querySelector('meta[name="room-role"]')?.content === 'guest';
+// ゲスト用の画面は**起動時に**確定させる（後から class を足すと、その前に host 用の口を叩く）
+let isGuest = IS_GUEST;
+if (IS_GUEST) document.body?.classList.add('guest');
+document.addEventListener('DOMContentLoaded', () => { if (IS_GUEST) document.body.classList.add('guest'); });
 const BOOT = document.querySelector('meta[name="room-boot"]').content;
 const log = document.getElementById('log');
 const statusEl = document.getElementById('status');
@@ -15,6 +21,13 @@ const ROOM_LABEL = { work: '🛠 作業部屋', chat: '💬 雑談部屋' };
 let handsfree = false;
 let listening = false;
 let playing = false;
+// PBI-022: キャラの口はこの 1 ビットだけを見る。音声グラフ(AudioContext)には触らない
+const setPlaying = (v, who) => {
+  playing = v;
+  window.__clawSpeaking = v;
+  // PBI-032: 体が複数在る時に**誰の口を動かすか**。名前が無ければ null = 先頭の体
+  window.__clawSpeakingName = v ? (who ?? null) : null;
+};
 let currentAudio = null; // 6C: barge-in の duck/pause 対象
 const audioQueue = [];    // { url, bubble, eventId }
 // 自己音声棄却(SP3 実機で誤認を確認): 直近 8s に再生したテキストと一致する認識結果は捨てる
@@ -189,12 +202,12 @@ function playNext() {
   }
   const next = audioQueue.shift();
   if (!next) {
-    playing = false;
+    setPlaying(false);
     document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
     setTimeout(resumeMic, 500); // エコー尾の拾い込み防止
     return;
   }
-  playing = true;
+  setPlaying(true, next.name);
   pauseMic();
   rememberPlayed(next.text);
   next.bubble.classList.add('speaking');
@@ -213,8 +226,8 @@ function playNext() {
   audio.play().catch(advance);
 }
 
-function enqueueAudio(url, bubble, eventId, turnId, filler, text) {
-  audioQueue.push({ url, bubble, eventId, turnId, filler, text });
+function enqueueAudio(url, bubble, eventId, turnId, filler, text, name) {
+  audioQueue.push({ url, bubble, eventId, turnId, filler, text, name });
   if (!playing) playNext();
 }
 
@@ -226,7 +239,7 @@ function maybePlayAck(url, bubble, eventId, text) {
   playAckNow(url, bubble, eventId, text);
 }
 function playAckNow(url, bubble, eventId, text) {
-  playing = true;
+  setPlaying(true);
   pauseMic(); // マイク方針は SP3 の実測で確定(現状は保守的に停止)
   rememberPlayed(text);
   bubble.classList.add('speaking');
@@ -254,7 +267,7 @@ function stopSpeaking() {
   }
   currentAudio = null;
   audioQueue.length = 0;
-  playing = false;
+  setPlaying(false);
   document.querySelectorAll('.speaking').forEach((el) => el.classList.remove('speaking'));
 }
 
@@ -282,6 +295,9 @@ function connect() {
 
 function render(ev) {
   const isReplay = ev.id <= replayBoundary;
+  // PBI-008 AC-5: 会話が始まったら**試聴だけ**を止める。currentAudio / audioQueue には触らない
+  // (会話の再生・queue は無傷のまま。止めるのは試聴の fetch と <audio> だけ)
+  if (!isReplay && (ev.type === 'user_speech' || ev.type === 'agent_speech')) stopPreview();
   // 部屋分割: 会話系(user_speech/agent_speech)は今いる部屋の分だけ表示・再生。
   // 実況/system・presence は channel を持たず常時表示(部屋切替の告知等は見えていてほしい)
   if ((ev.type === 'user_speech' || ev.type === 'agent_speech') && ev.channel && ev.channel !== currentChannel) return;
@@ -302,7 +318,7 @@ function render(ev) {
     if (ev.audio && !isReplay) {
       // S6: 相槌(ack)は FIFO に入れない独立即時スロット — 再生中なら即スキップ
       if (ev.filler === 'ack') maybePlayAck(ev.audio, line, ev.id, ev.text);
-      else enqueueAudio(ev.audio, line, ev.id, ev.turnId, ev.filler, ev.text);
+      else enqueueAudio(ev.audio, line, ev.id, ev.turnId, ev.filler, ev.text, ev.name);
       // 6B: 本応答が来たら同 turn の未再生 filler を破棄(キャンセル 3 層目)
       if (!ev.filler && ev.turnId) {
         for (let i = audioQueue.length - 1; i >= 0; i--) {
@@ -316,6 +332,12 @@ function render(ev) {
   }
   // 部屋で何か起きた = 作業の状態も変わっている可能性。進捗表示をすぐ取り直す
   boardSoon();
+  // PBI-021: 発話のたびに相棒の 9 軸が動く。相槌(filler)では動かないので取り直さない
+  if ((ev.type === 'user_speech' || (ev.type === 'agent_speech' && !ev.filler)) && typeof refreshPersona === 'function') {
+    setTimeout(() => void refreshPersona(), 150);
+  }
+  // PBI-024: 自分が話した後だけ候補を取り直す(相棒の発話では増えない)
+  if (ev.type === 'user_speech' && typeof refreshVocab === 'function') setTimeout(() => void refreshVocab(), 200);
   if (gameKind !== null || sideView === 'game') setTimeout(() => void refreshGame(), 200);
 }
 
@@ -591,6 +613,161 @@ micBtn.addEventListener('click', () => {
   else { pauseMic(); setStatus('🎤 でハンズフリー開始'); }
 });
 
+// ---- 相棒の 9 軸(PBI-021)。話すたびに育つので、発話のたびに軽く取り直す ----
+const personaBtn = document.getElementById('personaBtn');
+const personaPanel = document.getElementById('personaPanel');
+let personaOpen = false;
+async function refreshPersona() {
+  try {
+    const r = await fetch('/persona?token=' + TOKEN);
+    const d = await r.json();
+    const top = (d.top || [])[0];
+    document.getElementById('personaTop').textContent =
+      d.turns === 0 ? '' : (top ? `${top.ja} ${top.value}` : `${d.turns}発話`);
+    personaBtn.title = d.turns === 0
+      ? '相棒の 9 軸(まだ何も観測していない。話すと育つ)'
+      : `相棒の 9 軸 / ${d.turns} 発話を観測`;
+    if (!personaOpen) return;
+    personaPanel.replaceChildren();
+    for (const [k, ax] of Object.entries(d.axes || {})) {
+      const span = document.createElement('span');
+      const b = document.createElement('b');
+      b.textContent = String(d.values[k] ?? 0);
+      span.append(ax.ja + ' ', b);
+      personaPanel.appendChild(span);
+    }
+  } catch { /* 部屋が落ちていても画面は壊さない */ }
+}
+void refreshPersona(); // 開いた時点の値を出す(0 発話なら数字は出さない)
+if (personaBtn) {
+  personaBtn.onclick = () => {
+    personaOpen = !personaOpen;
+    personaBtn.setAttribute('aria-expanded', String(personaOpen));
+    personaPanel.classList.toggle('hidden', !personaOpen);
+    void refreshPersona();
+  };
+}
+
+// ---- PBI-024: 「これ覚える?」------------------------------------------------
+// 勝手に覚えない。候補が出た時だけ 1 行出して、押されたら覚える(適合率は人が担保する)
+const vocabBar = document.getElementById('vocabBar');
+async function refreshVocab() {
+  if (!vocabBar || isGuest) return;   // PBI-040: 語彙はホストのもの
+  try {
+    const d = await (await fetch('/vocab?token=' + TOKEN)).json();
+    const words = (d.candidates ?? []).slice(0, 3);
+    vocabBar.replaceChildren();
+    vocabBar.hidden = words.length === 0;
+    if (words.length === 0) return;
+    const label = document.createElement('span');
+    label.textContent = 'これ覚える?';
+    vocabBar.appendChild(label);
+    for (const w of words) {
+      const wrap = document.createElement('span');
+      wrap.className = 'vword';
+      const yes = document.createElement('button');
+      yes.textContent = w;
+      yes.title = `「${w}」を覚える`;
+      yes.onclick = async () => { await post('/vocab', { word: w, action: 'remember' }); void refreshVocab(); };
+      const no = document.createElement('button');
+      no.className = 'no';
+      no.textContent = '✕';
+      no.title = `「${w}」はもう聞かない`;
+      no.setAttribute('aria-label', `${w} を覚えない`);
+      no.onclick = async () => { await post('/vocab', { word: w, action: 'ignore' }); void refreshVocab(); };
+      wrap.append(yes, no);
+      vocabBar.appendChild(wrap);
+    }
+  } catch { /* 部屋が落ちていても画面は壊さない */ }
+}
+void refreshVocab();
+
+// ---- PBI-022: キャラ(VRM)----------------------------------------------
+// 置いていなければ何も出さない(ボタンごと隠す)。three / three-vrm は押された時に初めて読む
+// (起動時に 1.6MB を無条件で引かない)。
+let avatarStage = null;
+let avatarLoading = false;
+let avatarFiles = [];
+// PBI-027: 前の盤面を覚えておいて、持ち分が動いた時だけキャラを動かす。
+// **キャラの状態と同じ場所に置く** —— 先に使う側(refreshGame)から見て宣言が後ろに来ないように
+let motionFiles = [];
+let reactToGame = null;
+let pickMotionForMood = null;
+let lastGameView = null;
+
+function stopAvatar() {
+  if (!avatarStage) return;
+  avatarStage.dispose();
+  avatarStage = null;
+}
+
+async function renderAvatar() {
+  const note = document.getElementById('avatarNote');
+  const canvas = document.getElementById('avatarCanvas');
+  if (!canvas || avatarLoading) return;
+  if (avatarStage) { avatarStage.resize(); return; }   // 開き直しただけ
+  if (avatarFiles.length === 0) { note.textContent = '~/.talkingclaw/avatars/ に .vrm を置くと、ここに立ちます'; return; }
+  avatarLoading = true;
+  note.textContent = '読み込み中…';
+  try {
+    const { createAvatarStage, gameMood, motionForMood, assignBodies } = await import('/avatar.js');
+    reactToGame = gameMood;              // PBI-027: 盤面に反応する(キャラが居る時だけ)
+    pickMotionForMood = motionForMood;   // PBI-031: 同じ気分で体と顔を動かす
+    const stage = createAvatarStage(canvas);
+    // PBI-032: 置いてある体を在室者に割り当てる(ファイル名 = 名前。合わなければ置いた順)
+    const here = [...pidNames.values()];
+    const cast = assignBodies(avatarFiles, here);
+    await stage.loadAvatars(cast.map((c) => ({ name: c.name, url: '/avatars/' + encodeURIComponent(c.file) + '?token=' + TOKEN })));
+    avatarStage = stage;
+    window.__clawStage = stage;   // 検査から状態を読むための窓(読み取りだけ)
+    note.textContent = cast.map((c) => (c.name ? `${c.name}: ${c.file}` : c.file)).join(' / ');
+    void renderMotions();   // PBI-025: 動きのボタン(置いていなければ出ない)
+  } catch (e) {
+    stopAvatar();
+    // 読めなくても部屋は止めない。理由だけ 1 行出す(AC-7)
+    note.textContent = 'キャラを読み込めませんでした: ' + (e?.message ?? e);
+  } finally {
+    avatarLoading = false;
+  }
+}
+
+// PBI-025: 置いてある .vrma を並べる。押すと再生し、終われば待機に戻る
+async function renderMotions() {
+  const bar = document.getElementById('motionBar');
+  if (!bar) return;
+  bar.replaceChildren();
+  let motions = [];
+  try { motions = (await (await fetch('/motions?token=' + TOKEN)).json()).motions ?? []; } catch { return; }
+  motionFiles = motions;   // PBI-027: 盤面の反応で選ぶ(置いてあるものだけ)
+  for (const m of motions) {
+    const b = document.createElement('button');
+    b.textContent = m.replace(/\.vrma$/i, '');
+    b.title = `${b.textContent} を再生`;
+    b.onclick = async () => {
+      const note = document.getElementById('avatarNote');
+      try {
+        await avatarStage?.playMotion('/motions/' + encodeURIComponent(m) + '?token=' + TOKEN);
+        window.__clawMotionPlaying = () => avatarStage?.isPlaying?.() ?? false;  // 検査用
+      }
+      catch (e) { if (note) note.textContent = '動きを再生できませんでした: ' + (e?.message ?? e); }  // AC-5
+    };
+    bar.appendChild(b);
+  }
+}
+
+// 起動時に 1 回だけ: 置いてあるか確かめ、あればボタンを出す。
+// 広い画面(右レーンがある)で、前回閉じていなければそのまま立たせる
+(async () => {
+  try {
+    const r = await fetch('/avatars?token=' + TOKEN);
+    avatarFiles = (await r.json()).avatars ?? [];
+  } catch { avatarFiles = []; }
+  const btn = document.getElementById('avatarBtn');
+  if (!btn || avatarFiles.length === 0) return;   // 置いていない = 今までどおりの画面
+  btn.hidden = false;
+  if (wideLayout() && localStorage.getItem('claw_avatar_open') !== '0') openPanel('avatar');
+})();
+
 // ---- 在室リスト + 相手選択(4A-2)----
 const rosterEl = document.getElementById('roster');
 let lastBoardRows = []; // 在室チップに「何をしているか」を出すための直近の作業状況
@@ -602,7 +779,14 @@ async function refreshRoster() {
     const r = await fetch('/participants?token=' + TOKEN);
     const d = await r.json();
     selectedPid = d.selected;
-    if (d.channel && d.channel !== currentChannel) { currentChannel = d.channel; updateRoomBtn(); }
+    // PBI-040: ゲストなら**招かれた部屋**に居るようにし、ホスト専用の道具を画面から外す
+    if (d.role === 'guest') {
+      isGuest = true;
+      document.body.classList.add('guest');
+      roomList = [{ channel: d.yourChannel, label: roomLabel(d.yourChannel) }];
+    }
+    const ch = isGuest ? (d.yourChannel ?? d.channel) : d.channel;
+    if (ch && ch !== currentChannel) { currentChannel = ch; updateRoomBtn(); }
     rosterEl.replaceChildren();
     // 相手が 1 人(クロエだけ)の時は選ぶ余地が無いので、行ごと隠して画面を軽くする
     rosterEl.classList.toggle('hidden', d.participants.length <= 1 && selectedPid === null);
@@ -627,12 +811,20 @@ async function refreshRoster() {
       const elsewhere = p.room != null && p.room !== currentChannel;
       chip.classList.toggle('away', elsewhere);
       const job = lastBoardRows.find((t) => t.status === 'working' && t.agentName === p.name);
-      chip.textContent = p.name + (p.voice !== 'ready' ? '(声なし)' : '');
+      // 名前は名前だけの要素に置く。地の text node に置くと、あとから足す .where と
+      // **accessible name が連結**して「作業係作業部屋」という 1 語のボタンになる(PBI-010 C)
+      const cname = document.createElement('span');
+      cname.className = 'cname';
+      cname.textContent = p.name + (p.voice !== 'ready' ? '(声なし)' : '');
+      chip.replaceChildren(cname);
+      chip.setAttribute('aria-label', p.name);   // 読み上げは agent 名だけ
       if (elsewhere) {
         const where = document.createElement('span');
         where.className = 'where';
         where.textContent = roomLabel(p.room).replace(/^[^\p{L}]+/u, '');
+        where.setAttribute('aria-hidden', 'true');   // 居場所は副題(名前に混ぜない)
         chip.appendChild(where);
+        chip.setAttribute('aria-label', `${p.name}(${roomLabel(p.room)}にいる)`);
       }
       if (job) {
         const busy = document.createElement('span');
@@ -758,30 +950,60 @@ const panels = {
   rooms: { el: document.getElementById('rooms'), btn: document.getElementById('roomBtn'), render: renderRooms },
   board: { el: document.getElementById('board'), btn: document.getElementById('boardBtn'), render: refreshBoard },
   settings: { el: document.getElementById('settings'), btn: document.getElementById('settingsBtn'), render: renderSettings },
+  voice: { el: document.getElementById('voice'), btn: document.getElementById('voiceBtn'), render: openVoicePanel },
+  // ヘッダにボタンを持たない(導線は rail の ＋ と部屋パネル内のボタン)
+  roomAdmin: { el: document.getElementById('roomAdmin'), btn: null, render: renderRoomsExtra },
+  avatar: { el: document.getElementById('avatar'), btn: document.getElementById('avatarBtn'), render: renderAvatar },
 };
 let openedPanel = null;
+// 右レーンに置く opt-in パネル。84px のレールでは読めないので中央の外へ出してある(PBI-009)
+const SIDE_PANELS = new Set(['voice', 'settings', 'roomAdmin', 'avatar']);
+// レーンの出し入れを今の幅に合わせ直す。開閉状態そのものは触らない(resize で勝手に閉じないため)
+function syncSideLane(prev) {
+  const onSide = SIDE_PANELS.has(openedPanel);
+  document.body.classList.toggle('side-panel-open', onSide);
+  if (!wideLayout()) return;                        // 狭い画面にレーンの概念は無い(display:contents)
+  if (onSide) openSide(true);
+  else if (SIDE_PANELS.has(prev)) openSide(false);  // 側パネルを閉じた時だけレーンを畳む
+}
 function openPanel(name) {
+  const prev = openedPanel;
   openedPanel = openedPanel === name ? null : name;
   for (const [key, p] of Object.entries(panels)) {
     const on = key === openedPanel;
     p.el.classList.toggle('open', on);
-    p.btn.setAttribute('aria-expanded', String(on));
+    p.btn?.setAttribute('aria-expanded', String(on));   // ヘッダにボタンを持たないパネルもある
   }
   boardOpen = wideLayout() || openedPanel === 'board';
+  syncSideLane(prev);
+  if (openedPanel !== 'voice') stopPreview(); // 閉じたら試聴も止める(音だけ残さない)
+  if (openedPanel !== 'avatar') stopAvatar();  // 閉じたら描画も止める(見えない絵を描き続けない)
+  if (openedPanel === 'avatar') localStorage.setItem('claw_avatar_open', '1');
+  else if (prev === 'avatar') localStorage.setItem('claw_avatar_open', '0');
   if (openedPanel) void panels[openedPanel].render();
 }
 for (const [key, p] of Object.entries(panels)) {
+  if (!p.btn) continue;                                  // 導線を別の場所に持つパネル(部屋の管理)
   p.btn.onclick = () => {
     // 広い画面の 📋 は「右レーンを出す/しまう」ボタン(パネル開閉は狭い画面の話)
     if (key === 'board' && wideLayout()) return openSide(!document.body.classList.contains('side-open'));
     openPanel(key);
   };
 }
-// 幅が変わってレーン ⇄ 1 カラムを跨いだら、開閉状態を揃え直す(レイアウト自体は CSS が持つ)
-wideQuery.addEventListener('change', () => { openPanel(null); void renderSideAlways(); void refreshBoard(); });
+// 幅が変わってレーン ⇄ 1 カラムを跨いでも、**ユーザーが開いたパネルは閉じない**(PBI-009 AC-6)。
+// 配置は CSS が持つので、ここは「レーンを出すか畳むか」だけを今の幅に合わせ直す
+wideQuery.addEventListener('change', () => {
+  syncSideLane(openedPanel);
+  void renderSideAlways();
+  void refreshBoard();
+});
 // 広い画面ではパネルを開かなくても見えている = 開いた時だけ描く作りでは中身が空になる
 function renderSideAlways() { if (wideLayout()) { void renderRooms(); void renderSettings(); } }
 
+document.getElementById('roomAdminOpen').onclick = () => {
+  openPanel('roomAdmin');
+  setTimeout(() => voiceTarget('room-name-input')?.focus(), 60);
+};
 document.getElementById('logBtn').onclick = () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel);
 document.getElementById('archiveBtn').onclick = () => window.open('/archives.md?token=' + TOKEN);
 
@@ -811,7 +1033,13 @@ async function fetchRooms() {
 }
 // 部屋を作る / 名前を変える(音声ナビからも押せるよう data-voice を付ける)
 function renderRoomsExtra() {
+  if (isGuest) return;   // PBI-040: 部屋作り・招待はホストのもの
   const box = document.getElementById('roomsExtra');
+  // PBI-010 AC-3: SSE 由来の再描画(refreshRoster → renderRooms)がここを毎回作り直すと、
+  // **打鍵中に focus と値が飛ぶ**。触っている最中は作り直さない — 部屋一覧(#roomList)側は
+  // そのまま更新されるので、表示の鮮度は落ちない
+  const live = box.querySelector('input');
+  if (live && (box.contains(document.activeElement) || live.value.trim() !== '')) return;
   box.replaceChildren();
   const input = document.createElement('input');
   input.type = 'text';
@@ -833,7 +1061,7 @@ function renderRoomsExtra() {
       const d = await r.json();
       if (!r.ok) { addSys(d.error ?? '部屋を操作できなかった'); return; }
       input.value = '';
-      box.classList.remove('open');   // 作れたら吹き出しは畳む(出しっぱなしは会話を覆う)
+      if (openedPanel === 'roomAdmin') openPanel('roomAdmin'); // 作れたら畳む
       if (action === 'create') { await renderRooms(); await enterRoom(d.channel); }
       else { await renderRooms(); updateRoomBtn(); }
     } catch { addSys('サーバに繋がらないみたい'); }
@@ -845,18 +1073,105 @@ function renderRoomsExtra() {
   row.className = 'rform';
   row.append(input, create, rename);
   box.appendChild(row);
+  box.appendChild(guestBox());
+}
+
+// PBI-043: 卓が立っている間だけの自動更新。1.5 秒ごと（他家の 1 手は 5 秒間隔なので十分）
+let gamePollTimer = null;
+function armGamePoll(on) {
+  if (!on) { if (gamePollTimer) { clearInterval(gamePollTimer); gamePollTimer = null; } return; }
+  if (gamePollTimer) return;
+  gamePollTimer = setInterval(() => { if (!document.hidden) void refreshGame(); }, 1500);
+}
+
+// ---- PBI-042: 卓モード ----
+// 遊んでいる間だけ「上に参加者の窓、下に大きな卓、会話は出さない」に切り替える。
+// 見た目の決めごとは CSS(body.table)に置き、ここは**入れ替えと名札**だけ持つ
+function setTableMode(on, seats) {
+  document.body.classList.toggle('table', on);
+  const bar = document.getElementById('seatBar');
+  if (bar) {
+    bar.replaceChildren();
+    for (const s of on ? seats : []) {
+      const el = document.createElement('span');
+      el.className = 'seat' + (s.turn ? ' turn' : '') + (s.you ? ' you' : '');
+      el.textContent = s.chips === undefined ? s.name : `${s.name} ${s.chips}`;
+      if (s.turn) el.title = `${s.name} の番`;
+      bar.appendChild(el);
+    }
+  }
+  // AI の動きが見えるように、卓が立ったらキャラを出す（置いていなければ何も起きない）
+  if (on && !avatarStage && avatarFiles.length > 0 && !avatarLoading) void renderAvatar();
+}
+
+// PBI-035: ゲストを招く。**「入れる」と「何でもできる」は別**なので、渡すのはゲスト用の鍵。
+// 招いた人は遊ぶ・話す・見るだけができ、いつでも取り消せる
+function guestBox() {
+  const box = document.createElement('div');
+  box.className = 'rform';
+  const h = document.createElement('b');
+  h.textContent = 'この部屋に招く';
+  const name = document.createElement('input');
+  name.type = 'text';
+  name.placeholder = '相手の名前(例: たけし)';
+  name.maxLength = 24;
+  name.dataset.voice = 'guest-name-input';
+  const go = document.createElement('button');
+  go.className = 'go';
+  go.textContent = '招待リンクを作る';
+  go.dataset.voice = 'invite-guest';
+  const out = document.createElement('p');
+  out.className = 'tnote';
+  out.textContent = '渡した人は「遊ぶ・話す・見る」だけできるよ。設定やファイルは触れないし、いつでも取り消せる';
+  const list = document.createElement('div');
+  list.className = 'gmoves';
+
+  const refresh = async () => {
+    try {
+      const d = await (await post('/guests', { action: 'list' })).json();
+      list.replaceChildren();
+      for (const g of (d.guests ?? []).filter((x) => x.active)) {
+        const b = document.createElement('button');
+        b.textContent = `${g.name} ✕`;
+        b.title = `${g.name} の招待を取り消す（${new Date(g.expiresAt).toLocaleString('ja-JP')} まで有効）`;
+        b.onclick = async () => { await post('/guests', { action: 'revoke', id: g.id }); void refresh(); };
+        list.appendChild(b);
+      }
+    } catch { /* 部屋が落ちていても画面は壊さない */ }
+  };
+
+  go.onclick = async () => {
+    try {
+      const d = await (await post('/guests', {
+        action: 'invite', name: name.value.trim() || 'ゲスト', channel: currentChannel,
+      })).json();
+      if (!d.url) { addSys('招待を作れなかった'); return; }
+      // **リンクは 1 回しか出せない**（一覧には鍵を並べない）。その場でコピーまでやる
+      try { await navigator.clipboard.writeText(d.url); addSys(`${d.guest.name} の招待リンクをコピーしたよ`); }
+      catch { addSys(`招待リンク: ${d.url}`); }
+      out.textContent = d.lan
+        ? `${d.url}\n（この部屋は LAN に出ているので、同じネットワークの人が開けるよ）`
+        : `${d.url}\n（いまは同じ機械の中だけ。別の機械から入れるには ROOM_BIND=0.0.0.0 で起動してね）`;
+      name.value = '';
+      void refresh();
+    } catch { addSys('サーバに繋がらないみたい'); }
+  };
+  box.append(h, name, go, out, list);
+  void refresh();
+  return box;
 }
 
 // レールの下に置く道具(部屋を作る / 記録)。狭い画面では部屋パネルの中に出るので足さない
+// PBI-040: ゲストは自分の部屋しか無い。作る・記録の道具も出さない
 function renderRailTools() {
   const host = document.getElementById('roomList');
-  if (!wideLayout()) return;
+  if (!wideLayout() || isGuest) return;
   for (const [icon, label, run] of [
     // レールでは #rooms は常設なのでパネルを開く意味がない。
     // 隠れている入力欄そのものを出す(出さないと focus も効かず、押しても無反応になる)
     ['＋', '作る', () => {
-      document.getElementById('roomsExtra').classList.add('open');
-      voiceTarget('room-name-input')?.focus();
+      openPanel('roomAdmin');                       // 読める幅の独立パネルで開く(PBI-010)
+      setTimeout(() => voiceTarget('room-name-input')?.focus(), 60);
     }],
     ['📄', '記録', () => window.open('/transcript.md?token=' + TOKEN + '&channel=' + currentChannel)],
   ]) {
@@ -913,14 +1228,9 @@ document.getElementById('railMe').onclick = () => {
   setTimeout(() => rosterEl.classList.remove('flash'), 1400);
   rosterEl.querySelector('.chip')?.focus();
 };
-// 「作る」の吹き出しは Escape と外側クリックで閉じる(閉じられないと会話を覆ったままになる)
+// 部屋の管理パネルは Escape で閉じる(開閉の本体は openPanel)
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') document.getElementById('roomsExtra').classList.remove('open');
-});
-document.addEventListener('pointerdown', (e) => {
-  const box = document.getElementById('roomsExtra');
-  if (!box.classList.contains('open')) return;
-  if (!box.contains(e.target) && !e.target.closest('.railbtn')) box.classList.remove('open');
+  if (e.key === 'Escape' && openedPanel === 'roomAdmin') openPanel('roomAdmin');
 });
 
 async function renderRooms() {
@@ -931,6 +1241,9 @@ async function renderRooms() {
   list.replaceChildren();
   const filterEl = document.getElementById('roomFilter');
   filterEl.hidden = roomList.length < 6;
+  // 狭い画面には rail(＋ ボタン)が無いので、ここからも「部屋の管理」へ入れる(PBI-010 D)。
+  // 要素は index.html に静的に在る。**append しない** = 何回描画しても 1 個(R1 の増殖対策)
+  document.getElementById('roomAdminOpen').hidden = wideLayout();
   if (filterEl.hidden) filterEl.value = '';
   // 種類ごとに束ねる。1 種類しか無いなら見出しは付けない(区切る相手が居ない)
   const grouped = new Map();
@@ -1010,6 +1323,7 @@ async function enterRoom(next) {
 // 部屋に入った時、その部屋で話していた内容を読み直す(音は鳴らさない)
 async function showHistory(channel, lines = 40) {
   try {
+    if (isGuest) return [];   // PBI-040: 過去ログはホストのもの（ゲストは入室後の会話だけ見る）
     const d = await (await post('/transcript', { channel, lines })).json();
     const rows = d.lines ?? [];
     if (rows.length === 0) { addSys('この部屋はまだ会話がないよ'); return; }
@@ -1233,6 +1547,15 @@ function renderPlan(p) {
     for (const s of p.steps) { const li = document.createElement('li'); li.textContent = s; ol.appendChild(li); }
     planEl.appendChild(ol);
   }
+  // PBI-013: 受入条件は「始める」を押した瞬間に backlog の PBI へそのまま残る。押す前に見せる
+  if ((p.accept ?? []).length > 0) {
+    const h = document.createElement('div');
+    h.className = 'psummary';
+    h.textContent = 'これができたら終わり:';
+    const ul = document.createElement('ul');
+    for (const a of p.accept) { const li = document.createElement('li'); li.textContent = a; ul.appendChild(li); }
+    planEl.append(h, ul);
+  }
   const acts = document.createElement('div');
   acts.className = 'pacts';
   const go = document.createElement('button');
@@ -1255,7 +1578,8 @@ async function planAction(action) {
     const d = await r.json();
     if (!r.ok) { addSys(d.error ?? '案を動かせなかった'); return; }
     renderPlan(null);
-    addSys(action === 'confirm' ? 'この案で始めるね' : '案は取り下げたよ');
+    // PBI-013 AC-3: PBI を作った時も作らなかった時も、理由込みで画面に出す(黙って落とさない)
+    addSys(action === 'confirm' ? 'この案で始めるね' + (d.note ? ' — ' + d.note : '') : '案は取り下げたよ');
     boardSoon(100);
   } catch { addSys('サーバに繋がらないみたい'); }
 }
@@ -1338,13 +1662,25 @@ function switchBoardTab(view) {
 
 // ---- 幅を掴んで動かす(Zed のような仕切り)----
 // 左は px、右は画面幅に対する % で覚える。両端に寄せすぎないよう幅に下限を置く
+// 右レーンの下限(px)。**実測で決めた値** — lane 幅から content までに 66px 失われる
+// (`.lane > *` の左右 margin 18×2 + パネル padding 14×2 + border 1×2)。
+// 320 + 66 = 386 が下限。丸めと scrollbar のぶんを見て 396(content 実測 328px)。
+// 机上で置いた 352 では content が 284px にしかならず、境界ちょうどの 388 も余裕が無かった。
+// 「読める幅」の定義は #settingsBody / #voiceList の clientWidth >= 320(PBI-009 AC-1)
+const SIDE_MIN_PX = 396;
 function setupGrips() {
   const saved = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
   const remember = (k, v) => { try { localStorage.setItem(k, v); } catch { /* 使えなくても動く */ } };
   const navW = saved('tc-nav-w');
   const sideW = saved('tc-side-w');
   if (navW) document.documentElement.style.setProperty('--nav-w', navW);
-  if (sideW) document.documentElement.style.setProperty('--side-w', sideW);
+  if (sideW) {
+    // 以前の版で 22% まで縮められた値が残っていることがある。読める下限まで引き上げる(F4)
+    const px = sideW.endsWith('%') ? window.innerWidth * parseFloat(sideW) / 100 : parseFloat(sideW);
+    const fixed = px >= SIDE_MIN_PX ? sideW : (SIDE_MIN_PX / window.innerWidth * 100).toFixed(1) + '%';
+    document.documentElement.style.setProperty('--side-w', fixed);
+    if (fixed !== sideW) remember('tc-side-w', fixed);
+  }
 
   const make = (lane, onMove, onReset) => {
     if (!lane) return;
@@ -1380,8 +1716,12 @@ function setupGrips() {
   });
 
   make(document.querySelector('.lane.side'), (x) => {
-    const pct = Math.min(Math.max((window.innerWidth - x) / window.innerWidth * 100, 22), 65);
-    const w = pct.toFixed(1) + '%';
+    // PBI-009 F4: 下限は % ではなく px で切る。22% だと 1440px 幅で 316.8px となり、
+    // 「開いたパネルは読める幅(content >= 320px)」を **ユーザーの drag が永続的に破れる**
+    // (--side-w は localStorage に残るので、一度最小化すると次回以降ずっと読めない)
+    const minPx = SIDE_MIN_PX;
+    const wantPx = Math.min(Math.max(window.innerWidth - x, minPx), window.innerWidth * 0.65);
+    const w = (wantPx / window.innerWidth * 100).toFixed(1) + '%';
     document.documentElement.style.setProperty('--side-w', w);
     remember('tc-side-w', w);
   }, () => {
@@ -1398,8 +1738,23 @@ let gameKind = null;
 async function refreshGame() {
   try {
     const v = await (await post('/game', {})).json();
+    // PBI-027 / PBI-031: 勝った / 負けた / 勝負どころ で**体と顔**が反応する。
+    // キャラが居る時だけ。動きは素材が在る時だけ、顔は素材が要らない
+    const mood = avatarStage && reactToGame ? reactToGame(lastGameView, v) : null;
+    if (mood) {
+      avatarStage.setMood(mood);
+      const react = pickMotionForMood?.(mood, motionFiles);
+      if (react) void avatarStage.playMotion('/motions/' + encodeURIComponent(react) + '?token=' + TOKEN);
+    }
+    const started = !gameKind && !!v.kind;   // 卓が立った瞬間
+    lastGameView = v;
     gameKind = v.kind;
     gameBadgeEl.textContent = v.kind ? '●' : '';
+    // PBI-042/043/044: **卓が立ったら黙って卓の画面にする**。
+    // 「麻雀やろう」と言ったのにゲームのタブを自分で選ばないと何も出ない、を無くす
+    setTableMode(!!v.kind, v.seats ?? []);
+    armGamePoll(!!v.kind);
+    if (started && sideView !== 'game') { switchBoardTab('game'); openPanel('board'); }
     if (sideView !== 'game') return;
     gameEl.replaceChildren();
     const h = document.createElement('h3');
@@ -1617,6 +1972,13 @@ function playBox() {
     row.appendChild(b);
   }
   box.appendChild(row);
+  if (!gameKind) {
+    // PBI-034: **人数が足りない時に使える**ことが、ここを見て分かるようにする
+    const note = document.createElement('p');
+    note.className = 'tnote';
+    note.textContent = '1 人でも 4 人打ちできるよ。足りない席はキャラが座るから、麻雀もポーカーもすぐ始められる';
+    box.appendChild(note);
+  }
   return box;
 }
 
@@ -1743,6 +2105,7 @@ function threadCard(t) {
 }
 
 async function refreshInbox() {
+  if (isGuest) return;   // PBI-040
   try {
     const d = await (await post('/inbox', {})).json();
     const unread = d.unread ?? 0;
@@ -1767,7 +2130,56 @@ async function refreshInbox() {
   } catch { /* 次の更新で */ }
 }
 
+// PBI-014: herdr の艦隊(端末で動いている agent)を作業タブに出す。箱とボタンは index.html に
+// 静的に置いてあるので、ここは中身を差し替えるだけ(再描画で導線が増殖しない)
+const fleetListEl = document.getElementById('fleetList');
+let fleetPending = false; // 「見る」を押してから返事が来るまで。定期更新に横取りさせない
+function fleetNote(text) {
+  const e = document.createElement('div');
+  e.className = 'tnote';
+  e.textContent = text;
+  fleetListEl.appendChild(e);
+}
+function renderFleet(v) {
+  fleetListEl.replaceChildren();
+  if (!v) return fleetNote('「herdr の艦隊を見る」を押すと、今動いている agent が出るよ');
+  if (v.error) return fleetNote(`herdr を見られなかった: ${v.error}`);
+  if (!v.agents || v.agents.length === 0) return fleetNote('herdr に agent は 1 人も居ないよ');
+  for (const a of v.agents) {
+    const div = document.createElement('div');
+    div.className = 'task';
+    const stat = document.createElement('span');
+    stat.className = 'tstat ' + (a.status === 'working' ? 'working' : 'queued');
+    stat.textContent = { working: '作業中', idle: '待機', blocked: '止まってる' }[a.status] ?? a.status;
+    const who = document.createElement('span');
+    who.className = 'treq';
+    who.textContent = `${a.name ?? a.pane}${a.mine ? '(部屋の子)' : ''} — ${a.title || a.cwd}`;
+    who.title = a.cwd;
+    const meta = document.createElement('span');
+    meta.className = 'tmeta';
+    meta.textContent = `${a.workspace} / ${a.pane}`;
+    div.append(stat, who, meta);
+    fleetListEl.appendChild(div);
+  }
+  const ago = elapsed(v.at);
+  if (ago) fleetNote(`${ago}前に見た様子`);
+}
+document.getElementById('fleetBtn').onclick = async () => {
+  fleetPending = true;
+  fleetListEl.replaceChildren();
+  fleetNote('herdr に聞いてるところ…');
+  try {
+    const d = await (await post('/herdr', { action: 'list' })).json();
+    fleetPending = false;
+    renderFleet(d.error ? { error: d.error } : d.fleet);
+  } catch {
+    fleetPending = false;
+    renderFleet({ error: '部屋に繋がらなかった' });
+  }
+};
+
 async function refreshBoard() {
+  if (isGuest) return;   // PBI-040: 成果物・タスクはホストのもの
   if (boardBusy) return; // 取得が重ならないように(SSE 連打 + 定期更新)
   boardBusy = true;
   try {
@@ -1780,6 +2192,7 @@ async function refreshBoard() {
     checkAutoPreview(d);           // 出来たものは会話に成果物カードで出す
     renderArtifacts(rows);         // 右レーンの成果物一覧(見えるものだけ)
     renderHistory(rows);           // 済んだものは履歴に集める
+    if (!fleetPending) renderFleet(d.fleet); // 取り直し中は上書きしない(「聞いてるところ…」が消えると無反応に見える)
     if (!boardOpen) return;
     boardEl.replaceChildren();
     // スクロールさせないため、ここは「まだ動いているもの」だけ。
@@ -2010,6 +2423,10 @@ void refreshBoard();
 // ---- W8-7: worker 設定パネル ----
 const settingsEl = document.getElementById('settingsBody');
 async function renderSettings() {
+  if (isGuest) return;   // PBI-040: 設定はホストのもの
+  // 設定は丸ごと作り直す。何かを選ぶたびに一番上へ飛ばされると、下の方の操作が続けられないので
+  // 見ていた位置を覚えて戻す(#settingsBody が scroll する箱)
+  const keepY = settingsEl.scrollTop;
   const d = await (await post('/settings', {})).json();
   settingsEl.replaceChildren();
   const mk = (labelText, el) => { const l = document.createElement('label'); l.textContent = labelText + ' '; l.appendChild(el); settingsEl.appendChild(l); };
@@ -2069,12 +2486,538 @@ async function renderSettings() {
     ? '外部 MCP: ' + d.externalMcp.join(', ')
     : '外部 MCP は ~/.talkingclaw/worker-mcp.json で追加できるよ(次の作業から反映)';
   settingsEl.appendChild(note);
-  const proj = document.createElement('div');
-  proj.className = 'tnote';
-  proj.textContent = '作業先プロジェクト: ' + (d.projects ?? []).join(' / ') + '(追加は ~/.talkingclaw/projects.json。「talkingclaw の◯◯直して」で自己開発)';
-  settingsEl.appendChild(proj);
+  await renderProjects();
   await renderMemory();
   await renderDict();
+  if (keepY > 0) settingsEl.scrollTop = keepY; // 描き終えてから戻す(中身が揃う前だと届かない)
+}
+
+// PBI-011: 作業先プロジェクトを画面から追加・登録解除する(projects.json の手書き廃止)。
+// 登録すると「〈名前〉の◯◯直して」で作業先に指定できる。外してもフォルダは消えない
+let cloningUrl = null; // PBI-012: clone 中の URL(パネルを描き直しても実行中の表示を失わない)
+// PBI-015: 追加の入口(github / folder / path)と、その状態。パネルは他の操作でも丸ごと
+// 描き直されるので、開いていた入口・見ていたフォルダ・取得済みの repo 一覧はここに残す
+let projTab = null;
+let repoList = null;
+let repoLoading = false; // 取得中に描き直されても二重に gh を叩かない
+let browseAt = null;
+let browseName = null; // 打った名前は描き直しで消さない(null = まだ打っていない)
+let pickedRepo = '';
+// 表示中のメッセージ。描き直しを跨いで残す —— clone の失敗は再描画の後に届くので、
+// その場の DOM に書くと切り離された要素に消える(押せないボタンと「clone 中…」だけが残る)
+let projMsg = '';
+// PBI-016: GitHub の連携待ち(合言葉と、その貼り先)
+let authCode = '';
+let authUrl = 'https://github.com/login/device';
+let authCopied = false;
+let dropWanted = ''; // PBI-017: 落とす時に付ける名前(空ならフォルダ名)
+
+// PBI-017: フォルダは**画面のどこに落としてもいい**。落とし口を探させない —— 設定を開いていなくても、
+// 会話を見ている最中でも受ける(ブラウザ既定のファイル表示に飛ばされるのも同時に防ぐ)
+const dragHasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
+let dragDepth = 0;
+window.addEventListener('dragenter', (e) => {
+  if (!dragHasFiles(e)) return;
+  dragDepth += 1;
+  document.body.classList.add('dragging'); // 帯を出すだけ。会話は覆わない
+});
+window.addEventListener('dragleave', () => { dragDepth -= 1; if (dragDepth <= 0) document.body.classList.remove('dragging'); });
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dragging');
+  if (dragHasFiles(e)) await handleFolderDrop(e.dataTransfer);
+});
+
+// 落ちてきたフォルダを受ける。場所が取れればコピーせず登録、取れなければ中身を送る。
+// 結果は設定パネルが開いていればそこに、閉じていれば画面上の通知に出す(黙って終わらない)
+async function handleFolderDrop(dt) {
+  const tell = (t) => {
+    projMsg = t;
+    const el = document.getElementById('projErr');
+    if (el) el.textContent = t;
+    notice(t);
+  };
+  const uri = (dt.getData('text/uri-list') || '').split('\n').map((s) => s.trim()).filter((s) => s.startsWith('file://'))[0];
+  if (uri) {
+    const p = decodeURIComponent(uri.replace(/^file:\/\/(localhost)?/, '')).replace(/\/$/, '');
+    const nm = (dropWanted.trim() || p.split('/').filter(Boolean).pop()) ?? '';
+    const r = await (await post('/projects', { action: 'add', name: nm, path: p, via: 'drop' })).json();
+    tell(r.error ? r.error : `${nm} を作業先にしたよ(コピーしていない)`);
+    if (!r.error && openedPanel === 'settings') await renderSettings();
+    return;
+  }
+  const entries = [...(dt.items ?? [])].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  const files = [];
+  for (const entry of entries) await walkEntry(entry, entry.name, files);
+  if (files.length === 0) {
+    const kinds = [...(dt.types ?? [])].join(', ') || '(何も無い)';
+    tell(`落ちてきたものを読めなかった(種類: ${kinds} / ファイル ${dt.files?.length ?? 0} 件)。フォルダごと落としてみてね`);
+    return;
+  }
+  await intakeFiles(files, tell, dropWanted.trim());
+}
+
+// PBI-017: 落とされたフォルダを取り込む。除外は「持ち込んでも意味が無い / 重いだけ」のもの
+const INTAKE_SKIP = /(^|\/)(\.git|node_modules|\.next|\.venv|__pycache__|\.DS_Store)(\/|$)/;
+const intakeRel = (f) => f.webkitRelativePath || f._rel || f.name;
+
+// drop されたディレクトリを辿ってファイルを集める(webkitGetAsEntry の再帰)
+const WALK_MAX = 5000; // 走査そのものの上限(超えたら「数え切れていない」と伝える。黙って切らない)
+async function walkEntry(entry, prefix, out) {
+  if (INTAKE_SKIP.test(prefix) || out.length >= WALK_MAX) return;
+  if (entry.isFile) {
+    const f = await new Promise((res, rej) => entry.file(res, rej)).catch(() => null);
+    if (f) { f._rel = prefix; out.push(f); }
+    return;
+  }
+  const reader = entry.createReader();
+  for (;;) {
+    const batch = await new Promise((res) => reader.readEntries(res, () => res([])));
+    if (!batch.length) return;
+    for (const e of batch) await walkEntry(e, prefix + '/' + e.name, out);
+  }
+}
+
+// 集めたファイルを部屋へ送る。送る前に上限を聞き、進捗は件数で出す
+async function intakeFiles(files, say, wantName) {
+  const keep = files.filter((f) => !INTAKE_SKIP.test(intakeRel(f)) && !intakeRel(f).split('/').some((s, i) => i > 0 && s.startsWith('.')));
+  const skipped = files.length - keep.length;
+  if (keep.length === 0) { say('置けるファイルが無かったよ(除外だけだった)'); return; }
+  if (files.length >= WALK_MAX) { say(`数え切れないほど入っているよ(${WALK_MAX} 件で数えるのをやめた)。もっと小さいフォルダにしてね`); return; }
+  // 名前は打ってあればそれ。無ければフォルダ名(日本語や空白入りは部屋の規則に通らないので、その時は打ってもらう)
+  const name = (wantName || intakeRel(keep[0]).split('/')[0] || 'folder').trim();
+  const bytes = keep.reduce((a, f) => a + f.size, 0);
+  const start = await (await post('/projects', { action: 'intakeStart', name, files: keep.length, bytes })).json();
+  if (start.error) { say(start.error); return; }
+  let done = 0;
+  let failed = '';
+  for (const f of keep) {
+    const rel = intakeRel(f).split('/').slice(1).join('/') || f.name; // 先頭のフォルダ名は置き場そのもの
+    const res = await fetch(`/intake?token=${TOKEN}&name=${encodeURIComponent(name)}&rel=${encodeURIComponent(rel)}`, {
+      method: 'POST', headers: { 'x-room-token': TOKEN }, body: f,
+    }).catch((e) => ({ ok: false, json: async () => ({ error: e.message }) }));
+    if (!res.ok) { failed = (await res.json().catch(() => ({}))).error ?? '送れなかった'; break; }
+    done += 1;
+    if (done % 10 === 0 || done === keep.length) say(`取り込み中… ${done}/${keep.length}${skipped ? `(${skipped} 件は除外)` : ''}`);
+  }
+  const fin = await (await post('/projects', { action: 'intakeDone', name, skipped })).json();
+  if (fin.error) { say(fin.error); await renderSettings(); return; }
+  projMsg = failed
+    ? `${done}/${keep.length} まで置いて止まった: ${failed}`
+    : `${name} を取り込んだよ(${done} 件${skipped ? ` / ${skipped} 件は除外` : ''})`;
+  await renderSettings();
+  say(projMsg);
+}
+
+// 承認されるまで部屋に聞き続ける。合言葉を消した(やめた)ら止まる
+let authPollSeq = 0; // やめる→もう一度 で古いループが生き残らないようにする世代番号
+async function pollAuth() {
+  const mine = ++authPollSeq;
+  let misses = 0;
+  while (authCode && mine === authPollSeq) {
+    await new Promise((r) => setTimeout(r, 2000));
+    if (!authCode || mine !== authPollSeq) return;
+    let r;
+    try {
+      r = await (await post('/projects', { action: 'authPoll' })).json();
+      misses = 0;
+    } catch {
+      // 承認までは数分かかる。Wi-Fi の瞬きで黙って見張りを降りない(降りると永遠に切り替わらない)
+      misses += 1;
+      if (misses < 10) continue;
+      say('待っている間に部屋と話せなくなったみたい。承認が済んでいるなら、この画面を開き直してね');
+      return;
+    }
+    if (r.waiting) {
+      if (r.code && r.code !== authCode) { authCode = r.code; await renderSettings(); }
+      continue;
+    }
+    authCode = '';
+    projMsg = r.authed ? `GitHub と繋がったよ${r.user ? '(@' + r.user + ')' : ''}` : (r.error ?? '連携できなかった');
+    repoList = null; // 繋がったので一覧を取り直す
+    await renderSettings();
+    return;
+  }
+}
+async function renderProjects() {
+  const box = document.createElement('div');
+  box.className = 'editlist';
+  box.id = 'projectsAdmin';
+  const h = document.createElement('b');
+  h.textContent = '作業先プロジェクト';
+  box.appendChild(h);
+  const err = document.createElement('div');
+  err.className = 'tnote';
+  err.id = 'projErr';
+  err.textContent = projMsg;
+  // 状態に置いてから、今生きている要素にも書く(描き直しを跨いでも残る)
+  const say = (t) => { projMsg = t; const el = document.getElementById('projErr'); if (el) el.textContent = t; else err.textContent = t; };
+  try {
+    const d = await (await post('/projects', {})).json();
+    // HOME 部分は ~ に縮めて表示(全文は title)。CSS の省略(ellipsis)は
+    // 「文字が切り詰められている」として geometry 契約が禁止しているので、文字列側で短くする
+    const short = (p) => (d.home && p.startsWith(d.home) ? '~' + p.slice(d.home.length) : p);
+    for (const [name, dir] of Object.entries(d.projects ?? {})) {
+      const row = document.createElement('div');
+      row.className = 'erow';
+      const t = document.createElement('span');
+      t.textContent = `${name} — ${short(dir)}`;
+      t.title = dir;
+      row.appendChild(t);
+      if (name !== 'workspace' && name !== 'talkingclaw') {
+        const del = document.createElement('button');
+        del.className = 'tact';
+        del.textContent = '外す';
+        del.onclick = async () => {
+          const r = await (await post('/projects', { action: 'remove', name })).json();
+          if (r.error) { say(r.error); return; }
+          projMsg = '';
+          await renderSettings();
+        };
+        row.appendChild(del);
+      }
+      box.appendChild(row);
+    }
+    // ---- PBI-015: 追加の入口は 3 つ。打たずに「選ぶ」ものを既定にする ----
+    if (projTab === null) projTab = d.gh === false ? 'path' : 'github';
+    const tabs = document.createElement('div');
+    tabs.className = 'erow';
+    for (const [key, label] of [['github', 'GitHub から'], ['drop', 'フォルダを落とす'], ['folder', 'フォルダから選ぶ'], ['path', 'パスを打つ']]) {
+      const b = document.createElement('button');
+      b.className = 'tact';
+      b.id = 'projTab-' + key;
+      b.textContent = label;
+      if (key === projTab) { b.style.fontWeight = '700'; b.style.outline = '2px solid currentColor'; }
+      b.onclick = async () => { projTab = key; await renderSettings(); };
+      tabs.appendChild(b);
+    }
+    box.appendChild(tabs);
+
+    // clone は URL 入力からも一覧からも同じ道を通る(実行中の見せ方も 1 箇所)
+    const doClone = async (url, via, btn) => {
+      if (!url) { say('どの repo にするか選んでね'); return; }
+      cloningUrl = url;
+      btn.disabled = true;
+      say('clone 中…(大きい repo だと数分かかるよ)');
+      let msg = '';
+      try {
+        const r = await (await post('/projects', { action: 'clone', url, via })).json();
+        msg = r.error ?? '';
+      } catch (e) {
+        msg = 'clone を頼めなかった: ' + e.message;
+      }
+      // 押した時のボタンは、待っている間の描き直しで切り離されているかもしれない。
+      // 状態を戻してから描き直す —— そうしないと失敗が永久に「clone 中…」のまま見えなくなる。
+      // 描き直しは同時に何本も走りうる(別の操作・画面幅の変化)ので、描き終えた後にもう一度書く ——
+      // 途中まで進んでいた古い描画が最後に完了すると、そちらの「clone 中…」が残ってしまう
+      cloningUrl = null;
+      projMsg = msg;
+      await renderSettings();
+      say(msg);
+    };
+
+    // gh が無い時は「連携」ではなく一覧側で理由を出す(入れる先が無いのに繋ごうとさせない)
+    const needAuth = d.gh !== false && d.ghAuthed === false;
+    if (projTab === 'github' && needAuth && !authCode) {
+      // PBI-016: 未認証なら、一覧より先に「連携」を出す(端末で gh auth login を打たせない)
+      const btn = document.createElement('button');
+      btn.className = 'tact';
+      btn.id = 'ghConnect';
+      btn.textContent = 'GitHub と連携する';
+      btn.onclick = async () => {
+        btn.disabled = true;
+        say('GitHub に繋いでいるところ…');
+        const r = await (await post('/projects', { action: 'auth' })).json();
+        if (r.error) { say(r.error); btn.disabled = false; return; }
+        if (!r.code) { say('合言葉を待っているところ…もう一度押してみて'); btn.disabled = false; return; }
+        authCode = r.code;
+        authUrl = r.url;
+        try { await navigator.clipboard.writeText(r.code); authCopied = true; } catch { authCopied = false; }
+        projMsg = '';
+        await renderSettings();
+        pollAuth();
+      };
+      const row = document.createElement('div');
+      row.className = 'erow';
+      row.appendChild(btn);
+      box.appendChild(row);
+      const why = document.createElement('div');
+      why.className = 'tnote';
+      why.textContent = 'まだ GitHub と繋がっていないよ。押すと合言葉が出るから、それを GitHub の画面に貼るだけ';
+      box.appendChild(why);
+    }
+
+    if (projTab === 'github' && authCode) {
+      // 合言葉を大きく出す。コピーは押した時に済ませてあるので、ユーザーは貼って許可するだけ
+      const big = document.createElement('div');
+      big.id = 'ghCode';
+      big.textContent = authCode;
+      big.style.fontSize = '2em';
+      big.style.fontWeight = '700';
+      big.style.letterSpacing = '0.1em';
+      big.style.userSelect = 'all';
+      box.appendChild(big);
+      const openBtn = document.createElement('button');
+      openBtn.className = 'tact';
+      openBtn.id = 'ghOpen';
+      openBtn.textContent = 'GitHub を開く';
+      openBtn.onclick = () => window.open(authUrl, '_blank', 'noopener');
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'tact';
+      copyBtn.textContent = 'もう一度コピー';
+      copyBtn.onclick = async () => {
+        try { await navigator.clipboard.writeText(authCode); say('コピーしたよ'); } catch { say('コピーできなかったので、上の文字を選んでコピーしてね'); }
+      };
+      const stopBtn = document.createElement('button');
+      stopBtn.className = 'tact';
+      stopBtn.id = 'ghCancel';
+      stopBtn.textContent = 'やめる';
+      stopBtn.onclick = async () => {
+        await post('/projects', { action: 'authCancel' });
+        authCode = '';
+        authPollSeq += 1; // 待っているループを降ろす(残すと次の連携の結果を横取りする)
+        projMsg = '';
+        await renderSettings();
+      };
+      const row = document.createElement('div');
+      row.className = 'erow';
+      row.append(openBtn, copyBtn, stopBtn);
+      box.appendChild(row);
+      const how = document.createElement('div');
+      how.className = 'tnote';
+      how.textContent = (authCopied ? '合言葉はコピー済み。' : '上の合言葉を選んでコピーしてね。')
+        + '「GitHub を開く」→ 貼り付け → 許可、で終わり。ここは開いたままでいいよ(終わったら勝手に切り替わる)';
+      box.appendChild(how);
+    }
+
+    if (projTab === 'github' && !needAuth) {
+      // 認証済みの gh から自分の repo を出す。URL は 1 文字も打たせない
+      const filter = document.createElement('input');
+      filter.id = 'repoFilter';
+      filter.placeholder = '絞り込み(名前の一部)';
+      const sel = document.createElement('select');
+      sel.id = 'repoSelect';
+      // 押すと開くドロップダウン(size を付けると開きっぱなしの箱になり、場所を取るうえ選びにくい)。
+      // 中身は更新の新しい順なので、打たずに開いて選ぶだけで済む
+      sel.style.width = '100%';
+      const fill = () => {
+        const q = filter.value.trim().toLowerCase();
+        const hit = (repoList ?? []).filter((r) => r.nameWithOwner.toLowerCase().includes(q));
+        // 絞り込みで消えた選択は捨てる —— 残すと「見えていない repo」を clone してしまう
+        if (!hit.some((r) => 'https://github.com/' + r.nameWithOwner === pickedRepo)) pickedRepo = '';
+        if (hit.length === 1) pickedRepo = 'https://github.com/' + hit[0].nameWithOwner; // 1 件なら選んだも同然
+        sel.replaceChildren();
+        for (const r of hit) {
+          const o = document.createElement('option');
+          o.value = 'https://github.com/' + r.nameWithOwner;
+          o.textContent = `${r.nameWithOwner}${r.isPrivate ? '(private)' : ''} — ${r.updatedAt.slice(0, 10)}`;
+          if (o.value === pickedRepo) o.selected = true;
+          sel.appendChild(o);
+        }
+        if (hit.length === 0) {
+          const o = document.createElement('option');
+          o.textContent = repoList ? '見つからない' : '読み込み中…';
+          o.disabled = true;
+          sel.appendChild(o);
+        }
+      };
+      filter.oninput = fill;
+      sel.onchange = () => { pickedRepo = sel.value; };
+      fill();
+      // 繋がっていることが分かる表示(押す必要が無いと分かる)
+      if (d.ghAuthed === true) {
+        const badge = document.createElement('div');
+        badge.className = 'tnote';
+        badge.id = 'ghState';
+        badge.textContent = 'GitHub と連携中';
+        box.appendChild(badge);
+      }
+      const cloneBtn = document.createElement('button');
+      cloneBtn.className = 'tact';
+      cloneBtn.id = 'projClone';
+      cloneBtn.textContent = 'clone して追加';
+      cloneBtn.onclick = () => doClone(sel.value || pickedRepo, 'list', cloneBtn);
+      if (cloningUrl) { cloneBtn.disabled = true; err.textContent = 'clone 中…(大きい repo だと数分かかるよ)'; }
+      if (d.gh === false) { cloneBtn.disabled = true; cloneBtn.textContent = 'clone して追加(gh が無い)'; }
+      const row1 = document.createElement('div');
+      row1.className = 'erow';
+      row1.append(filter, cloneBtn);
+      const row2 = document.createElement('div');
+      row2.className = 'erow';
+      row2.appendChild(sel);
+      box.append(row1, row2);
+      // 開いた時に 1 回だけ取る(閉じている間は gh を叩かない)。
+      // repoLoading を見ないと、取得中の描き直しのたびに gh repo list が増える(1 回 1 秒かかる)
+      if (!repoList && !repoLoading) {
+        repoLoading = true;
+        (async () => {
+          try {
+            const r = await (await post('/projects', { action: 'repos' })).json();
+            if (r.error) { say(r.error + ' → gh auth login で入り直せるよ'); return; }
+            repoList = r.repos ?? [];
+            // 黙って切らない: 打ち止めに当たったならそう言う
+            if (repoList.length >= (r.limit ?? 200)) say(`一覧は ${r.limit} 件までだよ(それ以上は「パスを打つ」で URL 指定してね)`);
+            fill();
+          } finally {
+            repoLoading = false;
+          }
+        })();
+      }
+    }
+
+    if (projTab === 'drop') {
+      // PBI-017: フォルダを落として持ち込む。Finder から場所が取れたらコピーしない
+      const zone = document.createElement('div');
+      zone.id = 'dropZone';
+      zone.className = 'tnote';
+      zone.textContent = 'ここにフォルダを落としてね(押すと選ぶこともできる)';
+      zone.style.border = '2px dashed currentColor';
+      zone.style.padding = '1.2em';
+      zone.style.textAlign = 'center';
+      zone.style.cursor = 'pointer';
+      // 名前は既定でフォルダ名。日本語・空白入りのフォルダはそのままだと登録できないので、ここで直せる
+      const dropName = document.createElement('input');
+      dropName.id = 'dropName';
+      dropName.placeholder = '名前(空ならフォルダ名のまま)';
+      dropName.value = dropWanted;
+      dropName.oninput = () => { dropWanted = dropName.value; };
+      const nameRow = document.createElement('div');
+      nameRow.className = 'erow';
+      nameRow.appendChild(dropName);
+      const picker = document.createElement('input');
+      picker.type = 'file';
+      picker.id = 'dropPicker';
+      picker.webkitdirectory = true;
+      picker.multiple = true;
+      picker.style.display = 'none';
+      picker.onchange = () => { if (picker.files.length) intakeFiles([...picker.files], say, dropWanted.trim()); };
+      zone.onclick = () => picker.click();
+      zone.ondragover = (e) => { e.preventDefault(); zone.style.opacity = '0.6'; };
+      zone.ondragleave = () => { zone.style.opacity = ''; };
+      zone.ondrop = async (e) => {
+        e.preventDefault();
+        zone.style.opacity = '';
+        await handleFolderDrop(e.dataTransfer); // 画面全体の落とし口と同じ道を通る
+      };
+      box.append(nameRow, zone, picker);
+      const note2 = document.createElement('div');
+      note2.className = 'tnote';
+      note2.textContent = '同じパソコンのフォルダなら、そのまま作業先にする(コピーしない)。取り込みになる時は .git と node_modules と隠しフォルダを除くよ';
+      box.appendChild(note2);
+    }
+
+    if (projTab === 'folder') {
+      // ~ から辿って選ぶ。絶対パスを打たせない
+      const where = document.createElement('span');
+      where.id = 'browseAt';
+      const upBtn = document.createElement('button');
+      upBtn.className = 'tact';
+      upBtn.id = 'browseUp';
+      upBtn.textContent = '↑ 上へ';
+      const head = document.createElement('div');
+      head.className = 'erow';
+      head.append(upBtn, where);
+      const list = document.createElement('div');
+      list.id = 'browseList';
+      list.style.maxHeight = '12em';
+      list.style.overflowY = 'auto'; // 一覧が伸びて会話を押し出さない
+      const nameIn2 = document.createElement('input');
+      nameIn2.id = 'browseName';
+      nameIn2.placeholder = '登録する名前';
+      const pickBtn = document.createElement('button');
+      pickBtn.className = 'tact';
+      pickBtn.id = 'browsePick';
+      pickBtn.textContent = 'ここにする';
+      const foot = document.createElement('div');
+      foot.className = 'erow';
+      foot.append(nameIn2, pickBtn);
+      box.append(head, list, foot);
+      const load = async (p) => {
+        const r = await (await post('/projects', { action: 'browse', path: p })).json();
+        if (r.error) {
+          say(r.error);
+          // 覚えていた場所が消えている(改名・削除)ことがある。行き止まりにせず ~ へ戻す
+          if (p !== '~') { browseAt = null; return load('~'); }
+          return;
+        }
+        browseAt = r.at;
+        where.textContent = short(r.at) + (r.git ? '(git repo)' : '');
+        upBtn.disabled = !r.up;
+        upBtn.onclick = () => load(r.up);
+        list.replaceChildren();
+        for (const e of r.entries) {
+          const b = document.createElement('button');
+          b.className = 'tact';
+          b.textContent = (e.git ? '📁 ' : '📂 ') + e.name;
+          b.title = e.git ? 'git repo' : '';
+          b.onclick = () => load(e.path);
+          const row = document.createElement('div');
+          row.className = 'erow';
+          row.appendChild(b);
+          list.appendChild(row);
+        }
+        if (r.entries.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'tnote';
+          empty.textContent = 'この中にフォルダは無いよ(「ここにする」でこの場所を登録できる)';
+          list.appendChild(empty);
+        }
+        if (r.more > 0) say(`このフォルダは多いので ${r.entries.length} 件まで出しているよ(あと ${r.more} 件)`);
+        // 打った名前は勝手に戻さない。既定を入れるのは、まだ打っていない時だけ
+        nameIn2.value = browseName ?? (r.at.split('/').filter(Boolean).pop() ?? '');
+      };
+      nameIn2.oninput = () => { browseName = nameIn2.value; };
+      pickBtn.onclick = async () => {
+        const r = await (await post('/projects', { action: 'add', name: nameIn2.value.trim(), path: browseAt, via: 'browse' })).json();
+        if (r.error) { say(r.error); return; }
+        browseName = null; // 登録できたら次のために白紙へ
+        projMsg = '';
+        await renderSettings();
+      };
+      load(browseAt ?? '~');
+    }
+
+    if (projTab === 'path') {
+      const nameIn = document.createElement('input');
+      nameIn.id = 'projName';
+      nameIn.placeholder = '名前(例: myapp)';
+      const pathIn = document.createElement('input');
+      pathIn.id = 'projPath';
+      pathIn.placeholder = 'フォルダの絶対パス / GitHub の URL';
+      const addBtn = document.createElement('button');
+      addBtn.className = 'tact';
+      addBtn.id = 'projAdd';
+      addBtn.textContent = '追加';
+      addBtn.onclick = async () => {
+        const p = pathIn.value.trim();
+        // URL を貼られたら clone、パスなら登録(押す前にどちらか選ばせない)
+        if (/^https?:\/\//.test(p)) { await doClone(p, 'url', addBtn); return; }
+        const r = await (await post('/projects', { action: 'add', name: nameIn.value.trim(), path: p, via: 'path' })).json();
+        if (r.error) { say(r.error); return; }
+        projMsg = '';
+        await renderSettings();
+      };
+      if (cloningUrl) { pathIn.value = cloningUrl; addBtn.disabled = true; }
+      const form = document.createElement('div');
+      form.className = 'erow';
+      form.append(nameIn, pathIn, addBtn);
+      box.appendChild(form);
+    }
+
+    box.appendChild(err);
+    const note = document.createElement('div');
+    note.className = 'tnote';
+    note.textContent = d.gh === false
+      ? 'GitHub から選ぶには gh コマンドが要るよ(brew install gh)。登録すると「〈名前〉の◯◯直して」で作業先にできる(外してもフォルダは消えない)'
+      : `登録すると「〈名前〉の◯◯直して」で作業先にできるよ(外してもフォルダは消えない)。clone 先は ${short(d.workspace ?? '')} の下`;
+    box.appendChild(note);
+  } catch {
+    err.textContent = 'プロジェクト一覧を読めなかった';
+    box.appendChild(err);
+  }
+  settingsEl.appendChild(box);
 }
 
 // 覚えたことを画面から見て消せるようにする。
@@ -2168,6 +3111,177 @@ async function renderDict() {
   } catch { /* 次に開いた時に */ }
   settingsEl.appendChild(box);
 }
+
+// ---- クロエの声を選ぶ(PBI-008)----
+// 会話の音(audioQueue / currentAudio / audioStore)とは完全に分ける。試聴は POST の応答 WAV を
+// 専用の <audio> で鳴らすだけで、会話の queue にも /played にも EventStore にも 1 件も入らない。
+const voiceListEl = document.getElementById('voiceList');
+const voiceNowEl = document.getElementById('voiceNow');
+const voiceNoteEl = document.getElementById('voiceNote');
+// PBI-029: どの役の声を選んでいるか。'chloe' | 'narrator'(実況 = 作業係)
+let voiceRole = 'chloe';
+const voiceRoleQ = () => (voiceRole === 'narrator' ? '&role=narrator' : '');
+function setVoiceRole(role) {
+  voiceRole = role;
+  document.getElementById('voiceRoleChloe')?.setAttribute('aria-pressed', String(role === 'chloe'));
+  document.getElementById('voiceRoleNarrator')?.setAttribute('aria-pressed', String(role === 'narrator'));
+  const h = document.getElementById('voiceTitle');
+  if (h) h.textContent = role === 'narrator' ? '実況の声' : 'クロエの声';
+  voicePage = 1;
+  voiceCards.clear();
+  void renderVoice();   // 役ごとに「選択中」が違うので取り直す
+}
+const voiceSearchEl = document.getElementById('voiceSearch');
+const voiceAllEl = document.getElementById('voiceAll');
+const voiceMoreEl = document.getElementById('voiceMore');
+const voicePreviewEl = document.getElementById('voicePreview');
+const voiceCards = new Map();     // id → 候補。ページを跨いでも id で束ねるので重複しない
+let voicePage = 1, voiceHasMore = false, voiceLoading = false;
+let previewUrl = null, previewAbort = null, previewingId = null;
+
+// 会話が音を出している / ユーザーが話している間は試聴させない(AC-5)
+function previewBlocked() {
+  if (gateActive()) return 'いま話してる最中だから、試聴はそのあとでね';
+  if (playing) return '読み上げ中だから、終わってからにしてね';
+  return null;
+}
+
+// 試聴だけを止める。currentAudio / audioQueue には**触らない**(会話側は無傷 = AC-5)
+function stopPreview() {
+  if (previewAbort) { previewAbort.abort(); previewAbort = null; }
+  previewingId = null;
+  voicePreviewEl.pause();
+  voicePreviewEl.removeAttribute('src');
+  voicePreviewEl.load();
+  if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+}
+
+function voiceRowError(id, message) {
+  const row = voiceListEl.querySelector(`[data-vid="${CSS.escape(id)}"]`);
+  if (!row) return;
+  let err = row.querySelector('.verr');
+  if (!err) { err = document.createElement('div'); err.className = 'verr'; row.appendChild(err); }
+  err.textContent = message; // 失敗はその行に文字で出す(ローカル音声で誤魔化さない = AC-9b)
+}
+
+async function previewVoice(id) {
+  const blocked = previewBlocked();
+  if (blocked) return voiceRowError(id, blocked); // ここで止める = サーバへも Fish へも行かない
+  stopPreview();
+  previewingId = id;
+  previewAbort = new AbortController();
+  try {
+    const r = await fetch('/voice/api/preview', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-room-token': TOKEN },
+      body: JSON.stringify({ candidateId: id }),   // 送るのは候補 id だけ
+      signal: previewAbort.signal,
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      const wait = d.retryAfterMs ? `(あと ${Math.ceil(d.retryAfterMs / 60000)} 分くらい)` : '';
+      return voiceRowError(id, (d.error ?? `試聴できなかった (${r.status})`) + wait);
+    }
+    const blob = await r.blob();
+    if (previewingId !== id) return;               // 待っている間に別のものに移った
+    previewUrl = URL.createObjectURL(blob);
+    voicePreviewEl.src = previewUrl;
+    await voicePreviewEl.play();
+  } catch (e) {
+    if (e.name !== 'AbortError') voiceRowError(id, '試聴できなかった');
+  }
+}
+
+async function selectVoice(id) {
+  try {
+    const r = await post('/voice/api/select' + (voiceRole === 'narrator' ? '?role=narrator' : ''), { candidateId: id });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return voiceRowError(id, d.error ?? `選べなかった (${r.status})`);
+    stopPreview();
+    await renderVoice({ keep: true });
+  } catch { voiceRowError(id, '選べなかった(通信エラー)'); }
+}
+
+function voiceRow(c) {
+  const row = document.createElement('div');
+  row.className = 'vrow' + (c.selected ? ' on' : '');
+  row.dataset.vid = c.id;
+  const name = document.createElement('div');
+  name.className = 'vname';
+  // 声の名前は**それ自身が葉の要素**であること。中に別の span を抱えると、名前で要素を
+  // 探す道具(支援技術・検査)から候補名が見つからなくなる(worker-f 実測 F4)
+  const title = document.createElement('span');
+  title.className = 'vtitle';
+  title.textContent = c.title;                     // Fish の title は必ず textContent(HTML を実行しない)
+  title.title = c.title;                           // 省略された分は title で全文が読める
+  const sub = document.createElement('span');
+  sub.className = 'vsub';
+  sub.textContent = [c.provider === 'local' ? 'この Mac の声' : 'Fish', ...c.tags, ...c.languages].join(' · ');
+  name.append(title, sub);
+  const play = document.createElement('button');
+  play.textContent = '▶';
+  play.title = '試聴する';
+  play.onclick = () => void previewVoice(c.id);
+  const pick = document.createElement('button');
+  pick.textContent = c.selected ? '選択中' : 'これにする';
+  pick.disabled = c.selected;
+  pick.onclick = () => void selectVoice(c.id);
+  row.append(name, play, pick);
+  return row;
+}
+
+async function renderVoice({ keep = false } = {}) {
+  if (voiceLoading) return;
+  voiceLoading = true;
+  try {
+    const q = new URLSearchParams({ token: TOKEN, page: String(voicePage) });
+    if (voiceSearchEl.value.trim()) q.set('title', voiceSearchEl.value.trim());
+    if (voiceAllEl.getAttribute('aria-pressed') === 'true') q.set('all', '1');
+    const d = await (await fetch('/voice/api/candidates?' + q + voiceRoleQ())).json();
+    if (!keep && voicePage === 1) voiceCards.clear();
+    for (const c of d.candidates ?? []) voiceCards.set(c.id, c);
+    voiceHasMore = !!d.hasMore;
+    voiceNoteEl.textContent = d.error ?? (d.stale ? '一覧が少し古いかも(取り直せなかった)' : '');
+    // AC-9d: 選んだ声と、いま実際に鳴っている声を**文字で区別**する
+    voiceNowEl.replaceChildren();
+    const sel = d.selection;
+    const label = sel ? sel.title : '既定の声';
+    const b = document.createElement('b');
+    b.textContent = label;
+    voiceNowEl.append('選択: ', b);
+    if (sel && sel.provider === 'fish' && d.actual === 'local') {
+      const f = document.createElement('span');
+      f.className = 'fallback';
+      f.textContent = ' / 現在: local fallback';
+      voiceNowEl.appendChild(f);
+    }
+    voiceMoreEl.hidden = !voiceHasMore;             // has_more=false なら追加取得の導線を出さない
+    voiceListEl.replaceChildren(...[...voiceCards.values()].map(voiceRow), voiceMoreEl);
+  } catch {
+    voiceNoteEl.textContent = '声の一覧を取れなかった';
+  } finally {
+    voiceLoading = false;
+  }
+}
+
+function openVoicePanel() {
+  voicePage = 1;
+  voiceCards.clear();
+  return renderVoice();
+}
+let voiceSearchTimer = null;
+voiceSearchEl.oninput = () => {
+  clearTimeout(voiceSearchTimer);
+  voiceSearchTimer = setTimeout(() => { voicePage = 1; voiceCards.clear(); void renderVoice(); }, 300);
+};
+voiceAllEl.onclick = () => {
+  voiceAllEl.setAttribute('aria-pressed', String(voiceAllEl.getAttribute('aria-pressed') !== 'true'));
+  voicePage = 1; voiceCards.clear(); void renderVoice();
+};
+voiceMoreEl.onclick = () => { voicePage++; void renderVoice({ keep: true }); };
+// PBI-029: クロエ / 実況 の切り替え(選択は役ごとに別々に保存される)
+document.getElementById('voiceRoleChloe')?.addEventListener('click', () => setVoiceRole('chloe'));
+document.getElementById('voiceRoleNarrator')?.addEventListener('click', () => setVoiceRole('narrator'));
 
 connect();
 void renderSideAlways();          // 常設パネル(部屋・設定)の中身を最初から描いておく

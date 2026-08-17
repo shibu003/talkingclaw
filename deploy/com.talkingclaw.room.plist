@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- talkingclaw 部屋 (port 3300) の LaunchDaemon。ログイン不要で起動し、KeepAlive で自動復帰。
+     設置先: /Library/LaunchDaemons/ (root:wheel 644)。手順は docs/setup-memo-public.md。
+     注意: 手動起動の部屋 (npm run web) と同時には動かせない — 設置前に手動の部屋を止めること。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.talkingclaw.room</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/YOUR_USER/talkingclaw/src/room.ts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USER/talkingclaw</string>
+
+  <!-- 部屋は ~/.talkingclaw に状態を書き、claude CLI・TTS エンジンを spawn するので
+       このユーザーで動かす。HOME と PATH は launchd では引き継がれないため明示する。 -->
+  <key>UserName</key>
+  <string>YOUR_USER</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/YOUR_USER</string>
+    <!-- claude=~/.local/bin, node/cloudflared=/usr/local/bin, git=/usr/bin, lsof=/usr/sbin -->
+    <key>PATH</key>
+    <string>/Users/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- PBI-003 の room 側 diff (memo 限定 origin 許可) が入ったら有効化する:
+    <key>MEMO_PUBLIC_ORIGIN</key>
+    <string>https://MEMO_HOST_PLACEHOLDER</string>
+    -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/talkingclaw/room.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/talkingclaw/room.log</string>
+</dict>
+</plist>

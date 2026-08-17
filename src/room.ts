@@ -1,22 +1,55 @@
 // 声の部屋 daemon(3A-1a-i: EventStore + HTTP core + token 認証 + inline TTS)。
 // S8 の単一性強化・S9 の Host/Origin 検証等は 3A-1b、ページ配信は 3A-1c で拡張する。
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
+import { readFile, readdir, stat, mkdir as mkdirP, writeFile as writeFileP } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.ts';
 import { archiveIndexTail, archiveRead, archiveSession, markArchiveBaseline } from './archive.ts';
 import { EventStore, Registry, type Channel, type RoomEvent } from './roomcore.ts'; // kanaNormalize は Router(convos/turn.ts)へ移った
 import { LatestChannel, TurnMetricClock, type ChannelRun } from './convos/channel.ts';
+import { createMemoHandler } from './memo.ts';
+import { attitudeLine, attitudeTone, currentPersona, observeTurn, personaSummary } from './persona.ts';
+import { currentVocab, decide as vocabDecide, observeText, pendingWords, promptLine } from './vocab.ts';
+
+// PBI-022: キャラの実体はユーザーが置く(AivisSpeech エンジンと同じ扱い。repo には入れない)。
+// 置いていなければ空配列で、画面はキャラ枠を出さずに今までどおり動く
+function listAvatars(): string[] {
+  try {
+    return readdirSync(join(homedir(), '.talkingclaw', 'avatars'))
+      .filter((n) => n.toLowerCase().endsWith('.vrm'))
+      .sort();
+  } catch { return []; }
+}
+
+// PBI-025: 動き(.vrma)。素材もユーザーが置く(repo には入れない)
+function listMotions(): string[] {
+  try {
+    return readdirSync(join(homedir(), '.talkingclaw', 'motions'))
+      .filter((n) => n.toLowerCase().endsWith('.vrma'))
+      .sort();
+  } catch { return []; }
+}
+import { createVoiceSwitch } from './voiceswitch.ts';
+import { findGuest, guestAllows, guestSummary, issueGuest, loadGuests, revokeGuest, saveGuests, type Guest } from './guests.ts';
+import { hostAllowed, inviteHost, lanAddresses, originAllowed } from './net.ts';
 import { SpeechPlane, UserSpeechState } from './convos/speech.ts';
 import { TurnPlane } from './convos/turn.ts';
 import { Voice } from './voice.ts'; // splitSentences は音声平面(convos/speech.ts)へ移った
+import { HerdrBridge, type FleetView } from './herdr.ts';
+import { writePbi } from './planpbi.ts';
 import * as casino from './casino.ts';
 
 const PORT = Number(process.env.PORT ?? 3300);
+// PBI-036: どこまで出すか。**既定は今までどおり localhost だけ**。
+// LAN に出すのは明示の opt-in（`ROOM_BIND=0.0.0.0`）—— 勝手に外へは出さない
+const BIND = process.env.ROOM_BIND === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
+const LAN = BIND === '0.0.0.0' ? lanAddresses() : [];
+// 通してよい Host（列挙一致。**ここを緩めない**のが DNS rebinding 対策の本体）
+const ALLOWED_HOSTS = ['127.0.0.1', 'localhost', ...LAN];
 const LISTEN_MAX_S = 48; // S2: server 内部 deadline 上限
 const TEXT_MAX = 4000;
 const BODY_MAX = 64 * 1024;
@@ -122,7 +155,8 @@ function reportSynthResult(ok: boolean): boolean {
   return false;
 }
 // スケジューラ / filler が読むのはこれだけ。engineState を直接見せない
-const isEngineReady = (): boolean => engineState === 'ready';
+// PBI-007: ローカル engine が落ちていても・冷えていても、クラウド合成が生きていれば声は出せる
+const isEngineReady = (): boolean => engineState === 'ready' || voice.cloudReady;
 
 // W9-0: 生死判定は 3 値。timeout(= 合成でビジーの可能性)と refused(= 本当に死亡)を区別する
 type EngineProbe = 'ok' | 'busy' | 'refused';
@@ -263,6 +297,85 @@ const speech = new SpeechPlane({
   metric, userSpeech: mic,
   // turn → channel の解決は Floor/Turn 層が持つ。下で定義される turn を実行時に読む
   turnChannel: (turnId) => turn.channelOf(turnId),
+  // PBI-008 AC-6: 声の選択は役ごと。クロエは voiceSwitch、実況(作業係)は narratorSwitch。
+  // どちらも選んでいなければ null = config の既定の声のまま(PBI-029 AC-6)
+  voiceSnapshot: (pid) => (pid === chloePid ? voiceSwitch.snapshot()
+    : pid !== null && pid === narratorPid ? narratorSwitch.snapshot() : null),
+});
+
+// ---- PBI-008: 声スイッチャー(候補・試聴・選択)----
+// 実装は src/voiceswitch.ts。room 側が渡すのは「合成の口・話者一覧・会話が鳴っているか・
+// commit の後始末」だけで、選択の永続化と課金の門(10 分 10 回 + WAL)は向こうが持つ。
+async function localSpeakers(): Promise<{ speakerId: number; title: string }[]> {
+  try {
+    const r = await fetch(`${config.tts.url}/speakers`, { signal: AbortSignal.timeout(3000) });
+    const speakers = (await r.json()) as { name: string; styles: { name: string; id: number }[] }[];
+    return speakers.flatMap((s) => s.styles.map((st) => ({ speakerId: st.id, title: `${s.name}/${st.name}` })));
+  } catch {
+    return []; // engine 不通 = ローカルの声は今は出せない(Fish の候補だけ出す)
+  }
+}
+
+// 会話が音を出している最中は試聴させない(AC-5: 再生 overlap 0・Fish へ 0 リクエスト)。
+// 根拠は pendingSpeechSnapshot と同じ「/played がまだ来ていない audio 付き発話」。
+// ただし直近 60s に絞る — 再生通知が来ないまま残った古い発話で試聴が永久に塞がらないように。
+function conversationBusy(): string | null {
+  if (mic.active) return 'いま話してる最中みたいだから、試聴はそのあとでね';
+  const since = Date.now() - 60_000;
+  for (const ev of store.since(Math.max(0, store.lastId - 200))) {
+    if (ev.type !== 'agent_speech' || !ev.audio || playedIds.has(ev.id)) continue;
+    if (Date.parse(ev.at) >= since) return '読み上げ中だから、終わってからにしてね';
+  }
+  return null;
+}
+
+const voiceSwitch = createVoiceSwitch({
+  fish: { apiKey: config.tts.fish.apiKey, base: config.tts.fish.base },
+  previewFish: (referenceId, text) => voice.previewFish(referenceId, text),
+  localSynth: (text, speakerId) => voice.previewLocal(text, speakerId),
+  localSpeakers,
+  cloudCooldown: () => Date.now() < voice.diag.cooldownUntil,
+  conversationBusy,
+  lastUsed: () => voice.lastUsed,
+  onCommit: (selection, revision) => {
+    // 合成中 / 再生中の turn は cancel しない。切替は次の turn から(AC-6)。
+    // 旧い声で焼いた相槌プールだけをここで失効させる(新プールが出来るまで相槌は text-only)
+    if (chloePid) {
+      speech.invalidatePool(chloePid);
+      const resolved = registry.get(chloePid)?.voice.resolvedSpeaker;
+      if (engineState === 'ready' && typeof resolved === 'number') speech.buildAckPool(chloePid, resolved);
+    }
+    store.append({
+      type: 'system', from: 'room',
+      text: `声を「${selection?.title ?? '既定'}」にしたよ。次の返事から切り替わるね`,
+    });
+    metric('voice_selected', { revision, provider: selection?.provider ?? 'default' });
+  },
+});
+
+// PBI-029: 実況(作業係)の声。**同じ部品をもう 1 つ**置くだけ(選択の保存先だけが違う)。
+// 試聴はこちらに来ない —— 課金の門(10 分 10 回)を 2 つに増やさないため、preview は常に上の本体が捌く。
+const narratorSwitch = createVoiceSwitch({
+  fish: { apiKey: config.tts.fish.apiKey, base: config.tts.fish.base },
+  previewFish: (referenceId, text) => voice.previewFish(referenceId, text),
+  localSynth: (text, speakerId) => voice.previewLocal(text, speakerId),
+  localSpeakers,
+  cloudCooldown: () => Date.now() < voice.diag.cooldownUntil,
+  conversationBusy,
+  lastUsed: () => voice.lastUsed,
+  stateDir: pathMod.join(homedir(), '.talkingclaw', 'voice-narrator'),
+  onCommit: (selection, revision) => {
+    if (narratorPid) {
+      speech.invalidatePool(narratorPid);
+      const resolved = registry.get(narratorPid)?.voice.resolvedSpeaker;
+      if (engineState === 'ready' && typeof resolved === 'number') speech.buildAckPool(narratorPid, resolved);
+    }
+    store.append({
+      type: 'system', from: 'room',
+      text: `実況の声を「${selection?.title ?? '既定'}」にしたよ。次の報告から切り替わるね`,
+    });
+    metric('voice_selected', { revision, provider: selection?.provider ?? 'default', role: 'narrator' });
+  },
 });
 
 // user_speech が EventStore に入るたび channel revision を進める。全入口をここで捕まえるため、
@@ -293,6 +406,13 @@ store.onAppend((ev) => {
   const ch = ev.channel ?? 'work';
   if (ev.type === 'user_speech') transcriptAppend(ch, 'あなた', ev.text ?? '');
   else if (ev.type === 'agent_speech' && !ev.filler && ev.text) transcriptAppend(ch, ev.name ?? ev.from, ev.text);
+  // PBI-021: 話すたびに相棒の 9 軸が育つ。相槌(filler)は観測しない(内容が無い)。
+  // observeTurn は例外を外に出さない — 人格の計算で会話を止めない
+  if (ev.text && (ev.type === 'user_speech' || (ev.type === 'agent_speech' && !ev.filler))) {
+    observeTurn({ speaker: ev.type === 'user_speech' ? 'user' : 'agent', text: ev.text, at: ev.at, sessionId: ev.turnId });
+    // PBI-024: 覚える価値のある語の候補を溜める(**勝手に覚えない**。聞いてから)
+    if (ev.type === 'user_speech') observeText(ev.text, dictionaryWords());
+  }
   if (ev.type === 'agent_speech' && !ev.filler && ev.audio === null && ev.from !== 'room') turn.advanceFloor(ev.from); // S4
   if (!ev.targets && !ev.broadcast) return;
   for (const [pid, waiter] of waiters) {
@@ -376,6 +496,13 @@ function parseReport(raw: string, task: OfficeTask): TaskReport {
 
 // ---- W11-2: 認識テキストの補正辞書(誤変換をここで直してから部屋に流す)----
 const DICT_PATH = join(homedir(), '.talkingclaw', 'dictionary.json');
+// PBI-024: 聞き間違い辞書の語は「既に知っている語」として扱う(二重に聞かない)
+function dictionaryWords(): string[] {
+  try {
+    const d = JSON.parse(readFileSync(DICT_PATH, 'utf8')) as Record<string, string>;
+    return Object.entries(d).flat().filter((x): x is string => typeof x === 'string');
+  } catch { return []; }
+}
 let dictCache: { at: number; map: Record<string, string> } = { at: 0, map: {} };
 function loadDict(): Record<string, string> {
   if (Date.now() - dictCache.at < 5_000) return dictCache.map;
@@ -461,34 +588,157 @@ function gameOpponents(): { id: string; name: string; style: number }[] {
 }
 
 /** ゲームの手なら、その場で判定して読み上げまでやる。ゲームでなければ null(いつもの会話へ) */
-function tryGame(text: string): number | null {
-  const session = gameSessions.get(activeChannel) ?? null;
+// ---- PBI-028: 手番の声かけ（実況とは別の「あなたに向けた一言」）----
+// **LLM を呼ばない**。台詞は casino.ts の固定表で、乱数ではなく回数で選ぶ(検査できる形)。
+// 話すのは「手番が false → true に変わった瞬間」だけ。同じ手番のまま盤面が何度更新されても黙る。
+const IDLE_TALK_MS = Number(process.env.TURN_IDLE_MS ?? 25_000);
+type TurnTalk = { onTurn: boolean; said: number; idle: ReturnType<typeof setTimeout> | null };
+const turnTalk = new Map<string, TurnTalk>();
+
+function sayAsChloe(text: string, channel: Channel): void {
+  if (!chloePid) return;
+  const name = registry.get(chloePid)?.assignedName ?? config.character.name;
+  speech.speakSentences(chloePid, name, text, turn.nextTurnId('T'), channel);
+}
+
+/** 盤面が動いた後に呼ぶ。手番になった瞬間だけ声をかけ、黙っていたら様子を伺う */
+function turnTalkTick(channel: Channel): void {
+  const st = turnTalk.get(channel) ?? { onTurn: false, said: 0, idle: null };
+  const session = gameSessions.get(channel) ?? null;
+  const view = casino.view(session);
+  const now = session !== null && view.yourTurn;
+  if (st.idle) { clearTimeout(st.idle); st.idle = null; }   // 盤面が動いた = 待たせていない
+  if (now && !st.onTurn) {
+    // 会話が最優先。ユーザーが話している最中には割り込まない(CLAUDE.md §2 / AC-7)
+    // PBI-039: 言い回しは 9 軸で選ぶ（推論ゼロ）
+    let tone = 0;
+    try { tone = attitudeTone(currentPersona().values); } catch { /* 素のままで話す */ }
+    const line = mic.active ? null : casino.turnLine(view.kind, st.said, tone);
+    if (line) { sayAsChloe(line, channel); st.said += 1; }
+    const timer = setTimeout(() => {
+      const cur = turnTalk.get(channel);
+      if (!cur?.onTurn || mic.active) return;               // もう手番じゃない / 話している最中
+      if (!casino.view(gameSessions.get(channel) ?? null).yourTurn) return;
+      let tone2 = 0;
+      try { tone2 = attitudeTone(currentPersona().values); } catch { /* 素のまま */ }
+      sayAsChloe(casino.idleLine(cur.said, tone2), channel);
+      cur.idle = null;
+    }, IDLE_TALK_MS);
+    timer.unref?.();
+    st.idle = timer;
+  }
+  st.onTurn = now;
+  turnTalk.set(channel, st);
+}
+
+// PBI-043: **AI が考える間合い**。人が打った後、他家は 1 手ずつこの間隔で打つ。
+// 一瞬で 3 人ぶん流れると「シミュレーションを見ている」感じになり、卓に着いている感じが消える
+const THINK_MS = Number(process.env.TABLE_THINK_MS ?? 5000);
+const thinkTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** 次の 1 手を間合いを置いて進める。人の番になったら止まる */
+function scheduleThink(channel: Channel): void {
+  const prev = thinkTimers.get(channel);
+  if (prev) clearTimeout(prev);
+  const session = gameSessions.get(channel) ?? null;
+  if (!session || casino.humanTurnPending(session)) { armTableIdle(channel); return; }
+  const timer = setTimeout(() => {
+    thinkTimers.delete(channel);
+    const cur = gameSessions.get(channel) ?? null;
+    if (!cur) return;
+    const reply = casino.stepOnce(cur);
+    if (reply) {
+      if (reply.session) gameSessions.set(channel, reply.session); else gameSessions.delete(channel);
+      saveGames();
+      const name = registry.get(chloePid ?? '')?.assignedName ?? config.character.name;
+      for (const line of reply.say) speech.speakSentences(chloePid ?? 'room', name, line, turn.nextTurnId('S'), channel);
+    }
+    scheduleThink(channel);   // 次の人も AI ならまた間合いを置く
+  }, THINK_MS);
+  timer.unref?.();
+  thinkTimers.set(channel, timer);
+}
+
+// PBI-038: 手番のまま止まっている人の代わりに 1 手打つまでの時間。
+// **他人を待たせない**ための仕掛けなので、1 人の卓では発火しない（考える時間は奪わない）
+const TABLE_IDLE_MS = Number(process.env.TABLE_IDLE_MS ?? 60_000);
+const tableIdle = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** 手番の人が止まったら面子が代打ちする。**打つたびに張り直す**（打てば消える） */
+function armTableIdle(channel: Channel): void {
+  const prev = tableIdle.get(channel);
+  if (prev) clearTimeout(prev);
+  const session = gameSessions.get(channel) ?? null;
+  if (!session) return;
+  const humans = casino.humanIds(session);
+  if (humans.size < 2) return;                     // 1 人なら誰も待っていない(AC-3)
+  const view = casino.view(session);
+  if (!view.yourTurn && view.kind !== 'mahjong') return;
+  const timer = setTimeout(() => {
+    const cur = gameSessions.get(channel) ?? null;
+    if (!cur) return;
+    // 誰の番で止まっているか（人間の席だけ見る）
+    for (const id of casino.humanIds(cur)) {
+      const reply = casino.autoPlay(cur, id);
+      if (!reply) continue;
+      if (reply.session) gameSessions.set(channel, reply.session); else gameSessions.delete(channel);
+      saveGames();
+      const name = registry.get(chloePid ?? '')?.assignedName ?? config.character.name;
+      for (const line of reply.say) speech.speakSentences(chloePid ?? 'room', name, line, turn.nextTurnId('A'), channel);
+      armTableIdle(channel);                       // 次の人の番でまた見る
+      return;
+    }
+  }, TABLE_IDLE_MS);
+  timer.unref?.();
+  tableIdle.set(channel, timer);
+}
+
+/** PBI-037: その部屋に居る**人間**（ホスト + 生きているゲスト）。卓の席はこの順に埋まる */
+function humansIn(channel: Channel): { id: string; name: string }[] {
+  const now = Date.now();
+  const guests = guestFile.guests
+    .filter((g) => !g.revoked && Date.parse(g.expiresAt) > now && g.channel === channel)
+    .map((g) => ({ id: g.id, name: g.name }));
+  return [{ id: 'you', name: 'あなた' }, ...guests].slice(0, 4);
+}
+
+function tryGame(text: string, opts: { actor?: string; channel?: Channel } = {}): number | null {
+  const channel = opts.channel ?? activeChannel;
+  const actor = opts.actor ?? 'you';
+  const session = gameSessions.get(channel) ?? null;
   const cmd = casino.parseCommand(text, session);
   if (!cmd) return null;
   if (!session && cmd.type !== 'start') return null;
   if (!chloePid) return null; // 進行役がいない部屋では遊べない
 
   const reply = cmd.type === 'start'
-    ? casino.start(cmd.game, (Date.now() ^ (store.lastId * 2654435761)) | 0, gameOpponents(), cmd.blind)
-    : casino.apply(session!, cmd);
+    ? casino.start(cmd.game, (Date.now() ^ (store.lastId * 2654435761)) | 0, gameOpponents(), cmd.blind, humansIn(channel))
+    // PBI-043: 人の手だけ適用する。他家は下の scheduleThink が 1 手ずつ進める
+    : casino.apply(session!, cmd, actor, { stepwise: true });
 
   // 発話は残す(会話の記録として)。targets を空にしてあるので Brain は起こさない
   const turnId = turn.nextTurnId("G");
   const ev = store.append({
     type: 'user_speech', from: 'user', text, turnId, targets: [],
-    routing: { method: 'default' }, channel: activeChannel,
+    routing: { method: 'default' }, channel: channel,
   });
-  if (reply.session) gameSessions.set(activeChannel, reply.session);
-  else gameSessions.delete(activeChannel);
+  if (reply.session) gameSessions.set(channel, reply.session);
+  else {
+    gameSessions.delete(channel);
+    const t = thinkTimers.get(channel);
+    if (t) { clearTimeout(t); thinkTimers.delete(channel); }   // やめたら間合いも止める(AC-7)
+  }
   saveGames();
-  if (reply.hand) store.append({ type: 'system', from: 'room', text: reply.hand, channel: activeChannel });
+  if (reply.hand) store.append({ type: 'system', from: 'room', text: reply.hand, channel: channel });
   // あなただけに見せる情報は system として画面に出すだけ。読み上げないし記録にも残さない
   // (進行役の発言として残すと、同じ卓にいる相手の文脈に手牌が戻ってしまう)
   for (const line of reply.show ?? []) {
-    store.append({ type: 'system', from: 'room', text: line, channel: activeChannel });
+    store.append({ type: 'system', from: 'room', text: line, channel: channel });
   }
   const name = registry.get(chloePid)?.assignedName ?? config.character.name;
-  for (const line of reply.say) speech.speakSentences(chloePid, name, line, turnId, activeChannel);
+  for (const line of reply.say) speech.speakSentences(chloePid, name, line, turnId, channel);
+  turnTalkTick(channel);   // PBI-028: 手番が回ってきたら一言(実況の後)
+  scheduleThink(channel);  // PBI-043: 他家は 5 秒くらい考えてから 1 手ずつ打つ(中で armTableIdle も呼ぶ)
   return ev.id;
 }
 
@@ -543,35 +793,41 @@ function flushPending(): void {
   if (text.trim()) userSpeech(text.trim());
 }
 
-function userSpeech(rawText: string): RoomEvent {
+function userSpeech(rawText: string, viaMemo?: { turnId: string }): RoomEvent {
+  // PBI-003: 伝言(viaMemo)は channel=work 固定で、routing・permission・consult・turn tracking は
+  // 部屋の発話と同じ経路を通す(AC-7)。部屋のマイク・添付・turn_created 計上だけが部屋起点限定。
+  const channel: Channel = viaMemo ? 'work' : activeChannel;
   const text = applyDict(rawText);
-  mic.clear(); // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
-  // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う
+  if (!viaMemo) mic.clear(); // 発話がここまで届いた = この turn の「発話中」は終了(client 側 false 通知の到着順に依存しない)
+  // W8-8: 許可待ち中の短い諾否はパーミッションへの返答として扱う(伝言からも答えられる)
   if (pendingPermission) {
     const t = text.trim();
     if (PERM_YES.test(t)) {
-      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
+      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel });
       finishPermission(true, 'おっけー、許可したよ。続けるね。');
       return ev;
     }
     if (PERM_NO.test(t)) {
-      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
+      const ev = store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel });
       finishPermission(false, 'わかった、それはやめておくね。');
       return ev;
     }
   }
   if (process.env.ROOM_TEST_HOOKS === '1' && text === '__askperm__') {
     void askUserPermission('テスト機能').then((ok) => store.append({ type: 'system', from: 'room', text: `perm:${ok}` }));
-    return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel: activeChannel });
+    return store.append({ type: 'user_speech', from: 'user', text, targets: [], routing: { method: 'default' }, channel });
   }
   const { targets, routing } = turn.route(text);
-  const turnId = turn.nextTurnId("T");
-  beginTurnMetrics(turnId, 'room');
-  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel: activeChannel, files: pendingFiles.length > 0 ? pendingFiles : undefined });
-  pendingFiles = [];
-  metric('turn_created', { turnId, path: 'room', method: routing?.method, targets: targets.length });
+  const turnId = viaMemo?.turnId ?? turn.nextTurnId("T");
+  beginTurnMetrics(turnId, viaMemo ? 'memo' : 'room');
+  const ev = store.append({ type: 'user_speech', from: 'user', text, turnId, targets, routing, channel, files: !viaMemo && pendingFiles.length > 0 ? pendingFiles : undefined });
+  if (!viaMemo) {
+    pendingFiles = [];
+    // 伝言の turn_created は memo.ts(recordMetric)が確定行の後に 1 回だけ出す — ここでも出すと二重計上
+    metric('turn_created', { turnId, path: 'room', method: routing?.method, targets: targets.length });
+  }
   if (targets.length === 1) {
-    turn.track(turnId, targets[0], text, activeChannel);
+    turn.track(turnId, targets[0], text, channel);
     speech.fireAck(targets[0], turnId, text); // S6: t=0 相槌(単独 target のみ)
     turn.scheduleEscalation(turnId, targets[0], 1, 3_500); // /played で前倒し、無ければ fallback
     turn.scheduleUndeliveredNotice(turnId, targets[0]);
@@ -606,6 +862,110 @@ function finishPermission(ok: boolean, say: string): void {
 
 const PERM_YES = /^(はい|うん|いいよ|いいですよ|おっけ|オッケー|ok|オーケー|許可|どうぞ|やって|承認)/i;
 const PERM_NO = /^(だめ|ダメ|駄目|やめて|いや|嫌|不許可|禁止|no|ノー|見送)/i;
+
+// ---- PBI-003: 伝言(memo)の submit adapter・永続 dedupe 台帳・read 契約 ----
+// 台帳は crash を跨ぐ(AC-10): 副作用(user_speech/Brain/task)より先に追記し、
+// 再送は同じ turnId を返すだけで新しい実行を始めない。memo-log(memo.ts 側)が
+// 確定行を書く前に落ちても、ここが同一応答を保証する。
+const MEMO_LEDGER_PATH = join(homedir(), '.talkingclaw', 'memo-submit-ledger.jsonl');
+const memoLedger = new Map<string, { turnId: string; text: string }>();
+const memoTurnCid = new Map<string, string>(); // turnId → clientMessageId(reply/report の相関)
+const convCtx = new Map<Channel, { turnId?: string }>(); // 会話 Brain が今どの turn を処理中か(delegate の相関源)
+try {
+  for (const line of readFileSync(MEMO_LEDGER_PATH, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const r = JSON.parse(line) as { clientMessageId?: string; turnId?: string; text?: string };
+      if (!r.clientMessageId || !r.turnId) continue;
+      memoLedger.set(r.clientMessageId, { turnId: r.turnId, text: r.text ?? '' });
+      memoTurnCid.set(r.turnId, r.clientMessageId);
+    } catch { /* 壊れた行は飛ばす(残りは生かす) */ }
+  }
+} catch { /* 台帳無し = 初回 */ }
+
+async function memoSubmit({ text, clientMessageId }: { text: string; clientMessageId: string }): Promise<{ turnId: string; dedup: boolean }> {
+  const hit = memoLedger.get(clientMessageId);
+  if (hit) {
+    // crash 後の再送(memo 確定行が無い形)もここで受け、副作用ゼロで同じ turn を返す(AC-10)。
+    // dedup=true = この呼び出しは user_speech / Brain / OfficeTask を作っていない(裁定 17:08)
+    if (hit.text !== text) throw Object.assign(new Error('同じ clientMessageId が別の内容で使われています'), { status: 409 });
+    return { turnId: hit.turnId, dedup: true };
+  }
+  // turnId は永続台帳に残るので、プロセス毎カウンタの nextTurnId だけだと再起動を跨いで衝突する
+  // (実測: 2 プロセスとも T1 を発行し相関 map が上書きされた)。bootId を含めて一意化する
+  const turnId = `${turn.nextTurnId('M')}-${store.bootId.slice(0, 8)}`;
+  mkdirSync(join(homedir(), '.talkingclaw'), { recursive: true, mode: 0o700 });
+  appendFileSync(MEMO_LEDGER_PATH, JSON.stringify({ at: new Date().toISOString(), clientMessageId, turnId, text }) + '\n', { mode: 0o600 });
+  memoLedger.set(clientMessageId, { turnId, text });
+  memoTurnCid.set(turnId, clientMessageId);
+  userSpeech(text, { turnId }); // 既存 routing・permission・consult・turn tracking を通す(channel=work 固定)
+  if (process.env.ROOM_TEST_HOOKS === '1' && text.includes('__memocrash__')) {
+    // AC-10 の crash point 注入: user_speech と task は作成済み・memo 確定行と HTTP ack の前で落ちる
+    officeTasks.push({
+      id: ++taskSeq, agent: 'test', agentName: 'テスト', request: text, status: 'queued',
+      notes: [], artifacts: [], at: new Date().toISOString(), channel: 'work',
+      sourceTurnId: turnId, clientMessageId,
+    });
+    saveTasks();
+    process.exit(21);
+  }
+  return { turnId, dedup: false }; // この呼び出しが user_speech / turn を新しく作った
+}
+
+// read 契約: work channel の reply(本応答)・note(実況)・report(作業報告)を
+// MemoEntry の形に正規化して memo handler へ流す。report には相関 id を載せる(AC-9 の土台)
+type MemoRead = { kind: 'reply' | 'note' | 'report'; text: string; name?: string; turnId?: string; sourceTurnId?: string; clientMessageId?: string };
+const taskReportListeners: ((task: OfficeTask) => void)[] = [];
+function memoReadSubscribe(cb: (e: MemoRead) => void): () => void {
+  const offEvents = store.onAppend((ev) => {
+    if (ev.type !== 'agent_speech' || ev.filler || ev.from === 'room') return;
+    if ((ev.channel ?? 'work') !== 'work') return;
+    const text = ev.text ?? '';
+    if (!text.trim()) return;
+    if (!ev.turnId || ev.turnId === 'none') cb({ kind: 'note', text, name: ev.name });
+    else cb({ kind: 'reply', text, name: ev.name, turnId: ev.turnId, clientMessageId: memoTurnCid.get(ev.turnId) });
+  });
+  const onReport = (task: OfficeTask): void => {
+    if (!task.report) return;
+    const lines = [task.report.headline, ...task.report.can];
+    if (task.report.check.length > 0) lines.push(`確かめかた: ${task.report.check.join(' / ')}`);
+    cb({ kind: 'report', text: lines.join('\n'), name: task.agentName, sourceTurnId: task.sourceTurnId, clientMessageId: task.clientMessageId });
+  };
+  taskReportListeners.push(onReport);
+  return () => {
+    offEvents();
+    const i = taskReportListeners.indexOf(onReport);
+    if (i >= 0) taskReportListeners.splice(i, 1);
+  };
+}
+
+// AC-3: memo path 限定の origin 規則。MEMO_PUBLIC_ORIGIN=https://<host> の exact Host/Origin だけを
+// 追加許可する。部屋 UI(originOk)の規則はここでは一切緩めない。
+const memoPublicOrigin = ((): URL | null => {
+  const raw = process.env.MEMO_PUBLIC_ORIGIN;
+  if (!raw) return null;
+  try { return new URL(raw); } catch { console.error(`MEMO_PUBLIC_ORIGIN が URL として不正: ${raw}`); return null; }
+})();
+function memoOriginOk(req: IncomingMessage): boolean {
+  if (originOk(req)) return true; // localhost は従来どおり(隔離検証・局所利用)
+  if (!memoPublicOrigin) return false;
+  const host = req.headers.host;
+  if (!host || host.replace(/:\d+$/, '') !== memoPublicOrigin.hostname) return false;
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== memoPublicOrigin.origin) return false;
+  return true;
+}
+
+const memoHandler = createMemoHandler({
+  submit: memoSubmit,
+  read: { subscribe: memoReadSubscribe },
+  recordMetric: ({ kind, ...rest }) => metric(kind, rest),
+  identity: (req) => {
+    // 認証境界は Tunnel + hostname 全体の Access。このヘッダは表示用で、単独の認証根拠にしない
+    const v = req.headers['cf-access-authenticated-user-email'];
+    return typeof v === 'string' && v !== '' ? v : null;
+  },
+});
 
 function describeTool(name: string, input: Record<string, unknown>): string {
   if (name === 'Bash') return `コマンド実行(${String(input.command ?? '').slice(0, 50)})`;
@@ -673,6 +1033,13 @@ function appendMemory(note: string): void {
 
 // ---- W8-8: projects レジストリ(worker の作業先。talkingclaw 自身も登録)----
 const PROJECTS_PATH = join(homedir(), '.talkingclaw', 'projects.json');
+// PBI-011: temp→rename の原子的書込み。外部の読み手(worker 起動時の loadProjects)は
+// 旧か新の完全な版だけを見る — 書きかけの半端な JSON を読ませない
+function saveProjects(next: Record<string, string>): void {
+  const tmp = PROJECTS_PATH + '.tmp';
+  writeFileSync(tmp, JSON.stringify(next, null, 1), { mode: 0o600 });
+  renameSync(tmp, PROJECTS_PATH);
+}
 function loadProjects(): Record<string, string> {
   let user: Record<string, string> = {};
   try { user = JSON.parse(readFileSync(PROJECTS_PATH, 'utf8')); } catch { /* 初回 */ }
@@ -681,8 +1048,136 @@ function loadProjects(): Record<string, string> {
     talkingclaw: fileURLToPath(new URL('..', import.meta.url)),
     ...user,
   };
-  try { writeFileSync(PROJECTS_PATH, JSON.stringify(merged, null, 1), { mode: 0o600 }); } catch { /* */ }
+  try { saveProjects(merged); } catch { /* 書けなくても merged で動ける */ }
   return merged;
+}
+
+// ---- PBI-012: GitHub URL から clone して作業先に登録する ----
+// 認証は gh に丸投げ(keyring に入っている資格情報がそのまま効くので private repo も届く)。
+// 受けるのは https の URL だけ(SSH はスコープ外)。置き場は workspace 直下に固定
+const GH_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/;
+// 登録名に使える形。clone した repo 名をそのまま名前にするので、GitHub の repo 名(`.` を含む・
+// 長め)がそのまま通る幅に合わせてある。先頭は英数字に限る(`.`/`-` 始まりの紛らわしい名前を作らない)
+const PROJECT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,39}$/;
+// gh の在り処を PATH だけに頼らない —— 部屋は LaunchDaemon の薄い PATH から起動されることがあり、
+// Apple Silicon の brew は /opt/homebrew に入る(herdr.ts の BIN_CANDIDATES と同じ手当て)
+const GH_CANDIDATES = process.env.GH_BIN ? [process.env.GH_BIN] : ['gh', '/opt/homebrew/bin/gh', '/usr/local/bin/gh'];
+// 結果は覚えない —— 後から brew install した gh をすぐ拾えるし、探すのは設定パネルを開いた時と
+// clone の直前だけ。在れば 1 つ目の候補で即決まる
+async function ghPath(): Promise<string | null> {
+  for (const bin of GH_CANDIDATES) {
+    try { await execFileAsync(bin, ['--version'], { timeout: 5_000 }); return bin; } catch { /* 次の候補 */ }
+  }
+  return null;
+}
+// 認証済みかは `auth token`(ローカルの保管を読むだけ)で見る。`auth status` は API を叩くので
+// パネルを開くたびに待たされる
+async function ghAuthed(bin: string): Promise<boolean> {
+  try { await execFileAsync(bin, ['auth', 'token'], { timeout: 5_000 }); return true; } catch { return false; }
+}
+const CLONE_TIMEOUT_MS = Number(process.env.CLAW_CLONE_TIMEOUT_MS ?? 15 * 60_000);
+const REPO_LIST_LIMIT = 200; // ここで打ち止めたことは画面にも出す(黙って切らない)
+const BROWSE_LIMIT = Number(process.env.CLAW_BROWSE_LIMIT ?? 500); // 1 フォルダに出す上限(同上)
+// PBI-017: 落とされたフォルダの受け入れ。上限は「送り始める前に断る」ために使う
+const INTAKE_MAX_FILES = Number(process.env.CLAW_INTAKE_MAX_FILES ?? 2000);
+const INTAKE_MAX_BYTES = Number(process.env.CLAW_INTAKE_MAX_BYTES ?? 200 * 1024 * 1024);
+const intakes = new Map<string, { dir: string; files: number; bytes: number; wrote: number; bytesWrote: number; at: number }>();
+const cloning = new Set<string>(); // 進行中の clone 先(別タブ・リロードでは画面の disabled が共有されない)
+// timeout で gh を殺すだけでは足りない —— 実際に落としているのは孫の git。プロセスグループごと畳まないと
+// 「打ち切った」と言った後も裏で clone が続き、出来上がったフォルダが次回の「もう在るよ」を永久に踏む
+// PBI-016: 画面から GitHub にログインする。gh の web フロー(device code)を部屋が起こして、
+// 出てくる 8 桁コードを画面に渡すだけ —— トークンは gh が keyring に入れる。部屋は持たない
+type GhAuth = { child: ChildProcess; code: string; url: string; out: string; done: null | { ok: boolean; why: string }; at: number };
+let ghAuth: GhAuth | null = null;
+function ghAuthStart(bin: string): Promise<GhAuth> {
+  const child = spawn(bin, ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--skip-ssh-key', '--web'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GH_BROWSER: 'true' }, // 部屋の側でブラウザを開かない(開くのはユーザーの画面)
+  });
+  const state: GhAuth = { child, code: '', url: 'https://github.com/login/device', out: '', done: null, at: Date.now() };
+  const read = (d: Buffer): void => {
+    state.out += d.toString();
+    const m = /one-time code:\s*([A-Z0-9-]{4,20})/i.exec(state.out);
+    if (m) state.code = m[1];
+  };
+  child.stdout.on('data', read);
+  child.stderr.on('data', read);
+  child.once('close', (codeNum) => {
+    state.done = codeNum === 0 ? { ok: true, why: '' } : { ok: false, why: state.out.trim().slice(-400) || `gh が ${codeNum} で終わった` };
+  });
+  child.once('error', (e) => { state.done = { ok: false, why: e.message }; });
+  ghAuth = state;
+  // コードが出るまで待つ(実測 1 秒未満。出ないまま終わるなら、その理由を返す)
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = setInterval(() => {
+      if (state.code || state.done || Date.now() - t0 > 10_000) { clearInterval(tick); resolve(state); }
+    }, 100);
+  });
+}
+// (execFile ではなく spawn を使うのは detached を渡すため —— execFile の型は通してくれない)
+function ghClone(bin: string, repo: string, dir: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, ['repo', 'clone', repo, dir], { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = ''; // gh の言い分はここに出る(そのまま画面に返す)
+    child.stderr.on('data', (d: Buffer) => { if (stderr.length < 8192) stderr += d.toString(); });
+    const timer = setTimeout(() => {
+      // pid が無い時に process.kill(-0) を撃つと自分のグループを殺す(自傷)。必ず pid を確かめてから
+      if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); } } else child.kill('SIGKILL');
+      reject(Object.assign(new Error('clone が長すぎた'), { killed: true }));
+    }, CLONE_TIMEOUT_MS);
+    child.once('error', (e) => { clearTimeout(timer); reject(e); }); // gh を起動できなかった
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(Object.assign(new Error(`gh が ${code} で終わった`), { stderr }));
+    });
+  });
+}
+
+// ---- PBI-014: herdr 連携(端末の艦隊を声から見る・立てる・指示を渡す)----
+// fleetView は「最後に見た艦隊」。ツールでも画面のボタンでも更新され、作業ボードの表として出る
+const fleet = new HerdrBridge();
+let fleetView: FleetView | null = null;
+// 艦隊操作の入口は 1 つ(ツール・画面のボタンが同じここを通る)。声で読み上げる文もここで決める
+async function fleetAct(a: { action: string; target?: string; text?: string; name?: string; workspace?: string; project?: string; lines?: number }): Promise<{ say: string; error?: string }> {
+  if (a.action === 'list') {
+    const v = await fleet.list();
+    fleetView = v;
+    if (v.error) return { say: `herdr を見られなかった: ${v.error}`, error: v.error };
+    if (v.agents.length === 0) return { say: 'herdr に agent は 1 人も居ない。そう伝えて。' };
+    const lines = v.agents.map((x) => `${x.name ?? x.pane}(${x.pane} / ${x.status}${x.mine ? ' / 部屋が立てた子' : ''}) ${x.title.slice(0, 40)}`);
+    const working = v.agents.filter((x) => x.status === 'working').length;
+    return { say: `画面に一覧を出した。全部で ${v.agents.length} 人、動いているのは ${working} 人。数は盛らず、このとおりに短く伝えて。\n${lines.join('\n')}` };
+  }
+  if (a.action === 'start') {
+    const cwd = a.project ? loadProjects()[a.project] : undefined;
+    if (a.project && !cwd) return { say: `${a.project} という作業先は登録されていない。そう伝えて。`, error: 'unknown project' };
+    const r = await fleet.start({ name: a.name ?? a.target ?? '', workspace: a.workspace, cwd });
+    if ('error' in r) return { say: `立てられなかった: ${r.error}`, error: r.error };
+    fleetView = await fleet.list();
+    // 初めての場所で起動した claude は「このフォルダを信頼するか」で止まる(blocked)ことがある。
+    // 黙って待たせずに、見に行く必要があるかもしれないと最初に言っておく
+    return { say: `${a.name ?? a.target} を ${r.pane} に立てた。画面は切り替えていない。初めての場所だと最初の確認で止まることがあるので、herdr の画面を見てあげてと伝えて。` };
+  }
+  if (a.action === 'prompt') {
+    if (!a.target || !a.text) return { say: '誰に何を渡すかが足りない。聞き直して。', error: 'missing target/text' };
+    const r = await fleet.prompt(a.target, a.text);
+    if ('error' in r) return { say: `渡せなかった: ${r.error}`, error: r.error };
+    fleetView = await fleet.list();
+    // 送れたこと自体は失敗ではないので error にはしない。ただし裏取りできていない時は
+    // 「渡した」と言わせない —— 文面で正直に分ける(AC-3)
+    return r.confirmed
+      ? { say: `${a.target} に渡した(今 ${r.status})。短く「渡したよ」と伝えて。` }
+      : { say: `${a.target} に送ったけれど、画面に反映されたか確認できなかった。「届いたか分からない」と正直に伝えて。` };
+  }
+  if (a.action === 'read') {
+    if (!a.target) return { say: '誰の様子を読むかが足りない。聞き直して。', error: 'missing target' };
+    const r = await fleet.read(a.target, a.lines ?? 60);
+    if ('error' in r) return { say: `読めなかった: ${r.error}`, error: r.error };
+    return { say: `${a.target}(${r.pane})の画面。ここから要点だけ 1〜2 文で伝えて。\n${r.text.slice(-1500)}` };
+  }
+  return { say: 'その操作は知らない。', error: 'unknown action' };
 }
 
 // ---- W8-7: worker 設定(モデル / effort / skills / 外部 MCP)。次の task から反映 ----
@@ -731,6 +1226,8 @@ type OfficeTask = {
   unread?: boolean;
   replies?: { at: string; text: string }[]; // このスレッドへの追加依頼
   channel?: Channel;                        // どの部屋で頼まれたか(報告から戻れるように)
+  sourceTurnId?: string;                    // PBI-003: どの伝言(turn)から生まれた作業か
+  clientMessageId?: string;                 // PBI-003: 伝言の相関 id(root=X 系列)
 };
 type TaskReport = {
   headline: string;      // 結果を 1 行
@@ -758,7 +1255,7 @@ store.onAppend((ev) => {
 // ---- 相談モード: 依頼が来てもいきなり着手せず、まず進め方を相談して合意してから登録する ----
 // 案は部屋に 1 つだけ(作業係が 1 人なので、同時に複数の相談を走らせない)。
 // 合意の入口は 2 つ: クロエの confirm_plan ツールと、画面/音声からの POST /plan {action:'confirm'}。
-type Plan = { summary: string; steps: string[]; project?: string; at: string };
+type Plan = { summary: string; steps: string[]; accept?: string[]; project?: string; at: string };
 // ponytail: 相談中の案は in-memory(daemon 再起動で消える)。まとまった案はタスク台帳に残るので、
 // 永続化は「相談の途中で落ちるのが実際に困る」と分かってからでいい
 let plan: Plan | null = null;
@@ -767,14 +1264,33 @@ let planDelegate: ((description: string, project?: string) => OfficeTask) | null
 function planText(p: Plan): string {
   return p.summary + (p.steps.length > 0 ? '\n進め方:\n' + p.steps.map((s, i) => `${i + 1}. ${s}`).join('\n') : '');
 }
-function confirmPlan(): { ok: true; taskId: number; summary: string } | { ok: false; error: string } {
+
+// PBI-013: 案 → PBI。作れたら相対 path、作らなかったら理由。どちらの道でも声と画面に同じ文が出る(AC-3)。
+// 採番と雛形は src/planpbi.ts(検査から直接当てるため部屋の外に出してある)
+function planPbi(p: Plan): { pbi: string; note: string } {
+  const name = p.project ?? 'workspace';
+  const root = loadProjects()[name];
+  if (!root) return { pbi: '', note: `作業先 ${name} が見つからないから PBI は作らなかったよ` };
+  try {
+    const file = writePbi(join(root, 'backlog'), p, new Date().toISOString().slice(0, 10));
+    // 勝手に backlog/ を作らない。作らなかったことは黙らず言う(AC-3)
+    if (!file) return { pbi: '', note: `${name} には backlog フォルダが無いから PBI は作らなかったよ` };
+    return { pbi: `backlog/${file}`, note: `${name} の backlog/${file} に受入基準を残したよ` };
+  } catch (e) {
+    return { pbi: '', note: `PBI を書けなかった: ${(e as Error).message}` };
+  }
+}
+
+function confirmPlan(): { ok: true; taskId: number; summary: string; pbi: string; note: string } | { ok: false; error: string } {
   if (!plan) return { ok: false, error: 'まだ相談中の案がないよ' };
   if (!planDelegate) return { ok: false, error: '作業係の準備がまだできていないよ' };
   const p = plan;
   plan = null; // 先に空にする(二重登録防止)
-  const task = planDelegate(planText(p), p.project);
-  store.append({ type: 'system', from: 'room', text: `相談まとまり → 作業に登録したよ: ${p.summary.slice(0, 60)}`, channel: 'work' });
-  return { ok: true, taskId: task.id, summary: p.summary };
+  // PBI を先に作る —— 作業係の依頼文に「受入基準はここ」を入れてから渡すため
+  const { pbi, note } = planPbi(p);
+  const task = planDelegate(planText(p) + (pbi ? `\n受入基準(G1): ${pbi} —— 着手前に読み、埋まっていない欄を確定させること。` : ''), p.project);
+  store.append({ type: 'system', from: 'room', text: `相談まとまり → 作業に登録したよ: ${p.summary.slice(0, 60)}(${note})`, channel: 'work' });
+  return { ok: true, taskId: task.id, summary: p.summary, pbi, note };
 }
 
 // >>> collectArtifacts(pure に近い: test/check-artifacts.mjs から取り出して検査する)
@@ -839,6 +1355,7 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
 let chloePid: string | null = null;
+let narratorPid: string | null = null;   // PBI-029: 実況(作業係)。声はクロエと別に選べる
 let chloeResetWorker: (() => void) | null = null;
 let chloeResetChat: (() => void) | null = null;
 let chloeReply: ((task: OfficeTask, text: string) => void) | null = null;
@@ -872,6 +1389,7 @@ function startChloe(): void {
   const helperOutcome = registry.join(config.workerParticipant.name, config.workerParticipant.voice, store.lastId, store.bootId);
   const helper = 'error' in helperOutcome ? null : helperOutcome.participant;
   const helperPid = helper?.participantId ?? chloePid;
+  narratorPid = helper?.participantId ?? null;   // PBI-029: 実況役の声を別に選ぶための宛先
   if (helper) {
     const keepHelper = setInterval(() => { helper.lastSeen = Date.now(); }, 30_000);
     keepHelper.unref();
@@ -894,9 +1412,14 @@ function startChloe(): void {
   const taskQueue: OfficeTask[] = [];
 
   function delegate(description: string, project?: string): OfficeTask {
+    // PBI-003: 会話 Brain(work)の turn 処理中なら、その turn と相関させる。伝言起点なら
+    // clientMessageId も引き継ぎ、最終 TaskReport が root=X 系列でページに帰属できるようにする
+    const ctx = convCtx.get('work');
     const task: OfficeTask = {
       id: ++taskSeq, agent: chloePid!, agentName: chloe.assignedName, request: description, project,
-      status: 'queued', notes: [], artifacts: [], at: new Date().toISOString(), channel: activeChannel,
+      status: 'queued', notes: [], artifacts: [], at: new Date().toISOString(),
+      channel: ctx ? 'work' : activeChannel,
+      sourceTurnId: ctx?.turnId, clientMessageId: ctx?.turnId ? memoTurnCid.get(ctx.turnId) : undefined,
     };
     officeTasks.push(task);
     while (officeTasks.length > 50) officeTasks.shift();
@@ -1086,6 +1609,8 @@ function startChloe(): void {
       task.unread = true;
       saveTasks();
       notifyUnread();
+      // PBI-003: 伝言タイムラインへ最終報告を流す(相関 id 付き)。失敗しても作業は止めない
+      for (const l of taskReportListeners) { try { l(task); } catch { /* memo 側の都合で本流を止めない */ } }
       const firstCan = task.report.can[0] ? `${task.report.can[0]} ` : '';
       speech.enqueue({
         pid: helperPid!, priority: 2, kind: 'speech', turnId: 'none', revision: speech.revision('work'), channel: 'work',
@@ -1188,10 +1713,10 @@ function startChloe(): void {
       ),
       tool(
         'propose_plan',
-        '相談モードでの進め方の案。まだ着手はしない。summary は 1 行の要約、steps は具体的な手順 2〜5 個。出したらそのまま声で読み上げて「これでいい?」と確認すること。直しの要望が来たら、直した案でもう一度呼ぶ。',
-        { summary: z.string(), steps: z.array(z.string()).optional(), project: z.string().optional() },
-        async ({ summary, steps, project }) => {
-          plan = { summary, steps: (steps ?? []).slice(0, 8), project, at: new Date().toISOString() };
+        '相談モードでの進め方の案。まだ着手はしない。summary は 1 行の要約、steps は具体的な手順 2〜5 個。accept は「何ができていたら終わりか」をユーザー目線で 1〜5 個(ここが受入基準としてそのまま backlog に残るので、会話で決まった条件だけを書く。決まっていないなら空でいい)。出したらそのまま声で読み上げて「これでいい?」と確認すること。直しの要望が来たら、直した案でもう一度呼ぶ。',
+        { summary: z.string(), steps: z.array(z.string()).optional(), accept: z.array(z.string()).optional(), project: z.string().optional() },
+        async ({ summary, steps, accept, project }) => {
+          plan = { summary, steps: (steps ?? []).slice(0, 8), accept: (accept ?? []).slice(0, 5), project, at: new Date().toISOString() };
           store.append({ type: 'system', from: 'room', text: `相談中の案: ${summary.slice(0, 80)}`, channel: 'work' });
           return { content: [{ type: 'text', text: `案を画面に出した。この内容を声で短く伝えて「これで進めていい?」と聞くこと。まだ作業は始まっていない。\n${planText(plan)}` }] };
         },
@@ -1203,7 +1728,7 @@ function startChloe(): void {
         async () => {
           const r = confirmPlan();
           return { content: [{ type: 'text', text: r.ok
-            ? `task ${r.taskId} として登録した。ユーザーには短く「じゃあ始めるね」と伝えるだけでいい。`
+            ? `task ${r.taskId} として登録した。ユーザーには短く「じゃあ始めるね」と伝え、続けて「${r.note}」を一言で伝えること。`
             : `登録できなかった: ${r.error}。先に propose_plan で案を出すこと。` }] };
         },
       ),
@@ -1214,6 +1739,19 @@ function startChloe(): void {
         async ({ description, project }) => {
           const task = delegate(description, project);
           return { content: [{ type: 'text', text: `作業係に任せた(task ${task.id}${project ? ` / ${project}` : ''})。ユーザーには短く「やっとくね」と伝えるだけでいい。` }] };
+        },
+      ),
+      tool(
+        'herdr',
+        `端末の艦隊(herdr)を見る・立てる・指示を渡す・様子を読む。「herdr の様子見せて」= list、「claude をもう一人立てて」= start(name と workspace。workspace は w2 のような id)、「◯◯に△△やらせて」= prompt(target と text)、「◯◯どうなってる?」= read(target)。target は名前でもペイン id でもいい。指示を渡せるのは部屋が立てた子だけで、ユーザーが自分で開いたペインには送れない(読むのはできる)。start の作業先は project 名で指定する(${Object.keys(loadProjects()).join(' / ')})。`,
+        {
+          action: z.enum(['list', 'start', 'prompt', 'read']),
+          target: z.string().optional(), text: z.string().optional(), name: z.string().optional(),
+          workspace: z.string().optional(), project: z.string().optional(), lines: z.number().optional(),
+        },
+        async (a) => {
+          const r = await fleetAct(a);
+          return { content: [{ type: 'text' as const, text: r.say }] };
         },
       ),
     ],
@@ -1244,7 +1782,7 @@ function startChloe(): void {
         // 「推測で答えない」と指示しておきながら調べる手段が無いのが、精度の一番の天井だった
         ...config.convReadTools,
         ...(channel === 'work'
-          ? [...workTools, 'mcp__office__read_inbox', 'mcp__office__mark_read', 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']
+          ? [...workTools, 'mcp__office__read_inbox', 'mcp__office__mark_read', 'mcp__office__cancel_task', 'mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word', 'mcp__office__herdr']
           : ['mcp__office__remember', 'mcp__office__room_status', 'mcp__office__learn_word']),
       ],
       // W9-2: delegate + remember を挟むと 4 では error_max_turns になる
@@ -1301,6 +1839,14 @@ function startChloe(): void {
     const parts: string[] = [];
     const memo = readMemory();
     if (memo) parts.push(`(あなたが書き留めた大事なこと。必ず踏まえて)\n${memo}`);
+    // PBI-024: 覚えた固有名詞。聞き取りが崩れた時の解釈のよりどころにする
+    const vocabLine = promptLine(currentVocab());
+    if (vocabLine) parts.push(vocabLine);
+    // PBI-039: 育った 9 軸が態度に出る。初期状態（全軸 50）では**何も足さない**
+    try {
+      const attitude = attitudeLine(currentPersona().values);
+      if (attitude) parts.push(attitude);
+    } catch { /* 人格の計算で会話を止めない */ }
     const rows = transcriptTail(channel, 60);
     const latest = rows[rows.length - 1];
     if (latest?.who === 'あなた' && latest.text === currentText) rows.pop(); // 現在 prompt との二重投入を避ける
@@ -1309,6 +1855,20 @@ function startChloe(): void {
     const gameBrief = casino.brief(gameSessions.get(channel) ?? null);
     if (gameBrief) parts.push(gameBrief);
     return parts.length > 0 ? `${parts.join('\n\n')}\n---\n` : '';
+  }
+
+  // test seam のマーカー(裁定 21:24)。gate は既存と同じ ROOM_TEST_HOOKS 1 枚 — 新しい env は作らない
+  const CHLOESAY_MARKER = '__chloesay__ ';
+
+  // Brain の代わりに本文をそのまま流す。切り方は brain.ts の #emitCompleteSentences と同じ
+  // (句点の後ろで切って trim)。callback は speakStreamed が返す本番のものをそのまま使う。
+  function echoAsChloe(body: string, emit: (sentence: string) => void, onFirstToken: () => void): Promise<string> {
+    let first = true;
+    for (const sentence of body.split(/(?<=[。．！？!?])/).map((s) => s.trim()).filter(Boolean)) {
+      if (first) { onFirstToken(); first = false; }
+      emit(sentence);
+    }
+    return Promise.resolve(body);
   }
 
   const speakStreamed = (channel: Channel, turnId: string | undefined, run: ChannelRun<Brain>): ((sentence: string) => void) => {
@@ -1325,18 +1885,37 @@ function startChloe(): void {
   async function askOnce(channel: Channel, input: ConversationInput, run: ChannelRun<Brain>): Promise<void> {
     let text = input.text + attachmentNote(input.files);
     const hang = process.env.ROOM_TEST_HOOKS === '1' && text.includes('__hang__');
+    // 裁定 2026-08-06 21:24(PBI-008 AC-6 の test seam)。hooks が立っている時だけ、
+    // **Brain 呼び出しだけ**を「マーカー後の本文をそのまま返す」に置換する(echo)。
+    // turn 生成・routing・文分割・job 化・revision 照合・EventStore append・metrics は本番経路のまま
+    // = AC-6 が測る「turn 生成時 snapshot → 同一 turn 全 job 同一」を本番と同じ道で通す。
+    // 縛り 2: memo 経由の turn では発火しない(クロエの発話 primitive を公開面から到達不能にする)。
+    // 縛り 4: hooks 無効時はマーカーを解釈しない — ただの text として Brain へ渡る(分岐が消えるだけ)。
+    const say = process.env.ROOM_TEST_HOOKS === '1'
+      && !(input.turnId && memoTurnCid.has(input.turnId))
+      && text.startsWith(CHLOESAY_MARKER)
+      ? text.slice(CHLOESAY_MARKER.length) : null;
     if (run.freshBrain) text = contextPrefix(channel, input.text) + text;
-    const ask = hang ? new Promise<string>(() => {}) : run.brain.ask(
-      text,
-      speakStreamed(channel, input.turnId, run),
-      () => { if (run.isCurrent() && input.turnId) metric('brain_first_token', { turnId: input.turnId, path: 'room' }); },
-    );
+    convCtx.set(channel, { turnId: input.turnId }); // PBI-003: delegate がどの turn 起点かを読む(伝言相関)
+    try {
+    const onFirstToken = (): void => { if (run.isCurrent() && input.turnId) metric('brain_first_token', { turnId: input.turnId, path: 'room' }); };
+    const ask = hang ? new Promise<string>(() => {})
+      : say !== null ? echoAsChloe(say, speakStreamed(channel, input.turnId, run), onFirstToken)
+      : run.brain.ask(
+        text,
+        speakStreamed(channel, input.turnId, run),
+        onFirstToken,
+      );
     if ((await Promise.race([ask, timeoutMarker(ASK_GUARD_MS)])) !== TIMEOUT || !run.isCurrent()) return;
     console.error(`クロエ(${channel})の応答が ${ASK_GUARD_MS / 1000}s 超過 → interrupt`);
     if (!run.detach()) return;
     if (input.turnId) metric('turn_cancelled', { turnId: input.turnId, path: 'room', reason: 'brain_timeout' });
     store.append({ type: 'system', from: 'room', text: 'クロエの接続を作り直したよ。少し前の話は忘れちゃったかも', channel });
     store.append({ type: 'agent_speech', from: chloePid!, name: chloe.assignedName, text: 'ごめん、ちょっと固まってた。もう一回言ってくれる?', audio: null, turnId: input.turnId, channel });
+    } finally {
+      // 後続 turn が既に上書きしていたら消さない(LatestChannel は旧 askOnce の完走を待たない)
+      if (convCtx.get(channel)?.turnId === input.turnId) convCtx.delete(channel);
+    }
   }
 
   store.onAppend((ev) => {
@@ -1376,8 +1955,23 @@ function startChloe(): void {
 if (process.env.NO_CHLOE !== '1') startChloe();
 
 // ---- token(room.json 書込み。atomic 化・単一性は 3A-1b)----
-const token = randomBytes(24).toString('hex');
 const stateDir = join(homedir(), '.talkingclaw');
+// PBI-018: 前回の token を使い回す。毎回作り直すと、**サーバを直して再起動するたびに
+// 開いているタブが無効**になり「繋がらない」が起きる(0600 の room.json にどのみち置いてある)。
+// 変えたい時は CLAW_NEW_TOKEN=1 で起動する
+const token = (() => {
+  if (process.env.CLAW_NEW_TOKEN !== '1') {
+    try {
+      const prev = JSON.parse(readFileSync(join(stateDir, 'room.json'), 'utf8')) as { token?: unknown };
+      if (typeof prev.token === 'string' && /^[0-9a-f]{48}$/.test(prev.token)) {
+        console.log('token: 前回のものを使う(変えたい時は CLAW_NEW_TOKEN=1)');
+        return prev.token;
+      }
+    } catch { /* 初回・壊れている → 作り直す */ }
+  }
+  console.log('token: 新しく作った');
+  return randomBytes(24).toString('hex');
+})();
 const playedIds = new Set<number>(); // S4: floor 集計(4A)用の再生完了記録
 
 // W8-1: 会話ログの永続化(共有記憶の正)。user 発話 + 非 filler 本応答を追記。
@@ -1411,26 +2005,37 @@ function metric(kind: string, extra: Record<string, unknown> = {}, occurredAt = 
     const timing = TURN_METRICS.has(kind) && turnId ? turnMetricClock.event(turnId, kind, occurredAt) : null;
     let normalized = extra;
     if (timing) normalized = { ...extra, path: extra.path === 'memo' ? 'memo' : timing.path, ms: timing.ms };
+    // PBI-007 AC-10: どの合成で作った音かは別軸(tts)で記録する。path は入力経路の軸なので流用しない
+    if (kind === 'tts_ready') normalized = { ...normalized, tts: voice.lastUsed ?? config.tts.provider };
     appendFileSync(join(stateDir, 'metrics.jsonl'), JSON.stringify({ at: new Date(occurredAt).toISOString(), kind, ...normalized }) + '\n', { mode: 0o600 });
   } catch { /* 計測は本流を止めない */ }
 }
 const seenSpeakSeqs = new Map<string, Set<string>>(); // S2: speak 冪等(participant 毎)
 
+function tokenOf(req: IncomingMessage, url: URL): string {
+  if (req.method === 'GET') return String(url.searchParams.get('token') ?? '');
+  return String(req.headers['x-room-token'] ?? '');
+}
+
 function authed(req: IncomingMessage, url: URL): boolean {
-  if (req.method === 'GET') return url.searchParams.get('token') === token;
-  return req.headers['x-room-token'] === token;
+  return tokenOf(req, url) === token;
+}
+
+// PBI-035: 誰として来たか。**ホスト = 全部 / ゲスト = 遊ぶ・話す・見るだけ / それ以外 = 401**。
+// ゲストの一覧はファイルが正で、取り消しは次の要求から効く（プロセスに状態を溜めない）
+let guestFile = loadGuests();
+function guestOf(req: IncomingMessage, url: URL): Guest | null {
+  const t = tokenOf(req, url);
+  if (!t || t === token) return null;
+  return findGuest(guestFile, t);
 }
 
 // S9: Host = port 除去後の完全一致(欠如は deny — DNS rebinding 対策)。
 // Origin は存在時のみ自 origin 一致(curl / proxy の欠如は許可 — cross-site fetch 対策)。
 function originOk(req: IncomingMessage): boolean {
-  const host = req.headers.host;
-  if (!host) return false;
-  const hostname = host.replace(/:\d+$/, '');
-  if (hostname !== '127.0.0.1' && hostname !== 'localhost') return false;
-  const origin = req.headers.origin;
-  if (origin !== undefined && origin !== `http://127.0.0.1:${PORT}` && origin !== `http://localhost:${PORT}`) return false;
-  return true;
+  // PBI-036: LAN に出した時は**この機械の住所**も通す。それ以外の Host は今までどおり拒否
+  // （欠如も拒否）。許す先を増やしても「列挙一致」という形は変えない
+  return hostAllowed(req.headers.host, ALLOWED_HOSTS) && originAllowed(req.headers.origin, ALLOWED_HOSTS, PORT);
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown> | null> {
@@ -1453,20 +2058,57 @@ function json(res: ServerResponse, code: number, body: object): void {
   res.end(JSON.stringify(body));
 }
 
-const server = createServer(async (req, res) => {
+const server = createServer((req, res) => {
+  // PBI-041: **1 つの要求の失敗で部屋を殺さない**。async ハンドラの投げは Node では
+  // uncaught rejection = プロセス終了になる。実際に「卓に着いていない人が /game を見た」だけで
+  // 部屋が落ちた。ここで受け止めて 500 を返し、会話と卓は生かす
+  void handleRequest(req, res).catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`要求の処理で落ちた(部屋は続行): ${req.method} ${req.url} — ${msg}`);
+    try { if (!res.headersSent) json(res, 500, { error: '部屋の中で失敗した(部屋は動いています)' }); else res.end(); } catch { /* 返せないなら諦める */ }
+  });
+});
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
   const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
   const path = url.pathname;
 
+  // PBI-003(AC-3/AC-8): 伝言は token gate より前に memo handler だけが処理し、origin 規則も
+  // memo 限定(localhost または MEMO_PUBLIC_ORIGIN の exact Host/Origin)。部屋 UI の規則は下の originOk のまま
+  if (path === '/memo' || path.startsWith('/memo/')) {
+    if (!memoOriginOk(req)) return json(res, 403, { error: 'Host/Origin が不正です' });
+    if (await memoHandler.handle(req, res, path, url.searchParams)) return;
+    return json(res, 404, { error: 'not found' });
+  }
+
   if (!originOk(req)) return json(res, 403, { error: 'Host/Origin が不正です' });
 
+  // favicon はブラウザが token 無しで取りに来る。401 を返すと**画面の console が毎回赤くなり**、
+  // 本物のエラーが埋もれる（PBI-040 でゲストの画面を測っていて見つけた）
+  if (req.method === 'GET' && path === '/favicon.ico') {
+    res.writeHead(204, { 'cache-control': 'max-age=86400' });
+    return res.end();
+  }
   if (req.method === 'GET' && path === '/health') {
     return json(res, 200, { app: 'talkingclaw-room', version: '0.1.0', bootId: store.bootId, port: PORT });
   }
   if (req.method === 'GET' && path === '/') {
     // S8/S9: token 配布の唯一の経路 = このページへの埋め込み(no-store)
-    const html = (await readFile(fileURLToPath(new URL('../public/index.html', import.meta.url)), 'utf8'))
-      .replace('__ROOM_TOKEN__', token)
-      .replace('__BOOT_ID__', store.bootId);
+    const raw = await readFile(fileURLToPath(new URL('../public/index.html', import.meta.url)), 'utf8');
+    // PBI-022: CSP は inline script を禁じているので、import map の中身の sha256 を
+    // **配る時に計算して** script-src に足す。map を書き換えてもハッシュが自動で追随する
+    // (手で書いた固定ハッシュは、次に誰かが map を直した瞬間に静かに壊れる)。
+    // ハッシュの対象は script 要素の **テキスト内容そのまま**(前後の改行も含む)。
+    // 改行を落として計算すると、値は出るのに CSP は一致せず、原因が分かりにくい形で弾かれる
+    const mapBody = raw.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1] ?? '';
+    const mapHash = `sha256-${createHash('sha256').update(mapBody, 'utf8').digest('base64')}`;
+    const html = raw
+      // PBI-040(重大): **その人の token を返す**。ここでホストの token を焼き込むと、
+      // ゲストの画面が「ホストとして」全部の口を叩けてしまい、PBI-035 の鍵の分離が丸ごと無効になる
+      .replace('__ROOM_TOKEN__', guestOf(req, url)?.token ?? token)
+      .replace('__ROOM_ROLE__', guestOf(req, url) ? 'guest' : 'host')
+      .replace('__BOOT_ID__', store.bootId)
+      .replace('__IMPORTMAP_HASH__', mapHash);
     res.writeHead(200, {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-store',
@@ -1575,18 +2217,60 @@ const server = createServer(async (req, res) => {
     return res.end(md);
   }
 
+  // ---- PBI-022: キャラ(VRM)----------------------------------------------
+  // avatar.js と vendor(three / three-vrm)は room.js と同じく token gate の手前。
+  // 中身は第三者の公開ライブラリと自作の描画コードで、部屋の秘密を持たない。
+  if (req.method === 'GET' && path === '/avatar.js') {
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    return res.end(await readFile(fileURLToPath(new URL('../public/avatar.js', import.meta.url))));
+  }
+  // node_modules の ESM をそのまま配る(bundler を入れない代わり。import map が指す先)。
+  // **許可した package の .js だけ**。`..` は URL 正規化で既に潰れているが、念のため弾く
+  if (req.method === 'GET' && path.startsWith('/vendor/')) {
+    const rel = path.slice('/vendor/'.length);
+    const allowed = ['three/', '@pixiv/three-vrm/', '@pixiv/three-vrm-animation/'].some((p) => rel.startsWith(p));
+    if (!allowed || rel.includes('..') || !rel.endsWith('.js')) return json(res, 404, { error: 'not found' });
+    try {
+      const buf = await readFile(fileURLToPath(new URL(`../node_modules/${rel}`, import.meta.url)));
+      // 版で中身が変わらない前提の第三者ライブラリなので、ここだけキャッシュを効かせる
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'max-age=3600', 'x-content-type-options': 'nosniff' });
+      return res.end(buf);
+    } catch {
+      return json(res, 404, { error: 'vendor が見つかりません(npm install を実行したか確認してください)' });
+    }
+  }
+
   if (req.method === 'GET' && path === '/room.js') {
     res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     return res.end(await readFile(fileURLToPath(new URL('../public/room.js', import.meta.url))));
   }
-  if (!authed(req, url)) return json(res, 401, { error: 'token が必要です' });
+  // PBI-035: ホスト token でなければゲストとして見る。ゲストは allowlist の口だけ
+  const guest = authed(req, url) ? null : guestOf(req, url);
+  if (!guest && !authed(req, url)) return json(res, 401, { error: 'token が必要です' });
+  if (guest && !guestAllows(req.method ?? 'GET', path)) {
+    metric('guest_denied', { path });   // 何を断ったかは残す(招いた人が後から見られる)
+    return json(res, 403, { error: 'ゲストはこの操作をできません' });
+  }
+
+  // PBI-008: 声の操作は部屋の所有者だけが行う = originOk と token gate の**後ろ**に置く
+  // (伝言 /memo が gate の前だったのとは逆。伝言は外から届く、声は部屋の持ち主の設定)。
+  // 本文の読み取りは voiceswitch 側が自分でやる(下の readJson 共通経路には載せない)
+  if (path.startsWith('/voice/')) {
+    // PBI-029: 役ごとの振り分け。**試聴だけは常に本体**(課金の門を 1 つに保つ)
+    const roleSwitch = url.searchParams.get('role') === 'narrator' && path !== '/voice/api/preview'
+      ? narratorSwitch : voiceSwitch;
+    if (await roleSwitch.handle(req, res, path, url.searchParams)) return;
+    return json(res, 404, { error: 'not found' });
+  }
 
   if (req.method === 'GET' && path === '/events') {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
     res.write(`data: ${JSON.stringify({ type: 'hello', bootId: store.bootId, lastId: store.lastId })}\n\n`);
     const after = Number(url.searchParams.get('after') ?? 0);
-    for (const ev of store.since(after)) res.write(`data: ${JSON.stringify(ev)}\n\n`);
-    const unsubscribe = store.onAppend((ev) => res.write(`data: ${JSON.stringify(ev)}\n\n`));
+    // PBI-035: ゲストには**招いた部屋のイベントだけ**。ホストの作業部屋の会話は 1 行も出さない
+    const visible = (ev: RoomEvent): boolean => !guest || (ev.channel ?? 'work') === guest.channel;
+    for (const ev of store.since(after)) if (visible(ev)) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    const unsubscribe = store.onAppend((ev) => { if (visible(ev)) res.write(`data: ${JSON.stringify(ev)}\n\n`); });
     const ping = setInterval(() => res.write(': ping\n\n'), 25_000); // S1: SSE heartbeat
     req.on('close', () => { clearInterval(ping); unsubscribe(); });
     return;
@@ -1600,7 +2284,11 @@ const server = createServer(async (req, res) => {
     return json(res, 200, {
       selected: turn.selected,
       userSpeaking: mic.active,
-      channel: activeChannel,
+      channel: guest ? guest.channel : activeChannel,
+      // PBI-040: 画面が「自分は誰か」を知るための 2 つ。**押せない物を見せない**ために使う
+      role: guest ? 'guest' : 'host',
+      yourName: guest ? guest.name : 'あなた',
+      yourChannel: guest ? guest.channel : activeChannel,
       participants: registry.all().map((p) => ({
         participantId: p.participantId,
         name: p.assignedName,
@@ -1619,7 +2307,90 @@ const server = createServer(async (req, res) => {
     return res.end(wav);
   }
 
+  // ---- GET の口はこのゲートより **前** に置くこと ----------------------------
+  // 下の `req.method !== 'POST'` で 404 になるため、後ろに書くと GET が届かない。
+  // (2026-08-15: /persona と /avatars をここより後ろに書いてしまい、両方 404 だった)
+  if (req.method === 'GET' && path === '/persona') {
+    // PBI-021: 相棒の現在の 9 軸。token 必須(他の口と同じ)。読み取りのみ
+    return json(res, 200, personaSummary());
+  }
+  // PBI-024: 覚えた語と、まだ聞いていない候補
+  if (req.method === 'GET' && path === '/vocab') {
+    return json(res, 200, { known: currentVocab().known, candidates: pendingWords() });
+  }
+  // PBI-025: 置いてある動き(.vrma)。無ければ空配列 = ボタンを出さない
+  if (req.method === 'GET' && path === '/motions') {
+    return json(res, 200, { motions: listMotions() });
+  }
+  if (req.method === 'GET' && path.startsWith('/motions/')) {
+    const name = decodeURIComponent(path.slice('/motions/'.length));
+    // **名前の形ではなく、実際に在る名前と一致するかで通す**(列挙 allowlist)。
+    // 正規表現で ASCII に絞ると「コハク.vrma」のような日本語名が黙って 404 になる(PBI-032 で踏んだ)。
+    // readdir の結果と完全一致でしか通らないので、`..` もパス区切りも入り込めない
+    if (name.includes('/') || name.includes('\\') || !listMotions().includes(name)) return json(res, 404, { error: 'not found' });
+    try {
+      const buf = await readFile(join(homedir(), '.talkingclaw', 'motions', name));
+      res.writeHead(200, { 'content-type': 'model/gltf-binary', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      return res.end(buf);
+    } catch {
+      return json(res, 404, { error: 'not found' });
+    }
+  }
+  // PBI-022: 置いてあるアバター(~/.talkingclaw/avatars/*.vrm)。無ければ空配列 = キャラ枠を出さない
+  if (req.method === 'GET' && path === '/avatars') {
+    return json(res, 200, { avatars: listAvatars() });
+  }
+  if (req.method === 'GET' && path.startsWith('/avatars/')) {
+    const name = decodeURIComponent(path.slice('/avatars/'.length));
+    // 同上: 名前の形ではなく**実在する名前との一致**で通す(日本語のファイル名 = agent 名を許す)
+    if (name.includes('/') || name.includes('\\') || !listAvatars().includes(name)) return json(res, 404, { error: 'not found' });
+    try {
+      const buf = await readFile(join(homedir(), '.talkingclaw', 'avatars', name));
+      res.writeHead(200, { 'content-type': 'model/gltf-binary', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      return res.end(buf);
+    } catch {
+      return json(res, 404, { error: 'not found' });
+    }
+  }
+
   if (req.method !== 'POST') return json(res, 404, { error: 'not found' });
+
+
+  // PBI-017: 落とされたフォルダの中身を 1 ファイルずつ受ける。置き場は workspace 直下の
+  // <名前>/ で、相対パスをそのまま作る。受付は intakeStart で開いてあるものだけ
+  if (path === '/intake') {
+    const name = String(url.searchParams.get('name') ?? '');
+    const take = intakes.get(name);
+    if (!take) return json(res, 409, { error: '受付が開いていないよ(先に intakeStart)' });
+    // 相対パスは信用しない —— .. や絶対パスで置き場の外に書かせない(ここは信頼境界)
+    const parts = String(url.searchParams.get('rel') ?? '').split('/').filter((s) => s && s !== '.' && s !== '..');
+    if (parts.length === 0) return json(res, 400, { error: 'ファイルの位置が要る' });
+    const dest = join(take.dir, ...parts);
+    if (!dest.startsWith(take.dir + '/')) return json(res, 400, { error: '置き場の外には書けない' });
+    // 申告より多く送られても止める(intakeStart の上限は申告値にしか効かない)
+    if (take.wrote >= take.files) return json(res, 413, { error: `申告(${take.files} 件)より多いよ` });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let tooBig = false;
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > UPLOAD_MAX || take.bytesWrote + size > INTAKE_MAX_BYTES) { tooBig = true; break; }
+      chunks.push(chunk as Buffer);
+    }
+    // 413 は**読み切ってから**返す。途中で socket を壊すと fetch 自体が失敗し、
+    // 画面には理由でなく「Failed to fetch」が出る
+    if (tooBig) { req.resume(); return json(res, 413, { error: '大きすぎるよ(1 ファイル 20MB / 全体 200MB まで)' }); }
+    try {
+      // 同期で書くと、その間ユーザーの声が止まる(browse と同じ理由)
+      await mkdirP(pathMod.dirname(dest), { recursive: true, mode: 0o700 });
+      await writeFileP(dest, Buffer.concat(chunks), { mode: 0o600 });
+    } catch (e) {
+      return json(res, 500, { error: `${parts.join('/')} を置けなかった: ${(e as Error).message}` });
+    }
+    take.wrote += 1;
+    take.bytesWrote += size;
+    return json(res, 200, { ok: true, wrote: take.wrote });
+  }
 
   // こちらから画像・ファイルを送る。~/.talkingclaw/uploads に置き、agent には実パスで渡す
   // (作業先の git を汚さないよう、workspace や project の中には置かない)
@@ -1642,6 +2413,16 @@ const server = createServer(async (req, res) => {
   }
 
   const body = await readJson(req);
+  // PBI-024: 候補を覚える / 断る。**人が決める**(適合率は人が担保する)
+  if (path === '/vocab') {
+    const word = String((body as { word?: unknown }).word ?? '').trim();
+    const action = String((body as { action?: unknown }).action ?? '');
+    if (!word) return json(res, 400, { error: '語が空です' });
+    if (action !== 'remember' && action !== 'ignore') return json(res, 400, { error: 'action は remember か ignore' });
+    const v = vocabDecide(word, action);
+    return json(res, 200, { ok: true, known: v.known, candidates: pendingWords() });
+  }
+
   if (body === null) return json(res, 400, { error: 'JSON body が必要です(64KB 以内)' });
 
   if (path === '/join') {
@@ -1677,12 +2458,25 @@ const server = createServer(async (req, res) => {
 
   // ゲームの今の様子(画面のボタンを組み立てるため)。ボタンは声と同じ言葉を /chat に送る
   if (path === '/game') {
-    return json(res, 200, casino.view(gameSessions.get(activeChannel) ?? null));
+    // PBI-037: **見る人ごとの盤面**。ゲストは自分の部屋の卓を、自分の手牌で見る
+    const ch = guest ? (guest.channel as Channel) : activeChannel;
+    return json(res, 200, casino.view(gameSessions.get(ch) ?? null, guest ? guest.id : 'you'));
   }
 
   if (path === '/chat') {
     const text = String(body.text ?? '').trim();
     if (!text || text.length > TEXT_MAX) return json(res, 400, { error: `text が空か ${TEXT_MAX} 字超です` });
+    // PBI-035 / D-019: **ゲストの発話でホストの推論を使わない**。部屋には出るし卓は動くが、
+    // agent は起こさない(targets 空 = Brain へ行かない)。連れてきた agent が答えるのは W5
+    if (guest) {
+      const gameEvent = tryGame(text, { actor: guest.id, channel: guest.channel as Channel });
+      if (gameEvent !== null) return json(res, 200, { ok: true, eventId: gameEvent, game: true });
+      const ev = store.append({
+        type: 'user_speech', from: 'guest', name: guest.name, text, targets: [],
+        routing: { method: 'default' }, channel: guest.channel as Channel,
+      });
+      return json(res, 200, { ok: true, eventId: ev.id, guest: true });
+    }
     // 遊びの手は会話に流さず即判定(待たされるゲームは遊べない)
     const gameEvent = tryGame(text);
     if (gameEvent !== null) return json(res, 200, { ok: true, eventId: gameEvent, game: true });
@@ -1743,6 +2537,211 @@ const server = createServer(async (req, res) => {
     }
     const ext = loadWorkerMcp();
     return json(res, 200, { ...workerSettings, externalMcp: Object.keys(ext.mcpServers), projects: Object.keys(loadProjects()) });
+  }
+
+  // PBI-011: 作業先プロジェクトの一覧・追加・登録解除。projects.json の手書きを廃止する。
+  // token gate の内側なので伝言公開経路(/memo)からは見えない
+  if (path === '/projects') {
+    const action = String(body.action ?? 'list');
+    const projects = loadProjects();
+    if (action === 'add') {
+      const name = String(body.name ?? '').trim();
+      const raw = String(body.path ?? '').trim();
+      if (!PROJECT_NAME.test(name)) return json(res, 400, { error: '名前は英数字で始めて、英数字と . - _ で 40 文字までにしてね' });
+      if (projects[name]) return json(res, 409, { error: `「${name}」はもう登録されているよ` });
+      const dir = raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw;
+      if (!isAbsolute(dir)) return json(res, 400, { error: '絶対パスで指定してね(例: /Users/you/myapp か ~/myapp)' });
+      let st;
+      try { st = statSync(dir); } catch { return json(res, 400, { error: 'そのパスは見つからないよ' }); }
+      if (!st.isDirectory()) return json(res, 400, { error: 'フォルダではないみたい(ファイルは登録できないよ)' });
+      saveProjects({ ...projects, [name]: dir });
+      // PBI-015/017: どの入口から入ったか。drop は「落として、コピーせずその場を登録した」道
+      const via = ['browse', 'drop', 'path', 'cli'].includes(String(body.via)) ? String(body.via) : 'path';
+      metric('project_add', { via });
+      if (via === 'drop') metric('project_intake', { mode: 'path', files: 0, bytes: 0, skipped: 0 });
+      return json(res, 200, { ok: true, projects: loadProjects() });
+    }
+    // PBI-017: フォルダを落として持ち込む。中身は /intake で 1 ファイルずつ受け、ここで開閉する
+    if (action === 'intakeStart') {
+      const name = String(body.name ?? '').trim();
+      const files = Number(body.files ?? 0);
+      const bytes = Number(body.bytes ?? 0);
+      if (!PROJECT_NAME.test(name)) return json(res, 400, { error: '名前は英数字で始めて、英数字と . - _ で 40 文字までにしてね' });
+      if (projects[name]) return json(res, 409, { error: `「${name}」はもう登録されているよ` });
+      if (files < 1) return json(res, 400, { error: '中身が 1 つも無いみたい(空のフォルダは置けないよ)' });
+      // 送り始める前に断る(AC-5)。何が超えたかを言う
+      if (files > INTAKE_MAX_FILES) return json(res, 413, { error: `ファイルが多すぎるよ(${files} 個。${INTAKE_MAX_FILES} 個まで)。大きいものは terminal で: そのフォルダに cd して npm run cli → /project add(コピーしないので規模は関係ないよ)` });
+      if (bytes > INTAKE_MAX_BYTES) return json(res, 413, { error: `大きすぎるよ(${Math.round(bytes / 1e6)}MB。${Math.round(INTAKE_MAX_BYTES / 1e6)}MB まで)。大きいものは terminal で: そのフォルダに cd して npm run cli → /project add(コピーしないので規模は関係ないよ)` });
+      const dir = join(config.agent.cwd, name);
+      // 前回の取り込みが途中で切れた跡(空のまま登録もされていない置き場)なら、やり直させる。
+      // ここを一律に断ると「端末で rm -rf」しか手が無くなり、この機能の意味が消える
+      const leftover = existsSync(dir) && !projects[name] && readdirSync(dir).length === 0;
+      if (existsSync(dir) && !leftover) return json(res, 409, { error: `${dir} はもう在るよ(消したり上書きはしないから、要らないなら自分で消してね)` });
+      try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (e) {
+        return json(res, 500, { error: `置き場を作れなかった: ${(e as Error).message}` });
+      }
+      intakes.set(name, { dir, files, bytes, wrote: 0, bytesWrote: 0, at: Date.now() });
+      return json(res, 200, { ok: true, dir, resumed: leftover });
+    }
+    if (action === 'intakeDone') {
+      const name = String(body.name ?? '');
+      const take = intakes.get(name);
+      if (!take) return json(res, 409, { error: '受付が開いていないよ' });
+      intakes.delete(name);
+      metric('project_intake', { mode: 'upload', files: take.wrote, bytes: take.bytesWrote, skipped: Number(body.skipped ?? 0) });
+      if (take.wrote === 0) {
+        // 1 つも置けていないなら登録しない。**自分が作った空の置き場は自分で片付ける** ——
+        // 残すと次の取り込みが 409 で詰まる(中身があるものには触らない)
+        try { if (readdirSync(take.dir).length === 0) rmdirSync(take.dir); } catch { /* 消せなくても続ける */ }
+        return json(res, 500, { error: `${take.dir} に 1 つも置けなかった` });
+      }
+      try { saveProjects({ ...loadProjects(), [name]: take.dir }); } catch (e) {
+        return json(res, 500, { error: `置いたけど登録だけ失敗した(${take.dir}): ${(e as Error).message}`, dir: take.dir });
+      }
+      return json(res, 200, { ok: true, name, dir: take.dir, wrote: take.wrote, projects: loadProjects() });
+    }
+    // PBI-016: 画面から GitHub にログインする(端末で gh auth login を打たせない)
+    if (action === 'auth' || action === 'authPoll' || action === 'authCancel') {
+      const bin = await ghPath();
+      if (!bin) return json(res, 400, { error: 'gh コマンドが見つからないよ(brew install gh で入れてから、もう一度)' });
+      if (action === 'authCancel') {
+        if (ghAuth && !ghAuth.done) { try { ghAuth.child.kill('SIGTERM'); } catch { /* もう居ない */ } }
+        metric('gh_auth', { phase: 'cancel' });
+        ghAuth = null;
+        return json(res, 200, { ok: true });
+      }
+      if (action === 'authPoll') {
+        if (!ghAuth) return json(res, 200, { waiting: false, authed: await ghAuthed(bin) });
+        if (!ghAuth.done) return json(res, 200, { waiting: true, code: ghAuth.code, url: ghAuth.url });
+        const { ok, why } = ghAuth.done;
+        ghAuth = null;
+        metric('gh_auth', { phase: ok ? 'done' : 'failed' });
+        // 誰として入れたかは画面に出す(ここで初めて API を 1 回だけ叩く)
+        const who = ok ? await execFileAsync(bin, ['api', 'user', '--jq', '.login'], { timeout: 15_000 }).then((r) => r.stdout.trim()).catch(() => '') : '';
+        return json(res, 200, { waiting: false, authed: ok, user: who, error: ok ? undefined : why });
+      }
+      // 二重に起こさない。まだ合言葉が出ていないなら「待っている」と答える(空の合言葉を渡さない)
+      if (ghAuth && !ghAuth.done) {
+        return ghAuth.code ? json(res, 200, { code: ghAuth.code, url: ghAuth.url }) : json(res, 200, { waiting: true, url: ghAuth.url });
+      }
+      metric('gh_auth', { phase: 'start' });
+      const st = await ghAuthStart(bin);
+      if (!st.code) {
+        const why = st.done?.why || 'gh がコードを出さなかった';
+        // 合言葉が出ないまま諦める時は、待っている gh を必ず道連れにする ——
+        // ここで手を離すと二度と掴めず、15 分後に勝手に認証が通る(利用者には「失敗」と伝えた後で)
+        if (!st.done) { try { st.child.kill('SIGTERM'); } catch { /* もう居ない */ } }
+        ghAuth = null;
+        return json(res, 502, { error: why });
+      }
+      return json(res, 200, { code: st.code, url: st.url });
+    }
+    // PBI-015: 認証済みの gh から自分の repo を一覧する(URL を手で打たせないための材料)
+    if (action === 'repos') {
+      const bin = await ghPath();
+      if (!bin) return json(res, 400, { error: 'gh コマンドが見つからないよ(brew install gh で入れてから、もう一度)' });
+      try {
+        const { stdout } = await execFileAsync(bin, ['repo', 'list', '--limit', String(REPO_LIST_LIMIT), '--json', 'nameWithOwner,isPrivate,updatedAt'], { timeout: 30_000 });
+        const repos = (JSON.parse(stdout) as { nameWithOwner: string; isPrivate: boolean; updatedAt: string }[])
+          .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+        return json(res, 200, { repos, limit: REPO_LIST_LIMIT });
+      } catch (e) {
+        const err = e as { stderr?: string; message?: string };
+        // gh の言い分をそのまま(未認証なら「gh auth login して」がここに入る)
+        return json(res, 502, { error: String(err.stderr ?? '').trim() || err.message || 'repo 一覧を取れなかった' });
+      }
+    }
+    // PBI-015: ローカルのフォルダを辿る(絶対パスを手で打たせないための材料)。読むだけ・隠しフォルダは出さない。
+    // ここは会話と同じ event loop の上なので、同期で舐めない —— node_modules や Caches のような
+    // 万単位のフォルダで readdirSync + existsSync を回すと、その間ユーザーの声が止まる
+    if (action === 'browse') {
+      const raw = String(body.path ?? '').trim();
+      const at = pathMod.resolve(raw === '' ? homedir() : raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw);
+      const isDir = (p: string): Promise<boolean> => stat(p).then((s) => s.isDirectory()).catch(() => false);
+      let all;
+      try { all = await readdir(at, { withFileTypes: true }); } catch (e) {
+        return json(res, 400, { error: `${at} は開けなかった: ${(e as Error).message}` });
+      }
+      // symlink も候補に入れる(外付けや dotfiles 運用でフォルダが symlink のことがある)。実体の確認は stat で
+      const cands = all.filter((d) => !d.name.startsWith('.') && (d.isDirectory() || d.isSymbolicLink()));
+      const shown = cands.slice(0, BROWSE_LIMIT);
+      const entries = (await Promise.all(shown.map(async (d) => {
+        const p = join(at, d.name);
+        return (await isDir(p)) ? { name: d.name, path: p, git: await isDir(join(p, '.git')) } : null;
+      }))).filter((e) => e !== null).sort((a, b) => a.name.localeCompare(b.name));
+      const up = pathMod.dirname(at);
+      // more = 打ち止めで出していない数(黙って切らない)
+      return json(res, 200, { at, up: up === at ? null : up, git: await isDir(join(at, '.git')), entries, home: homedir(), more: cands.length - shown.length });
+    }
+    // PBI-012: URL 1 本で clone → 登録まで。clone が成功して初めて登録する
+    if (action === 'clone') {
+      const m = GH_URL.exec(String(body.url ?? '').trim());
+      if (!m) return json(res, 400, { error: 'https://github.com/owner/repo の形で入れてね' });
+      const [, owner, repo] = m;
+      if (!PROJECT_NAME.test(repo)) return json(res, 400, { error: `「${repo}」は登録名にできないよ(英数字で始まり、英数字と . - _ で 40 文字まで)` });
+      if (projects[repo]) return json(res, 409, { error: `「${repo}」はもう登録されているよ` });
+      const bin = await ghPath();
+      if (!bin) return json(res, 400, { error: 'gh コマンドが見つからないよ(brew install gh で入れてから、もう一度)' });
+      const dir = join(config.agent.cwd, repo);
+      // AC-3: 既に在るものには触らない。上書きも削除もせず、clone する前に止める
+      if (existsSync(dir)) return json(res, 409, { error: `${dir} はもう在るよ(消したり上書きはしないから、要らないなら自分で消してね)` });
+      if (cloning.has(dir)) return json(res, 409, { error: `${repo} は今 clone 中だよ(終わるまで待ってね)` });
+      cloning.add(dir);
+      const t0 = Date.now();
+      try {
+        mkdirSync(config.agent.cwd, { recursive: true });
+        await ghClone(bin, `${owner}/${repo}`, dir);
+      } catch (e) {
+        const err = e as { stderr?: string; message?: string; killed?: boolean };
+        metric('project_clone', { repo: `${owner}/${repo}`, ok: false, ms: Date.now() - t0, via: ['list','cli'].includes(String(body.via)) ? String(body.via) : 'url' });
+        // AC-4: gh の言い分をそのまま見せる(こちらで丸めると原因が消える)。projects.json は触っていない
+        const why = String(err.stderr ?? '').trim() || err.message || 'clone に失敗した';
+        return json(res, 502, {
+          error: err.killed
+            ? `clone が長すぎたので打ち切ったよ(${Math.round(CLONE_TIMEOUT_MS / 60_000)} 分)。${dir} に途中まで残っているかもしれないから、要らなければ消してね`
+            : why,
+        });
+      } finally {
+        cloning.delete(dir);
+      }
+      metric('project_clone', { repo: `${owner}/${repo}`, ok: true, ms: Date.now() - t0, via: ['list','cli'].includes(String(body.via)) ? String(body.via) : 'url' });
+      // 待っている間に別の追加・登録解除が入っているので、handler 入口の写しではなく今の中身に足す
+      try { saveProjects({ ...loadProjects(), [repo]: dir }); } catch (e) {
+        // AC-5: clone したフォルダは消さずに残す。登録だけやり直せると分かる文言で返す
+        return json(res, 500, { error: `clone はできた(${dir})けど、登録だけ失敗した: ${(e as Error).message}。上の追加フォームにこのパスを入れれば登録できるよ`, dir });
+      }
+      return json(res, 200, { ok: true, name: repo, dir, projects: loadProjects() });
+    }
+    if (action === 'remove') {
+      const name = String(body.name ?? '');
+      // 登録解除はレジストリから外すだけ — ディスク上のフォルダには触らない
+      if (name === 'workspace' || name === 'talkingclaw') return json(res, 400, { error: 'この 2 つは部屋の土台なので外せないよ' });
+      if (!projects[name]) return json(res, 404, { error: 'その名前は登録されていないよ' });
+      const next = { ...projects };
+      delete next[name];
+      saveProjects(next);
+      return json(res, 200, { ok: true, projects: loadProjects() });
+    }
+    // home は表示用(UI がパスの HOME 部分を ~ に縮める。切り詰めは geometry 契約違反)。
+    // gh / workspace は clone フォームのため(gh が無い環境ではフォームごと使えないと伝える)
+    const ghBin = await ghPath();
+    return json(res, 200, {
+      projects, home: homedir(), gh: ghBin !== null, workspace: config.agent.cwd,
+      ghAuthed: ghBin ? await ghAuthed(ghBin) : false, // PBI-016: 未認証なら画面から連携できると出す
+    });
+  }
+
+  // PBI-014: 画面から艦隊を見る・立てる・指示を渡す。声のツールと同じ fleetAct を通るので、
+  // 台帳の縛り(部屋が立てた子にしか指示を送らない)は画面側からも外せない
+  if (path === '/herdr') {
+    const str = (v: unknown): string | undefined => (v === undefined || v === null || v === '' ? undefined : String(v));
+    const r = await fleetAct({
+      action: String(body.action ?? 'list'),
+      target: str(body.target), text: str(body.text), name: str(body.name),
+      workspace: str(body.workspace), project: str(body.project),
+      lines: body.lines === undefined ? undefined : Number(body.lines),
+    });
+    return json(res, r.error ? 400 : 200, { fleet: fleetView, note: r.say, ...(r.error ? { error: r.error } : {}) });
   }
 
   if (path === '/ui-state') {
@@ -1841,7 +2840,9 @@ const server = createServer(async (req, res) => {
   }
 
   if (path === '/tasks') {
-    return json(res, 200, boardSnapshot());
+    // fleet は「最後に見た艦隊」。ここで毎回 herdr を叩くと board の定期更新のたびに CLI が走るので、
+    // 取りに行くのは声か画面のボタンが /herdr を叩いた時だけにする
+    return json(res, 200, { ...boardSnapshot(), fleet: fleetView });
   }
 
   if (path === '/plan') {
@@ -1849,7 +2850,7 @@ const server = createServer(async (req, res) => {
     const action = String(body.action ?? 'get');
     if (action === 'confirm') {
       const r = confirmPlan();
-      return r.ok ? json(res, 200, { ok: true, taskId: r.taskId }) : json(res, 400, { error: r.error });
+      return r.ok ? json(res, 200, { ok: true, taskId: r.taskId, pbi: r.pbi, note: r.note }) : json(res, 400, { error: r.error });
     }
     if (action === 'cancel') {
       if (plan) store.append({ type: 'system', from: 'room', text: '相談中の案はいったん取り下げたよ', channel: 'work' });
@@ -1956,6 +2957,34 @@ const server = createServer(async (req, res) => {
     return json(res, 200, { ok: true, room: activeChannel });
   }
 
+  // PBI-035: ゲストを招く / 取り消す / 一覧（**ホストだけ**。allowlist に無いのでゲストは 403）
+  if (path === '/guests') {
+    const action = String(body.action ?? 'list');
+    if (action === 'invite') {
+      const out = issueGuest(guestFile, {
+        name: String(body.name ?? 'ゲスト'),
+        channel: isChannel(body.channel) ? body.channel : activeChannel,
+        hours: Number(body.hours ?? 12),
+      });
+      guestFile = out.file;
+      saveGuests(guestFile);
+      store.append({ type: 'system', from: 'room', text: `${out.guest.name} を招待したよ（${out.guest.channel} の部屋・${new Date(out.guest.expiresAt).toLocaleString('ja-JP')} まで）` });
+      // token を返すのはこの 1 回だけ(一覧には出さない)
+      // 招待リンクは**繋がる住所**で作る。LAN に出していなければ 127.0.0.1（嘘をつかない）
+      const at = inviteHost(BIND, LAN);
+      return json(res, 200, {
+        ok: true, guest: { ...out.guest }, url: `http://${at}:${PORT}/?token=${out.guest.token}`,
+        lan: BIND === '0.0.0.0', addresses: LAN,
+      });
+    }
+    if (action === 'revoke') {
+      guestFile = revokeGuest(guestFile, String(body.id ?? ''));
+      saveGuests(guestFile);
+      return json(res, 200, { ok: true, guests: guestSummary(guestFile) });
+    }
+    return json(res, 200, { guests: guestSummary(guestFile) });
+  }
+
   if (path === '/channel') {
     // 部屋分割: 今いる部屋を切替。以後のデフォルト発話・クロエの記憶がこちらに切り替わる
     if (!isChannel(body.channel)) return json(res, 400, { error: '不明な部屋です' });
@@ -2044,10 +3073,10 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  return json(res, 404, { error: 'not found' });
-});
+  json(res, 404, { error: 'not found' });
+}
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, BIND, () => {
   // S8: token 生成物の書出しは bind 成功後のみ + tmp→rename の atomic(敗者は一切触れない)
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const tmp = join(stateDir, `room.json.tmp-${process.pid}`);
@@ -2056,6 +3085,16 @@ server.listen(PORT, '127.0.0.1', () => {
   }), { mode: 0o600 });
   renameSync(tmp, join(stateDir, 'room.json'));
   console.error(`talkingclaw room: http://127.0.0.1:${PORT}(bootId ${store.bootId.slice(0, 8)})`);
+  // PBI-036: **どこまで出しているかを起動時に必ず言う**（黙って LAN に出ている状態を作らない）
+  if (BIND === '0.0.0.0') {
+    console.error(`警告: この部屋は LAN に出ています — ${LAN.map((a) => `http://${a}:${PORT}/`).join(' / ') || '(住所を取得できませんでした)'}`);
+    console.error('  招待した人だけが入れます(ゲストの鍵)。公共の Wi-Fi では ROOM_BIND を外してください');
+  }
+  // 裁定 21:24 縛り 5: 検査用の口が開いていることを起動時に必ず 1 行出す(hooks 家族まとめて)。
+  // 本番の LaunchDaemon plist には ROOM_TEST_HOOKS を置かないこと(PBI-003 設置作業への申し送り)
+  if (process.env.ROOM_TEST_HOOKS === '1') {
+    console.error('警告: ROOM_TEST_HOOKS=1 — 検査用の口(__askperm__ / __memocrash__ / __hang__ / __chloesay__)が開いています。本番では外してください');
+  }
 });
 server.on('error', (e: NodeJS.ErrnoException) => {
   if (e.code === 'EADDRINUSE') {
@@ -2073,6 +3112,8 @@ setInterval(() => archiveSession(store.bootId, 'interval'), ARCHIVE_INTERVAL_MS)
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => {
     archiveSession(store.bootId, 'shutdown'); // 部屋を閉じた時点までの分を残す
+    // 認証待ちの gh を道連れにする(部屋が居ないのに device flow だけ回り続けるのを防ぐ)
+    if (ghAuth && !ghAuth.done) { try { ghAuth.child.kill('SIGTERM'); } catch { /* もう居ない */ } }
     process.exit(0);
   });
 }

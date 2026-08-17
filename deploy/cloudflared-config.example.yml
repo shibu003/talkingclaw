@@ -1,0 +1,18 @@
+# talkingclaw 伝言公開用 cloudflared 設定の雛形。
+# コピー先: ~/.cloudflared/config.yml (repo には実値を置かない — PBI-003 AC-6)
+# <TUNNEL_UUID> と <MEMO_HOST> は docs/setup-memo-public.md の手順で決めて書き換える。
+#
+# ingress の path は Go の正規表現 (公式: developers.cloudflare.com/cloudflare-one/
+# connections/connect-networks/do-more-with-tunnels/local-management/configuration-file/)。
+# /memo と /memo/api/* だけを部屋 (localhost:3300) に流し、同 hostname のそれ以外
+# (/, /events, /participants, /files/*, /uploads/* を含む全部) は origin に到達させず 404。
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /Users/YOUR_USER/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: <MEMO_HOST>
+    path: ^/memo(/api/.*)?$
+    service: http://localhost:3300
+  # catch-all は必須 (これが最後の rule でないと cloudflared が起動しない)
+  - service: http_status:404

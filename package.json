@@ -1,7 +1,10 @@
 {
   "name": "talkingclaw",
   "version": "0.1.0",
-  "description": "複数の coding agent が 1 つの「声の部屋」に同席し、agent ごとに違うアニメ声で喋りながら開発するローカル OSS(API キー不要)",
+  "description": "A local voice room where multiple coding agents (Claude Code / Codex / Gemini CLI) sit together and answer out loud, each in its own voice. No API keys.",
+  "bin": {
+    "talkingclaw": "bin/talkingclaw.mjs"
+  },
   "scripts": {
     "test": "npm run check-ui",
     "start": "node src/index.ts",
@@ -12,8 +15,10 @@
     "cost": "node scripts/cost-report.mjs",
     "split-log": "node scripts/split-transcript.mjs",
     "cli": "node src/cli.ts",
-    "check-ui": "node test/check-ui.mjs && node test/check-nav.mjs && node test/check-git.mjs && node test/check-artifacts.mjs && node test/check-convos.mjs && node test/check-sync-cancel.mjs",
-    "setup-stt": "swiftc -O tools/listen.swift -o tools/claw-listen -framework Speech -framework AVFoundation"
+    "typecheck": "node scripts/typecheck.mjs",
+    "check-ui": "npm run typecheck && node test/check-ui.mjs && node test/check-nav.mjs && node test/check-git.mjs && node test/check-artifacts.mjs && node test/check-convos.mjs && node test/check-sync-cancel.mjs && node test/check-projects.mjs && node test/check-herdr-bridge.mjs && node test/check-ui-geometry.mjs && node test/check-cli-projects.mjs && node test/check-plan-to-pbi.mjs && node test/check-memo-e2e.mjs && node test/check-persona.mjs && node test/check-avatar.mjs && node test/check-http-get.mjs && node test/check-vocab.mjs && node test/check-motion-visible.mjs && node test/check-no-key-table.mjs && node test/check-guest.mjs && node scripts/memory-baseline.mjs --self-check",
+    "setup-stt": "swiftc -O tools/listen.swift -o tools/claw-listen -framework Speech -framework AVFoundation",
+    "memory:baseline": "node scripts/memory-baseline.mjs"
   },
   "repository": {
     "type": "git",
@@ -45,6 +50,24 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@ricky0123/vad-web": "^0.0.30"
-  }
+    "@pixiv/three-vrm": "^3.5.5",
+    "@pixiv/three-vrm-animation": "^3.5.5",
+    "@ricky0123/vad-web": "^0.0.30",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "public/",
+    "scripts/",
+    "test/",
+    "tsconfig.json",
+    "README.md",
+    "README.ja.md",
+    "LICENSE"
+  ]
 }

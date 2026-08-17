@@ -8,7 +8,7 @@
 // 依存は一方向（convos → roomcore / voice / 注入された関数）で、room.ts を import しない。
 
 import { type Channel, type EventStore, type Registry } from '../roomcore.ts';
-import { type Voice, splitSentences } from '../voice.ts';
+import { type Voice, type VoiceSnapshot, splitSentences } from '../voice.ts';
 
 // ---- UserSpeechState: 「ユーザーが今話しているか」の単一の状態源（§4.8）----
 // ブラウザの STT interim 結果を /speech-state で報告させて保持する。AI 側の音声出力
@@ -63,6 +63,9 @@ type SynthJobBase = {
   speaker?: number;
   turnId?: string;
   channel: Channel;
+  // PBI-008 AC-6: turn 生成時に固定した声。実行時に現在値を読むと、queue 済みの job が
+  // 切替後の声になって**同一返答の途中で声が混ざる**。null = 選択なし(PBI-007 の既定挙動)
+  snapshot?: VoiceSnapshot | null;
 };
 export type SynthJob =
   | (SynthJobBase & { kind: 'speech'; revision: number; onReady?: never })
@@ -83,6 +86,9 @@ export type SpeechDeps = {
   metric: (kind: string, extra?: Record<string, unknown>) => void;
   turnChannel: (turnId: string | undefined) => Channel;
   userSpeech: UserSpeechState;
+  // PBI-008 AC-6: この participant の「いま選ばれている声」。クロエ以外は常に null を返す
+  // (作業係の provider / speaker は本 PBI で不変)。既定は「選択なし」= 現行挙動
+  voiceSnapshot?: (pid: string) => VoiceSnapshot | null;
 };
 
 // ---- SpeechPlane: TtsScheduler(S5) + FillerEngine(S6) ----
@@ -113,6 +119,7 @@ export class SpeechPlane {
 
   // スケジューラの状態
   #revisions = new Map<Channel, number>();
+  #turnSnapshots = new Map<string, VoiceSnapshot | null>(); // AC-6: turn ごとに 1 回だけ確定した声
   #jobQueues = new Map<string, SynthJob[]>();
   #rrOrder: string[] = [];
   #pumping = false;
@@ -160,22 +167,41 @@ export class SpeechPlane {
   buildAckPool(pid: string, speaker: number): void {
     if (this.#ackPools.has(pid)) return;
     this.#ackPools.set(pid, []);
+    // プールも「今の声」で焼く。選択が変わったら invalidatePool で捨てて焼き直す(AC-6)
+    const snapshot = this.#d.voiceSnapshot?.(pid) ?? null;
     // ack-pool は事前合成のみ・channel は不使用
     for (const text of SpeechPlane.ACK_TEXTS) {
       this.enqueue({
-        pid, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work',
+        pid, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work', snapshot,
         onReady: (url) => { this.#ackPools.get(pid)?.push(url); },
       });
     }
     for (const text of SpeechPlane.CONTEXT_TEXTS) {
       this.enqueue({
-        pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work',
+        pid: `__context_${pid}__`, priority: 3, kind: 'ack-pool', text, speaker, channel: 'work', snapshot,
         onReady: (url) => {
           const pool = this.#contextPools.get(pid) ?? [];
           pool.push(url);
           this.#contextPools.set(pid, pool);
         },
       });
+    }
+  }
+
+  // PBI-008 AC-6: 声の選択が確定した瞬間に、その participant の旧い声のプールを失効させる。
+  // 合成中 / 再生中の turn は止めない(cancel しない)。新プールが出来るまで fireAck は
+  // pool.length === 0 で早期 return するので、**旧音は 1 回も流れず text-only になる**。
+  // 触るのは渡された pid のぶんだけ = 他 participant のプールと queue は不変。
+  invalidatePool(pid: string): void {
+    this.#ackPools.delete(pid);
+    this.#contextPools.delete(pid);
+    this.#lastAckAt.delete(pid);
+    for (const key of [pid, `__context_${pid}__`]) {
+      const q = this.#jobQueues.get(key);
+      if (!q) continue;
+      const kept = q.filter((j) => j.kind !== 'ack-pool'); // 未合成の旧プール job を捨てる
+      if (kept.length > 0) this.#jobQueues.set(key, kept);
+      else this.#jobQueues.delete(key);
     }
   }
 
@@ -217,7 +243,24 @@ export class SpeechPlane {
 
   // ---- スケジューラ ----
 
+  // AC-6: 声は **turn 単位で 1 回だけ**確定する。job を積む口は複数ある(speakStreamed の
+  // 逐次 enqueue / speakSentences)ので、確定をここ 1 箇所に寄せる — 積む口ごとに snapshot を
+  // 覚えさせる作りだと、1 箇所忘れた瞬間に mid-turn で声が混ざる(実測で踏んだ)。
+  #snapshotFor(pid: string, turnId: string | undefined): VoiceSnapshot | null {
+    const read = (): VoiceSnapshot | null => this.#d.voiceSnapshot?.(pid) ?? null;
+    if (!turnId || turnId === 'none') return read();
+    const key = `${pid}|${turnId}`;
+    if (!this.#turnSnapshots.has(key)) {
+      this.#turnSnapshots.set(key, read());
+      // 古い turn の分は捨てる(部屋は長く生きるので無制限に持たない)
+      if (this.#turnSnapshots.size > 200) this.#turnSnapshots.delete(this.#turnSnapshots.keys().next().value!);
+    }
+    return this.#turnSnapshots.get(key) ?? null;
+  }
+
   enqueue(job: SynthJob): void {
+    // 明示的に渡されていない speech job はここで turn の確定値を貰う(ack-pool は呼び側が渡す)
+    if (job.snapshot === undefined) job.snapshot = this.#snapshotFor(job.pid, job.turnId);
     const q = this.#jobQueues.get(job.pid) ?? [];
     if (job.kind === 'speech' && q.filter((j) => j.kind === 'speech').length >= 20) {
       if (!this.#isCurrent(job)) return;
@@ -241,6 +284,7 @@ export class SpeechPlane {
 
   speakSentences(from: string, name: string, text: string, turnId: string | undefined, channel: Channel): void {
     const sentences = splitSentences(text);
+    // snapshot は渡さない — enqueue が turn 単位の確定値を入れる(混在防止をここ 1 箇所に寄せた)
     sentences.forEach((sentence, i) => {
       this.enqueue({ pid: from, priority: i === 0 ? 1 : 2, kind: 'speech', text: sentence, turnId, revision: this.revision(channel), channel });
     });
@@ -278,7 +322,7 @@ export class SpeechPlane {
     if (!this.#d.isEngineReady() || speaker === null) return emitSpeech(null); // S3: 未解決/down は即 text-only
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const wav = await this.#d.voice.synthesizeWav(job.text, speaker);
+        const wav = await this.#d.voice.synthesizeWav(job.text, speaker, job.snapshot ?? null);
         this.#d.reportSynthResult(true);
         if (!this.#isCurrent(job)) return;
         if (!wav) return emitSpeech(null);

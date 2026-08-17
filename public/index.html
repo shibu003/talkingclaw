@@ -3,8 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; media-src 'self'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'">
+<!-- media-src に blob: が要る: 試聴(PBI-008)は POST の応答 WAV を Blob URL で鳴らすため
+     (会話の音は /audio/N なので 'self' のまま)。frame-ancestors は meta では無視されるので
+     置かない — 埋め込み拒否はサーバが送る X-Frame-Options: DENY が担う(room.ts の / 配信) -->
+<!-- PBI-022: VRM のテクスチャは GLTFLoader が blob: を作って読む。外部 origin は増やしていない
+     (connect/img に blob: を足しただけ。self 以外のホストへは相変わらず出られない) -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' '__IMPORTMAP_HASH__'; connect-src 'self' blob:; media-src 'self' blob:; img-src 'self' blob: data:; style-src 'unsafe-inline'">
 <meta name="room-token" content="__ROOM_TOKEN__">
+<!-- PBI-040: この画面の主が誰か。**起動時に分かる**必要がある(後から分かるとホスト用の口を叩いてしまう) -->
+<meta name="room-role" content="__ROOM_ROLE__">
 <meta name="room-boot" content="__BOOT_ID__">
 <title>talkingclaw — 声の部屋</title>
 <style>
@@ -53,6 +60,28 @@
   #roomTitle { display: none; font-size: var(--fs-ui); font-weight: 700; line-height: 1.4;
                letter-spacing: .02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #status { font-size: var(--fs-small); line-height: 1.5; color: var(--muted); margin-left: auto; text-align: right; }
+  /* PBI-021: 相棒の 9 軸。会話ログを覆わない(header の中に収める) */
+  #personaBtn { margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: var(--fs-small); white-space: nowrap; }
+  #personaBtn #personaTop { color: var(--muted); }
+  #status { font-size: var(--fs-small); line-height: 1.5; color: var(--muted); text-align: right; }
+  #personaPanel { padding: 6px var(--pad) 0; font-size: var(--fs-small); color: var(--muted); display: flex; flex-wrap: wrap; gap: 10px; }
+  #personaPanel.hidden { display: none; }
+  /* PBI-024: 「これ覚える?」の 1 行。押せる的は 44px 以上(既存の規約) */
+  #vocabBar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px var(--pad) 0; font-size: var(--fs-small); color: var(--muted); }
+  #vocabBar[hidden] { display: none; }
+  #vocabBar .vword { display: inline-flex; align-items: center; gap: 4px; }
+  #vocabBar button { min-height: 32px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--fg, inherit); cursor: pointer; }
+  #vocabBar button.no { padding: 4px 8px; color: var(--muted); }
+  @media (pointer: coarse) { #vocabBar button { min-height: 44px; } }
+  /* PBI-022: キャラ。狭い画面では 30dvh までに抑えて #log を潰さない(.panel の既定と同じ考え方) */
+  #avatarCanvas { display: block; width: 100%; height: 260px; max-height: 30dvh; }
+  #avatar .anote { margin-top: 6px; font-size: var(--fs-small); color: var(--muted); }
+  /* PBI-025: 動きのボタン。押せる的は 44px 以上(既存の規約) */
+  #motionBar { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  #motionBar button { min-height: 32px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--fg, inherit); font-size: var(--fs-small); cursor: pointer; }
+  @media (pointer: coarse) { #motionBar button { min-height: 44px; } }
+  @media (min-width: 1100px) { #avatarCanvas { height: 380px; max-height: 44dvh; } }
+  #personaPanel b { color: var(--fg, inherit); font-weight: 600; }
   .tools { display: flex; gap: 2px; }
   /* 触れる的は 44px 以上。見た目のアイコンは小さいままで、押せる範囲だけ広げる */
   .hbtn { background: transparent; border: 1px solid transparent; color: var(--muted);
@@ -63,6 +92,14 @@
 
   #notice { margin: 10px var(--pad) 0; padding: 10px 14px; border-radius: var(--r-sm);
             background: #3d1c2b; color: #ffc2d1; font-size: var(--fs-ui); line-height: 1.7; display: none; }
+
+  /* PBI-017: フォルダをドラッグしている間だけ、画面の上端に帯を出す(会話は覆わない)。
+     落とし口を探させないための合図で、実際は画面のどこに落としてもいい */
+  body.dragging::before { content: 'フォルダを落とすと作業先になるよ(どこに落としてもいい)';
+            position: fixed; inset: 0 0 auto 0; z-index: 60; padding: 12px var(--pad);
+            background: var(--accent, #4a7bd6); color: #fff; font-size: var(--fs-ui); text-align: center;
+            pointer-events: none; }
+  body.dragging { outline: 3px dashed var(--accent, #4a7bd6); outline-offset: -3px; }
 
   /* ---- 話す相手 ---- */
   #roster { display: flex; gap: 6px; padding: 10px var(--pad) 0; flex-wrap: wrap; align-items: center; }
@@ -88,6 +125,60 @@
   .panel h2 { display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
               font-size: var(--fs-small); font-weight: 700; letter-spacing: .1em; color: var(--muted); }
   .panel h2::before { content: ""; width: 3px; height: 13px; border-radius: 2px; background: var(--accent); }
+
+  /* ---- 声を選ぶ(PBI-008 AC-10)----
+     測って決めた形: 上限 30dvh。44dvh(.panel 既定)だと 390x844 で #log が 286px となり
+     35dvh(295px)を 9px 下回る。30dvh ならパネル 253px / #log 316px で満たす(実測)。
+     パネル自身は overflow:hidden の縦積みにして、**内部 scroll は #voiceList だけ**に持たせる */
+  /* 設定も同じ形にする(PBI-009)。パネルは伸びず、内部 scroll を持つのは本体 1 つだけ */
+  #voice.open, #settings.open, #roomAdmin.open { display: flex; flex-direction: column; gap: 6px; padding: 10px 14px;
+                max-height: 30dvh; overflow: hidden; }
+  #settings > :not(#settingsBody), #roomAdmin > :not(#roomAdminBody) { flex-shrink: 0; }
+  #roomAdminBody { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+  #roomAdmin .rform { display: flex; flex-direction: column; gap: 8px; }
+  #roomAdmin .rform input { min-height: 44px; width: 100%; padding: 8px 10px; border-radius: 10px;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--line); }
+  #roomAdmin .rform button, #roomAdmin .linkbtn { min-height: 44px; }
+  #settingsBody { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+  #voice > :not(#voiceList) { flex-shrink: 0; }
+  #voice h2 { margin-bottom: 0; }   /* 間隔は gap が持つ(固定領域を 1px も無駄にしない) */
+  /* min-height は「一覧の取り分が 0 になって行が panel の外へはみ出す」事故の底 —
+     はみ出すと矩形が #log に重なり、会話を覆っていないという契約が崩れる(実測で踏んだ) */
+  #voiceList { flex: 1; min-height: 88px; overflow-y: auto; overflow-x: hidden; }
+  #voiceNow { font-size: var(--fs-small); line-height: 1.6; color: var(--muted); }
+  #voiceNow b { color: var(--text); font-weight: 600; }
+  #voiceNow .fallback { color: #ffc2d1; }
+  .vctl { display: flex; gap: 8px; align-items: center; }
+  #voiceSearch { flex: 1; min-width: 0; min-height: 44px; padding: 8px 10px; border-radius: 10px;
+                 background: var(--surface-2); color: var(--text); border: 1px solid var(--line); }
+  #voiceSearch:focus { border-color: var(--accent); outline: none; }
+  #voiceAll { min-height: 44px; padding: 0 12px; white-space: nowrap; border-radius: var(--r-sm);
+              border: 1px solid var(--line); background: var(--surface-2); color: var(--muted); font-size: var(--fs-small); }
+  #voiceAll[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }
+  /* PBI-029: 役の切り替え。的は 44px(押し間違えない大きさ。#voiceAll と同じ規則) */
+  #voiceRoles button { flex: 1; min-height: 44px; padding: 0 12px; border-radius: var(--r-sm);
+              border: 1px solid var(--line); background: var(--surface-2); color: var(--muted); font-size: var(--fs-small); }
+  #voiceRoles button[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }
+  #voiceNote:empty { display: none; }
+  #voiceNote { font-size: var(--fs-small); line-height: 1.6; color: #ffc2d1; }
+  .vrow { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .vrow.on { outline: 1px solid var(--accent); outline-offset: -1px; border-radius: var(--r-sm); }
+  /* 長い候補名は折り返して 2 行で省略。全体は title 属性で読める(AC-10) */
+  .vrow .vname { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .vrow .vtitle { font-size: 14px; line-height: 1.4; overflow-wrap: anywhere;
+                  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .vrow .vsub { font-size: 12.5px; color: var(--muted); }
+  .vrow button { min-width: 44px; min-height: 44px; padding: 0 10px; border-radius: var(--r-sm);
+                 border: 1px solid var(--line); background: var(--surface-2); color: var(--text); font-size: 13px; }
+  .vrow button:hover:not([disabled]) { border-color: var(--accent); }
+  .vrow button[disabled] { opacity: .4; cursor: default; }
+  .vrow .verr { flex-basis: 100%; color: #ffc2d1; font-size: var(--fs-small); line-height: 1.5; }
+  #voiceMore { width: 100%; min-height: 44px; margin-top: 6px; border-radius: var(--r-sm);
+               border: 1px solid var(--line); background: var(--surface-2); color: var(--text); }
+  /* 狭い画面では固定領域を削って一覧に回す(使い方は 🎙 ボタンの title に出る)。
+     さらに声パネルを会話の「下」(入力欄のすぐ上)へ回す。内部 scroll する一覧は、
+     画面外へ回った行の矩形が容器の外へ伸びる — 会話の上に置くとその伸びる先が #log になる。
+     下に置けば伸びる向きが会話から離れ、**会話に重なる余地が構造的に消える**(実測で踏んだ) */
 
   /* 部屋一覧: 1 行 1 部屋。今いる部屋だけ縁と背景で立てる */
   .room { width: 100%; text-align: left; display: flex; align-items: center; gap: 10px;
@@ -197,10 +288,17 @@
   .tnote { color: var(--muted); font-size: var(--fs-small); line-height: 1.7; }
 
   /* 設定: ラベルと値を 1 行 1 項目で */
-  #settings label { display: flex; align-items: center; gap: 10px; padding: 7px 0;
-                    color: var(--muted); font-size: var(--fs-ui); }
+  /* label は「押せる範囲」そのもの(checkbox は label をタップしても効く)。44px を label で確保し、
+     設定名は左・操作は右へ寄せて 1 行に収める(PBI-009 AC-1/2) */
+  #settings label { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+                    min-height: 44px; padding: 4px 0; color: var(--muted); font-size: var(--fs-ui); }
   #settings select, #settings input { background: var(--surface-2); color: var(--text);
-    border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 10px; }
+    border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px 10px; flex: none; }
+  #settings select, #settings input[type="search"], #settings input[type="text"] { min-height: 44px; }
+  /* checkbox は大きめに。的そのものは上の label(44px)が持つ */
+  #settings input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--accent); }
+  /* 辞書・記憶の編集欄と消すボタンも押せる大きさに */
+  .editlist input, .editlist button, .erow button { min-height: 44px; }
   #settings .tnote { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--surface-2); }
   /* 覚えたこと・言い換え表: 見て消せるようにする */
   .editlist { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--surface-2); }
@@ -385,6 +483,13 @@
     background: #e5484d; color: #fff; font-size: 12.5px; font-weight: 700;
     line-height: 19px; text-align: center; }
   .hbtn { position: relative; }
+  /* PBI-040: ゲストの画面。**押しても 403 になる物は最初から出さない**
+     （分岐を JS に散らさず、body.guest の 1 箇所で決める） */
+  body.guest #boardBtn, body.guest #voiceBtn, body.guest #settingsBtn,
+  body.guest #roster, body.guest #attach, body.guest #logBtn,
+  body.guest #roomsExtra, body.guest #railTools, body.guest #personaBtn { display: none !important; }
+  body.guest #roomList .room:not(.here) { display: none; }
+  body.guest #roomList .rgroup, body.guest #attachBtn { display: none; }
   #boardBadge:not(:empty) { position: absolute; top: 0; right: 0; transform: translate(35%, -25%); }
   #preview { display: none; flex-direction: column; margin: 0 var(--pad) 8px; border: 1px solid var(--line);
              border-radius: var(--r-md); overflow: hidden; background: var(--surface); height: 42dvh; flex: none; }
@@ -416,9 +521,34 @@
      1099px 以下では .lane を display:contents に戻し、今までの 1 カラムに縮退する */
   .lane { display: contents; }
 
+  /* ---- PBI-042: 卓モード（遊んでいる間は Zoom のような画面）----
+     上に参加者の窓、下に大きな卓。会話ログと入力欄は出さない（遊びに集中する画面）。
+     切替は body.table の 1 クラスで、置き場所は全部ここ */
+  body.table #log, body.table #composer, body.table #notice, body.table #plan,
+  body.table #rooms, body.table #voice, body.table #settings, body.table #roomAdmin { display: none !important; }
+  body.table #board .tabs { display: none; }
+  body.table #avatar { display: block; }
+  body.table #seatBar { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; margin: 4px 0 2px; }
+  body.table #seatBar .seat { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+                              background: var(--surface-2); color: var(--muted); font-size: var(--fs-small); white-space: nowrap; }
+  body.table #seatBar .seat.turn { border-color: var(--accent); color: var(--text); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+  body.table #seatBar .seat.you { font-weight: 600; }
+  /* 参加者の帯は**卓より小さく**保つ（主役は卓。AC-4） */
+  body.table #avatarCanvas { height: min(17vh, 150px); max-height: 150px; }
+  body.table #avatar { padding: 4px 10px 6px; margin-top: 4px; max-height: none; overflow: visible; }
+  body.table #avatar h2, body.table #avatarNote { display: none; }
+  /* 話す相手の選択もトーク UI なので出さない（遊びに集中する画面） */
+  body.table header #roster, body.table #motionBar { display: none; }
+  body.table #gameList { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+  /* **手牌と押せる手が常に見える**ように、卓の絵は残りの高さに収める（下に隠れると遊べない） */
+  body.table .mjtable { max-height: 38vh; grid-template-rows: 84px minmax(110px, 1fr) 84px; margin-bottom: 6px; }
+  body.table .gtiles .gtile { min-width: 30px; }
+  body.table #board { display: flex; flex-direction: column; min-height: 0; }
+  #seatBar { display: none; }
+
   @media (min-width: 1100px) {
     body { max-width: none; display: grid;
-           grid-template-columns: 264px minmax(0, 1fr) minmax(320px, 34%);
+           grid-template-columns: 264px minmax(0, 1fr) minmax(396px, 34%);
            grid-template-rows: auto auto auto auto 1fr auto;
            grid-template-areas: "nav head side" "nav room side" "nav note side"
                                 "nav plan side" "nav log side"  "nav foot side"; }
@@ -458,7 +588,19 @@
     .lane.side { grid-area: side; border-left: 1px solid var(--line); display: none; }
     body.side-open .lane.side { display: flex; }
     .lane > * { margin: 0 var(--pad); width: auto; max-height: none; flex-shrink: 0; }
+    /* 幅変更の掴み手。上の `.lane > * { width: auto }` と同じ詳細度で後ろに負けて **0px = 掴めない**
+       状態だった(実測)。子セレクタで詳細度を上げて 9px を取り戻す */
+    .lane > .grip { width: 9px; margin: 0; }
     .lane #rooms, .lane #board { display: block; }  /* 常設(ここでは開閉しない) */
+    /* 声と設定は広い画面でも開閉する(常設だと会話スペースを常に食う)。max-height の打ち消しを
+       ここで戻す — レーンではなく中身が scroll する形を両サイズで保つ(AC-10 / PBI-009 AC-1)。
+       この 1 行が無いと `.lane > * { max-height: none }` でパネルが青天井に伸びる = 今回の壊れの本体 */
+    .lane #voice.open { max-height: min(60dvh, 520px); }
+    .lane #settings.open { max-height: min(72dvh, 640px); }
+    .lane #roomAdmin.open { max-height: min(60dvh, 520px); }
+    /* 側パネルを開いている間は作業ボードを引っ込める。右レーンに 2 枚積むとレーン自体が scroll し、
+       「内部 scroll は中身だけ」が崩れる */
+    body.side-panel-open .lane.side #board { display: none; }
     /* 部屋の絞り込み・種類の区切り・いま話している相手。
        どれも「部屋が増えた時に迷子にならない」ための部品 */
     #roomFilter { width: 100%; background: var(--surface-2); color: var(--text);
@@ -487,17 +629,6 @@
     .lane.nav .room .here-mark, .lane.nav .room .rbadge { display: none; }
     .lane.nav .room.here { background: var(--surface-2); }
     .lane.nav .room.here .rmain b { color: var(--accent); font-weight: 700; }
-    /* 作成・名前変更・記録は「もっと」から開く(レールには置かない)*/
-    .lane.nav #roomsExtra, .lane.nav .rlinks { display: none; }
-    /* ただし「作る」を押した時は出す。84px には収まらないのでレールの右に重ねる。
-       ここが display:none のままだと、押しても入力欄が出ず focus も効かない(W20 からの穴) */
-    .lane.nav #roomsExtra.open {
-      display: flex; flex-direction: column; gap: 8px;
-      position: fixed; left: 92px; bottom: 16px; width: 280px; z-index: 40;
-      background: var(--surface); border: 1px solid var(--line);
-      border-radius: 14px; padding: 14px; box-shadow: 0 12px 32px #0008;
-    }
-    .lane.nav #roomsExtra.open input { width: 100%; }
     /* 在室は中央のヘッダで見る。進捗はレールでは潰れるので「作業」タブに任せる */
     .lane.nav #roster, .lane.nav #progress { display: none; }
     /* レールの下: 部屋を作る / 記録 */
@@ -534,6 +665,17 @@
   /* 指で押す幅では触れる的を 44px に上げる。広い画面は主にマウスなので、
      密なレールとチップは 32px のままにして縦を詰める(両立させるための線引き)*/
   @media (max-width: 1099px) {
+    /* ---- 1 カラム時の並びと下限(PBI-008 / PBI-009)----
+       **この block は基底の #log 規則より後ろに置くこと**。前に置くと同じ詳細度の
+       `#log { min-height: 0 }` に負けて min-height が効かない(実測で踏んだ) */
+    #voice .tnote { display: none; }
+    /* min-height が「会話が 35dvh を割らない」の構造的な保証。
+       flex の縮み順で #log が先に潰れるのを止め、足りない時はパネル側が譲る */
+    #log { order: 1; min-height: 35dvh; }
+    #voice, #settings, #roomAdmin { order: 2; }
+    footer { order: 3; }
+    /* レール専用の部品を 1 カラムへ漏らさない(実測: 37px を食って #log が 35dvh を割っていた) */
+    #railMe { display: none; }
     .chip { min-height: 44px; padding: 10px 14px; }
     .files a { min-height: 44px; }
     .tact { min-height: 44px; padding: 11px 15px; }
@@ -543,7 +685,52 @@
   }
   @media (max-width: 480px) { :root { --pad: 14px; } #roomBtn { max-width: 100%; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+  /* ---- PBI-042: 卓モード（ここが最後。既存のレーン規則より後ろに置いて勝たせる）----
+     遊んでいる間だけ「上に参加者の窓・下に大きな卓」。会話ログと入力欄は出さない。
+     右レーンは畳んで、その中身(キャラ枠・卓)を真ん中の列へ持ち上げる(display:contents) */
+  body.table #log, body.table #composer, body.table #notice, body.table #plan,
+  body.table #rooms, body.table #voice, body.table #settings, body.table #roomAdmin,
+  body.table .lane.side > .grip { display: none !important; }
+  body.table #board .tabs { display: none; }
+  body.table #avatar { display: block !important; }
+  body.table #seatBar { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; margin: 4px 0 2px; }
+  body.table #seatBar .seat { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+                              background: var(--surface-2); color: var(--muted); font-size: var(--fs-small); white-space: nowrap; }
+  body.table #seatBar .seat.turn { border-color: var(--accent); color: var(--text);
+                                   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+  body.table #seatBar .seat.you { font-weight: 600; }
+  body.table #avatarCanvas { height: 26vh; max-height: 300px; }
+  body.table #board { display: flex !important; flex-direction: column; min-height: 0; max-height: none; }
+  body.table #gameList { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+
+  /* スマホ（狭い画面）: 縦が足りないので、参加者の帯をさらに小さくし、卓の絵も詰める。
+     **手牌と押せる手が画面内に残る**ことが最優先（隠れると遊べない） */
+  @media (max-width: 1099px) {
+    body.table #avatarCanvas { height: min(14vh, 110px); max-height: 110px; }
+    body.table .mjtable { max-height: 30vh; grid-template-rows: 62px minmax(84px, 1fr) 62px;
+                          grid-template-columns: 84px minmax(120px, 1fr) 84px; gap: 2px; padding: 6px; }
+    body.table #avatar, body.table #board { margin: 4px var(--pad) 0; }
+    body.table #seatBar .seat { padding: 3px 8px; }
+    body.table .grow-label { margin: 4px 0 2px; }
+  }
+
+  @media (min-width: 1100px) {
+    /* 右の列は 0。キャラ枠と卓を真ん中の列(plan 行 / log 行)に積む */
+    body.table { grid-template-columns: var(--nav-w, 264px) minmax(0, 1fr) 0 !important; }
+    body.table .lane.side { display: contents !important; }
+    body.table #avatar { grid-area: plan; margin: 0 auto; width: 100%; max-width: 940px; }
+    body.table #board { grid-area: log; margin: 0 auto; width: 100%; max-width: 940px; }
+  }
 </style>
+<script type="importmap">
+{"imports":{
+  "three": "/vendor/three/build/three.module.js",
+  "three/": "/vendor/three/",
+  "@pixiv/three-vrm": "/vendor/@pixiv/three-vrm/lib/three-vrm.module.js",
+  "@pixiv/three-vrm-animation": "/vendor/@pixiv/three-vrm-animation/lib/three-vrm-animation.module.js"
+}}
+</script>
 </head>
 <body>
 <header>
@@ -552,12 +739,16 @@
   </button>
   <h1 id="roomTitle">部屋</h1>
   <div id="roster"></div>
+  <button id="personaBtn" class="hbtn" title="相棒の 9 軸(話すたびに育つ)。押すと内訳" aria-expanded="false">🌱<span id="personaTop"></span></button>
+  <button id="avatarBtn" class="hbtn" title="キャラを出す(~/.talkingclaw/avatars/ に .vrm を置くと立つ)" aria-expanded="false" hidden>🧍</button>
   <div id="status">接続中…</div>
   <div class="tools">
     <button id="boardBtn" class="hbtn" title="成果物と報告" aria-expanded="false">📋<span id="boardBadge" class="badge"></span></button>
+    <button id="voiceBtn" class="hbtn" title="クロエの声を選ぶ(▶ で試聴、「これにする」で決定。次の返事から切り替わる)" aria-expanded="false">🎙</button>
     <button id="settingsBtn" class="hbtn" title="設定" aria-expanded="false">⚙</button>
   </div>
 </header>
+<div id="personaPanel" class="hidden" aria-live="polite"></div>
 <div id="notice"></div>
 <div id="plan"></div>
 <!-- 左レーン: ナビ(どこにいる・誰がいる・何が動いている)。狭い画面では .lane が
@@ -568,13 +759,9 @@
   <!-- 部屋が増えるとレールから探せなくなる。数が増えた時だけ出す(少ない時は邪魔) -->
   <input id="roomFilter" type="search" placeholder="部屋を探す" aria-label="部屋を絞り込む" hidden>
   <div id="roomList"></div>
-  <!-- 部屋の作成 / 名前変更の操作部品はここに載せる。音声ナビからも押せるよう
-       data-voice="create-room" / "rename-room" / "room-name-input" を付けること -->
-  <div id="roomsExtra"></div>
-  <div class="rlinks">
-    <button id="logBtn" class="linkbtn">📄 この部屋の会話ログ</button>
-    <button id="archiveBtn" class="linkbtn">🗄 アーカイブ一覧</button>
-  </div>
+  <!-- 狭い画面には rail(＋ ボタン)が無いので、ここから「部屋の管理」へ入る。
+       **静的に置く** — 描画のたびに append すると同じ id が増殖する(PBI-010 R1 で実際に起きた) -->
+  <button id="roomAdminOpen" class="linkbtn" hidden>＋ 部屋を作る / 名前を変える</button>
   <p class="tnote">話しかけても動かせるよ —「部屋一覧見せて」「◯◯部屋に行って」「新しい部屋作って」</p>
 </div>
 <button id="progress" title="進行中の作業を開く"></button>
@@ -583,10 +770,33 @@
   <span class="ricon">🎙</span>
   <span class="rmename">みんな</span>
 </button>
-<div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
 </nav>
 <!-- 右レーン: 作業スペース(何ができたか)。中央の会話とは場所を取り合わない -->
 <aside class="lane side" aria-label="作業スペース">
+<!-- 設定は 84px のレールの中では読めない(PBI-009: content 幅 27px・高さ 13,616px の 1 文字縦積みだった)。
+     声パネルと同じく、読める幅を持てる右レーンに置く -->
+<div id="settings" class="panel"><h2>設定</h2><div id="settingsBody"></div></div>
+<!-- 部屋の作成 / 名前変更(PBI-010)。rail の中では 280px の吹き出しにしかならず、しかも
+     position:fixed で会話に重なっていた。設定・声と同じ右レーンの独立パネルへ移す。
+     音声ナビからも押せるよう data-voice="create-room" / "rename-room" / "room-name-input" を付ける -->
+<div id="roomAdmin" class="panel">
+  <h2>部屋の管理</h2>
+  <div id="roomAdminBody">
+    <div id="roomsExtra"></div>
+    <div class="rlinks">
+      <button id="logBtn" class="linkbtn">📄 この部屋の会話ログ</button>
+      <button id="archiveBtn" class="linkbtn">🗄 アーカイブ一覧</button>
+    </div>
+  </div>
+</div>
+<!-- PBI-022: キャラ。会話ログを覆わないよう、設定・部屋の管理と同じ右レーンに置く(CLAUDE.md §2) -->
+<div id="avatar" class="panel">
+  <h2>キャラ</h2>
+  <canvas id="avatarCanvas" aria-label="キャラ"></canvas>
+  <div id="seatBar"></div>
+  <div id="motionBar"></div>
+  <p id="avatarNote" class="anote"></p>
+</div>
 <div id="board" class="panel">
   <div class="tabs" role="tablist" aria-label="作業スペースの表示">
     <button id="tabArtifact" class="tab on" role="tab" aria-selected="true" aria-controls="artifactList">成果物</button>
@@ -596,8 +806,31 @@
   </div>
   <div id="artifactList" role="tabpanel" aria-labelledby="tabArtifact"></div>
   <div id="inboxList" role="tabpanel" aria-labelledby="tabInbox" hidden></div>
-  <div id="tasks" role="tabpanel" aria-labelledby="tabWork" hidden><div id="boardList"></div><div id="historyList"></div></div>
+  <!-- PBI-014: herdr の艦隊。箱とボタンは静的に置き、中身だけ差し替える(再描画で増殖させない) -->
+  <div id="tasks" role="tabpanel" aria-labelledby="tabWork" hidden><div id="boardList"></div><div id="fleetBox"><button id="fleetBtn" class="tact" title="herdr で動いている agent の一覧を取り直す">herdr の艦隊を見る</button><div id="fleetList"></div></div><div id="historyList"></div></div>
   <div id="gameList" role="tabpanel" aria-labelledby="tabGame" hidden></div>
+</div>
+<!-- 声を選ぶ(PBI-008)。会話ログと場所を取り合わないよう右レーンに置く —
+     広い画面では grid の別カラム、狭い画面では会話の「上」に積まれる。どちらも #log と重ならない -->
+<div id="voice" class="panel">
+  <h2 id="voiceTitle">クロエの声</h2>
+  <!-- PBI-029: 誰の声を選んでいるか。実況(作業係)はクロエと別に選べる -->
+  <div class="vctl" id="voiceRoles" role="group" aria-label="どの声を選ぶか">
+    <button id="voiceRoleChloe" aria-pressed="true" title="話し相手の声">クロエ</button>
+    <button id="voiceRoleNarrator" aria-pressed="false" title="作業の実況・報告をする声">実況</button>
+  </div>
+  <div id="voiceNow"></div>
+  <div class="vctl">
+    <input id="voiceSearch" type="search" placeholder="声の名前で探す" aria-label="声を名前で探す">
+    <!-- checkbox だと的が 13px にしかならない(実測)。44px を満たす toggle ボタンにする -->
+    <button id="voiceAll" aria-pressed="false" title="日本語の制限を外して全部の公開ボイスを出す">全公開</button>
+  </div>
+  <div id="voiceNote"></div>
+  <!-- 内部 scroll を持つのはここだけ(AC-10)。「もっと見る」は一覧の末尾に入れる —
+       パネル上部の固定領域に置くと、狭い画面で一覧の取り分が 0 になる(実測) -->
+  <div id="voiceList"><button id="voiceMore" hidden>もっと見る</button></div>
+  <p class="tnote">▶ で試聴、「これにする」で決定。次の返事から切り替わるよ</p>
+  <audio id="voicePreview" hidden></audio>
 </div>
 <div id="preview">
   <div class="phead">
@@ -611,6 +844,8 @@
 <!-- 会話は読み上げの対象。声の部屋なので、増えた行が読み上げられないと意味がない -->
 <main id="log" aria-live="polite" aria-relevant="additions" aria-label="会話"></main>
 <footer>
+  <!-- PBI-024: 覚える価値のありそうな語を聞く。候補が無い時は出ない。会話ログを覆わない(composer の上) -->
+  <div id="vocabBar" hidden aria-live="polite"></div>
   <div id="composer">
     <div id="attached"></div>
     <input id="text" placeholder="話しかけてね(画像やファイルはドロップ・貼り付けでも送れるよ)" autocomplete="off">

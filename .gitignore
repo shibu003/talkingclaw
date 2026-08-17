@@ -8,3 +8,10 @@ engine/
 tools/claw-listen
 .gstack/
 .playwright-mcp/
+
+# maintainer-local orchestration notes (A/B loop) — not part of the project
+.kaiwa-loop/
+
+# 開発メモ (public repo には置かない)
+backlog/
+DESIGN-DISCUSSION.md

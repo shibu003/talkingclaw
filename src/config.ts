@@ -1,4 +1,41 @@
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// ---- API キーの置き場(PBI-007 AC-5)----
+// 値は ~/.talkingclaw/secrets.env にだけ置く。repo・ログ・テストには絶対に書かない。
+// 形式は KEY=VALUE の 1 行 1 件。# 始まりはコメント。値の前後のクォートは剥がす。
+// 読めなくても落とさない(キーが無ければローカル合成のまま動くのが正しい姿)。
+function loadSecrets(): Record<string, string> {
+  const out: Record<string, string> = {};
+  try {
+    for (const line of readFileSync(join(homedir(), '.talkingclaw', 'secrets.env'), 'utf8').split('\n')) {
+      if (line.trimStart().startsWith('#')) continue;
+      const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$/);
+      if (m) out[m[1]] = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+    }
+  } catch { /* 無ければ環境変数だけで解決する */ }
+  return out;
+}
+const secrets = loadSecrets();
+// 環境変数が優先(テスト・一時的な差し替え用)、次に secrets.env
+const secret = (name: string): string => process.env[name] ?? secrets[name] ?? '';
+
+// voice.ts と同じ 3 値。import しないのは src/ の依存辺を増やさないため(voice.ts 側は
+// 「fish 以外は全部ローカル」の fail-safe な分岐なので、綴りがずれてもクラウドへは行かない)
+const TTS_PROVIDERS = ['fish', 'aivis-cloud', 'local'] as const;
+type TtsProvider = (typeof TTS_PROVIDERS)[number];
+const fishApiKey = secret('FISH_API_KEY');
+
+// 既定は「キーがあれば fish、無ければローカル」。不正値は黙って握りつぶさず 1 行警告して local(AC-2)
+function resolveTtsProvider(): TtsProvider {
+  const raw = secret('TTS_PROVIDER');
+  if (!raw) return fishApiKey ? 'fish' : 'local';
+  if ((TTS_PROVIDERS as readonly string[]).includes(raw)) return raw as TtsProvider;
+  console.error(`TTS_PROVIDER の値が不正(${raw})。ローカル合成で起動する。使えるのは ${TTS_PROVIDERS.join(' | ')}`);
+  return 'local';
+}
 
 export const config = {
   character: {
@@ -10,6 +47,16 @@ export const config = {
     speedScale: 1.05,
     // engine が落ちていたらここから自動起動する(repo root からの相対 path)
     enginePath: fileURLToPath(new URL('../engine/macOS-x64/run', import.meta.url)),
+    // ---- PBI-007: 合成の第一候補。失敗したら必ず上のローカル engine へ落ちる ----
+    provider: resolveTtsProvider(),
+    fish: {
+      apiKey: fishApiKey,                                    // 値は secrets.env のみ。ログに出さない
+      base: secret('FISH_API_BASE') || 'https://api.fish.audio',
+      referenceId: secret('FISH_REFERENCE_ID'),              // 声(公開 voice モデル id)。未指定なら既定の声
+      maxConcurrent: 5,                                      // Fish の Starter tier = 5 concurrent
+      // model は voice.ts の定数(s2.1-pro-free)。ここから差し替えない —
+      // 差し替えると送信前検査に引っかかって送信せずローカルへ落ちる(課金事故の防止)
+    },
   },
   model: 'sonnet', // 会話も品質優先。実測で haiku との速度差は誤差(支配項は SDK 往復と TTS)
   // 部屋分割: 会話 Brain は 'work'(作業部屋)/'chat'(雑談部屋)の 2 系統。system prompt に追記して住み分ける

@@ -6,17 +6,28 @@ const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf
 const js = readFileSync(new URL('../public/room.js', import.meta.url), 'utf8');
 
 const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+// room.js が自分で作って id を付ける要素(err.id = 'projErr' 等)も「在る」側。
+// これを数えないと、動的に組んだパネルを足すたびに嘘の欠落が出る(PBI-012/017 で実際に赤くなった)
+for (const m of js.matchAll(/\.id = '([^']+)'/g)) ids.add(m[1]);
 const used = new Set([...js.matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]));
 const missing = [...used].filter((id) => !ids.has(id));
 
 let fail = 0;
-if (missing.length > 0) { console.log('  ❌ index.html に無い id: ' + missing.join(', ')); fail = 1; }
-else console.log(`  ✅ room.js が触る id ${used.size} 個は index.html に揃ってる`);
+if (missing.length > 0) { console.log('  ❌ index.html にも room.js にも無い id: ' + missing.join(', ')); fail = 1; }
+else console.log(`  ✅ room.js が触る id ${used.size} 個は index.html か room.js で作られてる`);
 
-// パネルは同時に 1 枚だけ(openPanel 経由)= ヘッダのボタンが個別に display を触っていないこと
-if (/\.style\.display\s*=/.test(js.replace(/noticeEl\.style\.display\s*=\s*'block';/g, ''))) {
-  console.log('  ❌ パネルの開閉が style.display 直書きに戻ってる(openPanel に一本化して)'); fail = 1;
-} else console.log('  ✅ パネル開閉は openPanel に一本化されてる');
+// パネルは同時に 1 枚だけ(openPanel が class 'open' を付け替える)= パネル要素の display を直に触らないこと。
+// 見るのは panels マップに載っている要素だけ —— 隠しファイル入力や通知バーの display は無関係で、
+// そこまで禁じると検査が毎回赤くなって誰も読まなくなる(実際 2 commit のあいだ赤いまま放置されていた)
+const panelIds = [...js.matchAll(/\w+: \{ el: document\.getElementById\('([^']+)'\)/g)].map((m) => m[1]);
+const panelVars = [...js.matchAll(/(?:const|let) (\w+) = document\.getElementById\('([^']+)'\)/g)]
+  .filter((m) => panelIds.includes(m[2])).map((m) => m[1]);
+const direct = panelIds.filter((id) => new RegExp(`getElementById\\('${id}'\\)\\s*\\.style\\.display`).test(js))
+  .concat(panelVars.filter((v) => new RegExp(`\\b${v}\\.style\\.display\\s*=`).test(js)));
+if (panelIds.length === 0) { console.log('  ❌ panels マップを読めなかった(検査が対象を見失っている)'); fail = 1; }
+else if (direct.length > 0) {
+  console.log('  ❌ パネルの開閉が style.display 直書きに戻ってる(openPanel に一本化して): ' + direct.join(', ')); fail = 1;
+} else console.log(`  ✅ パネル ${panelIds.length} 枚の開閉は openPanel に一本化されてる`);
 
 // 部屋の作成 / 名前変更が「画面から押せる」形で組まれているか
 {
@@ -141,5 +152,22 @@ if (/font-size:\s*(?:[0-9]|1[0-1])(?:\.\d+)?px/.test(html)) {
   console.log('  ❌ 12px 未満の文字が残ってる'); fail = 1;
 }
 if (fail === 0) console.log(`  ✅ 本文 ${bodyPx}px / 補助 ${smallPx}px、コントラストは本文 7:1・補助 5.5:1 以上`);
+
+// PBI-029: 声のパネルに「誰の声か」の切り替えが在り、役を付けて投げている
+{
+  const room = readFileSync(new URL('../public/room.js', import.meta.url), 'utf8');
+  const checks = [
+    [/id="voiceRoleNarrator"/.test(html), '実況の声に切り替えるボタンが在る'],
+    [/aria-pressed/.test(html.slice(html.indexOf('voiceRoles'), html.indexOf('voiceRoles') + 400)), '切り替えの状態が aria-pressed で分かる'],
+    [/role=narrator/.test(room), '実況を選んでいる時は role を付けて投げている'],
+    [/voiceTitle/.test(room) && /実況の声/.test(room), '見出しが役に合わせて変わる'],
+    // 試聴は役に依らない = **課金の門を 2 つにしない**(PBI-029 AC-5)
+    [!/preview[^\n]*role=narrator/.test(room), '試聴に役を付けていない(門は 1 つ)'],
+  ];
+  for (const [okay, what] of checks) {
+    if (okay) console.log(`  ✅ ${what}`);
+    else { console.log(`  ❌ ${what}`); fail = 1; }
+  }
+}
 
 process.exit(fail);

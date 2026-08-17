@@ -314,6 +314,56 @@ async function showSettings(args: string[]): Promise<void> {
   console.log(c.dim('  変更例: /settings chatModel haiku'));
 }
 
+// PBI-020: 作業先を terminal だけで完結させる。ここが本命の入口 ——
+// 「今いる場所」をそのまま渡せるので、パスを打つ必要も、フォルダを運ぶ必要も無い(規模も関係ない)
+async function projectCmd(args: string[]): Promise<void> {
+  const sub = args[0] ?? '';
+  const show = (d: { projects?: Record<string, string>; home?: string }): void => {
+    const home = d.home ?? '';
+    const here = process.cwd();
+    let i = 0;
+    for (const [name, dir] of Object.entries(d.projects ?? {})) {
+      i += 1;
+      const short = home && dir.startsWith(home) ? '~' + dir.slice(home.length) : dir;
+      console.log(`  ${i}. ${name}  ${c.dim(short)}${dir === here ? c.dim('  ← 今ここ') : ''}`);
+    }
+    console.log(c.dim('  /project add [名前] [パス]   今いる場所なら引数なしでいい'));
+  };
+  if (sub === '' || sub === 'list') return show(await api('/projects', {}));
+  if (sub === 'add') {
+    // 引数なし = 今いる場所。名前だけ = 今いる場所に別名を付ける
+    const path = args[2] ?? (args[1] && (args[1].startsWith('/') || args[1].startsWith('~')) ? args[1] : process.cwd());
+    const name = args[1] && !args[1].startsWith('/') && !args[1].startsWith('~') ? args[1] : (path.split('/').filter(Boolean).pop() ?? '');
+    const d = await api('/projects', { action: 'add', name, path, via: 'cli' });
+    if (d.error) return console.log(c.dim(`  ${d.error}`));
+    console.log(`  ${name} を作業先にしたよ  ${c.dim(path)}`);
+    return show(d as { projects?: Record<string, string> });
+  }
+  if (sub === 'clone') {
+    const raw = args[1] ?? '';
+    if (!raw) return console.log(c.dim('  /project clone <URL または owner/repo>'));
+    const url = /^https?:\/\//.test(raw) ? raw : `https://github.com/${raw}`;
+    console.log(c.dim(`  clone 中… ${url}`));
+    const d = await api('/projects', { action: 'clone', url, via: 'cli' });
+    if (d.error) {
+      console.log(c.dim(`  ${d.error}`));
+      // terminal に居るのだから、打てるコマンドをそのまま出す(ブラウザと違って直せる場所に居る)
+      if (/gh auth login|authentication/i.test(String(d.error))) console.log(c.dim('  → gh auth login  を打ってから、もう一度'));
+      return;
+    }
+    console.log(`  ${d.name} を作業先にしたよ  ${c.dim(String(d.dir))}`);
+    return show(d as { projects?: Record<string, string> });
+  }
+  if (sub === 'rm' || sub === 'remove') {
+    const name = args[1] ?? '';
+    const d = await api('/projects', { action: 'remove', name });
+    if (d.error) return console.log(c.dim(`  ${d.error}`));
+    console.log(`  ${name} を外したよ(フォルダは消していない)`);
+    return show(d as { projects?: Record<string, string> });
+  }
+  console.log(c.dim('  /project [list] | add [名前] [パス] | clone <URL|owner/repo> | rm <名前>'));
+}
+
 async function showWho(): Promise<void> {
   const res = await fetch(`http://127.0.0.1:${room!.port}/participants?token=${room!.token}`);
   const d = (await res.json()) as { participants: { name: string; presence: string; voice: string }[]; selected: string | null };
@@ -321,11 +371,37 @@ async function showWho(): Promise<void> {
   console.log(c.dim(`  話す相手: ${d.selected ?? 'みんな(自動)'} / 部屋: ${currentChannel}`));
 }
 
+async function showPersona(): Promise<void> {
+  const res = await fetch(`http://127.0.0.1:${room!.port}/persona?token=${room!.token}`);
+  const d = (await res.json()) as {
+    values: Record<string, number>; turns: number;
+    top: { key: string; ja: string; value: number }[];
+    axes: Record<string, { ja: string; en: string }>;
+  };
+  if (d.turns === 0) { console.log(c.dim('  まだ何も観測していない(話すと育つ)')); return; }
+  const line = Object.entries(d.axes)
+    .map(([k, a]) => `${a.ja} ${String(d.values[k] ?? 0).padStart(5)}`)
+    .join('  ');
+  console.log(`  ${line}`);
+  const t = d.top.map((x) => `${x.ja} ${x.value}`).join(' / ');
+  console.log(c.dim(`  ${d.turns} 発話を観測${t ? ` / 今いちばん強いのは ${t}` : ''}`));
+}
+
+async function showVocab(): Promise<void> {
+  const res = await fetch(`http://127.0.0.1:${room!.port}/vocab?token=${room!.token}`);
+  const d = (await res.json()) as { known: string[]; candidates: string[] };
+  console.log(`  覚えている語(${d.known.length}): ${d.known.slice(0, 20).join(' / ') || '(まだ無い)'}`);
+  if (d.candidates.length > 0) console.log(c.dim(`  候補: ${d.candidates.join(' / ')} — 画面の「これ覚える?」で決められる`));
+}
+
 const HELP = `${c.bold('コマンド')}
   /inbox           作業係からの報告(read <id> / reply <id> <内容>)
   /tasks           作業ボード(誰が何をどこまで)
   /who             在室者
+  /persona         相棒の 9 軸(話すたびに育つ)
+  /vocab           覚えた固有名詞と、聞かれ待ちの候補
   /settings        設定表示  (/settings chatModel haiku のように変更も)
+  /project         作業先の一覧(add で今いる場所を登録 / clone <owner/repo> / rm <名前>)
   /room chat|work  部屋を切り替え(雑談 / 作業)
   /log [n]         直近の会話ログ
   /v               マイクで 1 回話す(macOS の音声認識)
@@ -425,7 +501,10 @@ async function main(): Promise<void> {
     }
     if (line === '/tasks') { await showTasks().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
     if (line === '/who') { await showWho().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
+    if (line === '/persona') { await showPersona().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
+    if (line === '/vocab') { await showVocab().catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
     if (line.startsWith('/settings')) { await showSettings(line.split(/\s+/).slice(1)).catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
+    if (line.startsWith('/project')) { await projectCmd(line.split(/\s+/).slice(1)).catch((e) => console.log(c.sys(`  ${e.message}`))); continue; }
     if (line.startsWith('/room')) {
       const ch = line.split(/\s+/)[1] === 'chat' ? 'chat' : 'work';
       await api('/channel', { channel: ch }).catch(() => ({}));

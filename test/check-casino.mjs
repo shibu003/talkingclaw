@@ -1,6 +1,7 @@
 // 「言葉 → 手」の翻訳と 1 手ぶんの進行の検査(daemon 不要)。
 // 会話に紛れて誤爆しないこと、遊べる一通りの流れが通ることを見る。
-import { parseCommand, start, apply, brief, view } from '../src/casino.ts';
+const { readFileSync: readSync } = await import('node:fs');
+import { parseCommand, start, apply, brief, view, turnLine, idleLine, fillSeats, styleOf, humanIds, autoPlay, stepOnce, humanTurnPending } from '../src/casino.ts';
 import { shanten as mjShanten, tileName as mjTileName } from '../src/mahjong.ts';
 import { doraOf, discard as mgDiscard, callsFor } from '../src/mahjongGame.ts';
 import * as mjlib from '../src/mahjong.ts';
@@ -307,6 +308,268 @@ console.log('[10] 画面用の卓(札と牌)');
   m.game.players[0].riichi = true;
   const rv = view(m);
   ok(rv.hand.filter((f) => f.move).length === 1, `立直中はツモ牌だけ押せる(${rv.hand.filter((f) => f.move).length})`);
+}
+
+
+console.log('[PBI-028] 手番の判定と声かけ');
+{
+  const { readFileSync } = await import('node:fs');
+  // 3 ゲームで「自分の番か」が画面と同じ judgement で取れる
+  const bj = start('blackjack', 42, []).session;
+  ok(view(bj).yourTurn === false, 'BJ: 賭ける前は自分の番ではない');
+  const bet = apply(bj, { type: 'deal', bet: 100 });
+  ok(view(bet.session).yourTurn === true, 'BJ: 配られたら自分の番');
+  const stood = apply(bet.session, { type: 'stand' });
+  ok(view(stood.session).yourTurn === false, 'BJ: 勝負した後は自分の番ではない');
+  ok(view(null).yourTurn === false, '遊んでいない時は自分の番ではない');
+
+  const mj = start('mahjong', 7, [{ id: 'a', name: 'コハク' }, { id: 'b', name: 'マイ' }, { id: 'c', name: 'マオ' }]).session;
+  ok(typeof view(mj).yourTurn === 'boolean', '麻雀: 判定が真偽値で出る');
+
+  // 台詞は乱数ではなく回数で選ぶ = 検査できる。ゲームごとに言い回しが違う
+  ok(turnLine('blackjack', 0) === turnLine('blackjack', 0), '同じ回数なら同じ台詞(決定的)');
+  ok(turnLine('blackjack', 0) !== turnLine('blackjack', 1), '続けて同じ台詞を言わない');
+  ok(turnLine('mahjong', 0).includes('切る'), '麻雀の言い回しになっている');
+  ok(turnLine('blackjack', 0).includes('引く'), 'BJ の言い回しになっている');
+  ok(turnLine('poker', 0).includes('降りる') || turnLine('poker', 0).includes('乗る'), 'ポーカーの言い回しになっている');
+  ok(turnLine(null, 0) === null, '遊んでいない時は何も言わない');
+  ok(turnLine('blackjack', 999) !== undefined && turnLine('blackjack', -3) !== undefined, '回数が大きくても負でも落ちない');
+  ok(idleLine(0).length > 0 && idleLine(0) !== idleLine(1), '様子伺いも回して使う');
+
+  // PBI-039: 同じ場面でも**育ちで言い回しが変わる**（tone。推論ゼロ）
+  ok(turnLine('mahjong', 0, 1) !== turnLine('mahjong', 0, 0), '決める力が高い子は言い方が変わる');
+  ok(turnLine('mahjong', 0, 2) !== turnLine('mahjong', 0, 1), '優しい子とはっきりした子で違う');
+  ok(idleLine(0, 3) !== idleLine(0, 0), 'せっかちな子の様子伺いが変わる');
+  ok(turnLine('mahjong', 0, 9) === turnLine('mahjong', 0, 9 % 4), '知らない tone でも落ちない');
+  ok(/切/.test(turnLine('mahjong', 0, 1)) && /引く|勝負/.test(turnLine('blackjack', 0, 1)), 'tone を変えてもゲームの言葉は保つ');
+
+  // room 側の 3 分岐(1 手番 1 回・打ったら取り消す・話している最中は黙る)は源で守る
+  const room = readFileSync(new URL('../src/room.ts', import.meta.url), 'utf8');
+  ok(/if \(now && !st\.onTurn\)/.test(room), '「false → true の瞬間だけ」話す形になっている');
+  ok(/if \(st\.idle\) \{ clearTimeout\(st\.idle\)/.test(room), '盤面が動いたら様子伺いのタイマーを消している');
+  ok(/mic\.active \? null : casino\.turnLine/.test(room), 'ユーザーが話している最中は割り込まない');
+  ok(/turnTalkTick\(channel\)/.test(room), '手を打った後に呼んでいる（その部屋の卓で）');
+}
+
+
+console.log('[PBI-034] 人数が足りない時に埋める');
+{
+  // 1 人しか居ない = 空席 3 つ。**NPC2 ではなく名前のある面子**が座る
+  const solo = fillSeats([], 3);
+  ok(solo.length === 3, `3 席ぶん埋まる(${solo.length})`);
+  ok(solo.every((s) => s.name && !/^NPC/.test(s.name)), `名前がある(${solo.map((s) => s.name).join(',')})`);
+  ok(new Set(solo.map((s) => s.name)).size === 3, '名前が重ならない');
+  ok(new Set(solo.map((s) => s.style)).size === 3, `打ち筋が全員違う(${solo.map((s) => s.style).join(',')})`);
+  ok(solo.every((s) => s.style !== 0.5 || true) && solo.some((s) => s.style > 0.7) && solo.some((s) => s.style < 0.4),
+    '攻める人と降りる人が混ざっている');
+
+  // 居る人が優先。埋めるのは足りないぶんだけ
+  const withAgents = fillSeats([{ id: 'a', name: 'クロエ' }], 3);
+  ok(withAgents[0].name === 'クロエ', '在室者が先に座る');
+  ok(withAgents.length === 3 && withAgents.filter((s) => s.name === 'クロエ').length === 1, '在室者が二重に座らない');
+  ok(styleOf('クロエ') === 0.72, '在室者の打ち筋は元の表から引く');
+  ok(fillSeats([{ id: 'a', name: 'クロエ' }, { id: 'b', name: 'コハク' }, { id: 'c', name: 'まい' }], 3)
+    .every((s) => ['クロエ', 'コハク', 'まい'].includes(s.name)), '3 人居れば面子は入らない');
+
+  // 決定的（同じ入力 → 同じ席順）
+  ok(JSON.stringify(fillSeats([], 3)) === JSON.stringify(fillSeats([], 3)), '席順が揺れない');
+
+  // 卓が実際に立つ: 1 人でも 4 人麻雀
+  const g = start('mahjong', 7, []).session;
+  const seats = view(apply(g, { type: 'deal', bet: 0 }).session ?? g);
+  const names = (g.game.players ?? []).map((p) => p.name);
+  ok(names.length === 4, `4 人になる(${names.join(',')})`);
+  ok(!names.some((n) => /^NPC/.test(n)), `NPC が居ない(${names.join(',')})`);
+  ok(names[0] === 'あなた', '自分が先頭');
+  // ポーカーも 1 人では成立しないので埋まる
+  const pk = start('poker', 7, []).session;
+  ok(pk.table.seats.length >= 3, `ポーカーも 3 人以上になる(${pk.table.seats.length})`);
+  ok(!pk.table.seats.some((s) => /^NPC/.test(s.name)), 'ポーカーにも NPC が居ない');
+
+  // AC-6: 人数が足りない時に思い出せる導線（遊ぶ箱に 1 行）
+  const roomJs = readSync(new URL('../public/room.js', import.meta.url), 'utf8');
+  ok(/1 人でも 4 人打ちできる/.test(roomJs), '「1 人でも遊べる」がどこにも書いていない');
+}
+
+
+console.log('[PBI-037] 同じ卓に人が 2 人以上着く');
+{
+  const two = [{ id: 'you', name: 'あなた' }, { id: 'g1', name: 'たけし' }];
+  const mj = start('mahjong', 7, [], 10, two).session;
+  const names = mj.game.players.map((p) => p.name);
+  ok(names[0] === 'あなた' && names[1] === 'たけし', `AC-1 2 人とも席に着く(${names.join(',')})`);
+  ok(names.length === 4 && !names.some((n) => /^NPC/.test(n)), `AC-1 残りは面子が埋める(${names.join(',')})`);
+  ok(humanIds(mj).size === 2 && humanIds(mj).has('g1'), 'AC-1 人間の席が 2 つ');
+
+  // AC-5: 手牌は見る人のもの
+  const dealt = apply(mj, { type: 'deal', bet: 0 }, 'you').session ?? mj;
+  const mine = view(dealt, 'you').hand ?? [];
+  const theirs = view(dealt, 'g1').hand ?? [];
+  ok(mine.length > 0 && theirs.length > 0, `AC-5 どちらにも手牌が出る(${mine.length}/${theirs.length})`);
+  ok(JSON.stringify(mine) !== JSON.stringify(theirs), 'AC-5 自分の手牌は自分にしか見えない（別の人には別の牌）');
+
+  // AC-3/AC-4: 手番でない人・卓に居ない人は打てない
+  const g = dealt.game;
+  const turnId = g.players[g.turn].id;
+  const other = two.find((h) => h.id !== turnId)?.id ?? 'g1';
+  const before = JSON.stringify(g.players.map((p) => p.hand));
+  const r = apply(dealt, { type: 'discard', tile: 0, riichi: false }, other);
+  ok(JSON.stringify(dealt.game.players.map((p) => p.hand)) === before, 'AC-3 手番でない人が打っても卓が動かない');
+  ok(/番|できない|使えない/.test(r.say.join('')), `AC-3 断りの言葉が返る(${r.say[0]})`);
+  const ghost = apply(dealt, { type: 'discard', tile: 0, riichi: false }, 'よその人');
+  ok(JSON.stringify(dealt.game.players.map((p) => p.hand)) === before, 'AC-4 卓に居ない人が打っても卓が動かない');
+  void ghost;
+
+  // AC-7: 1 人の時は今までどおり
+  const solo = start('mahjong', 7, [], 10, []).session;
+  ok(solo.game.players[0].name === 'あなた' && solo.game.players.length === 4, 'AC-7 1 人でも 4 人卓');
+  ok(humanIds(solo).size === 1, 'AC-7 人間は 1 人');
+  const pk2 = start('poker', 7, [], 10, two).session;
+  ok(pk2.table.seats.length >= 3 && pk2.table.seats[1].name === 'たけし', `AC-1 ポーカーも 2 人が着く(${pk2.table.seats.map((x) => x.name).join(',')})`);
+
+  // 配線: 部屋がゲストの手を「その人・その部屋」で処理している
+  const room = readSync(new URL('../src/room.ts', import.meta.url), 'utf8');
+  ok(/tryGame\(text, \{ actor: guest\.id, channel: guest\.channel as Channel \}\)/.test(room), 'ゲストの手が自分の部屋・自分の名前で処理されていない');
+  ok(/casino\.view\(gameSessions\.get\(ch\) \?\? null, guest \? guest\.id : 'you'\)/.test(room), '盤面が見る人ごとになっていない');
+  ok(/humansIn\(channel\)/.test(room), '卓に人間を座らせていない');
+}
+
+
+console.log('[PBI-038] 離席しても卓が止まらない');
+{
+  const two = [{ id: 'you', name: 'あなた' }, { id: 'g1', name: 'たけし' }];
+  const s0 = start('mahjong', 11, [], 10, two).session;
+  const dealt = apply(s0, { type: 'deal', bet: 0 }, 'you').session ?? s0;
+  const g = dealt.game;
+  const turnId = g.players[g.turn].id;
+  const handBefore = g.players[g.turn].hand.slice();
+  const river = g.players[g.turn].discards.length;
+
+  const r = autoPlay(dealt, turnId);
+  ok(!!r, '手番の人の代わりに打てる');
+  ok(/代わりに|スルー|ツモ/.test(r?.say.join('') ?? ''), `AC-2 打ったことを言う(${r?.say[0]})`);
+  ok(g.players.map((p) => p.id).includes(turnId), 'AC-5 席は取り上げない');
+  const moved = g.players.find((p) => p.id === turnId);
+  ok(moved.discards.length === river + 1 || JSON.stringify(moved.hand) !== JSON.stringify(handBefore),
+    'AC-1 卓が 1 手ぶん進む');
+
+  // AC-6: 1 回の発火で 1 手だけ（次の人の番になっているか、自分の番が終わっている）
+  ok(g.turn !== g.players.findIndex((p) => p.id === turnId) || g.phase !== 'discard',
+    'AC-6 1 手だけで止まる（全部打ち切らない）');
+
+  // 手番でない席・卓に居ない席では何もしない
+  const other = two.find((h) => h.id !== turnId)?.id ?? 'g1';
+  const snapshot = JSON.stringify(g.players.map((p) => [p.hand, p.discards]));
+  ok(autoPlay(dealt, 'よその人') === null, '卓に居ない席では何もしない');
+  const maybe = autoPlay(dealt, other);
+  ok(maybe === null || /代わりに|スルー|ツモ/.test(maybe.say.join('')),
+    maybe === null ? '手番でない席では何もしない' : `代打ちの後に番が回ってきていた(${maybe.say[0]})`);
+  void snapshot;
+
+  // PBI-037 の穴（この作業で見つけた）: **他の人間の鳴きを AI が決めない**
+  const src2 = readSync(new URL('../src/casino.ts', import.meta.url), 'utf8');
+  ok(/if \(i === seat \|\| !humans\.has\(p\.id\)\) return false;/.test(src2), '他の人間に権利がある時に止めて聞く形になっている');
+  ok(/s2 === seat \|\| humans\.has\(g\.players\[s2\]\.id\)\) continue;/.test(src2), '人の席を AI が鳴かない');
+
+  // 固まった場（返事待ち）でも代打ちが場を進める
+  // 誰も動かない場（人の番のまま止まる）を代打ちが解く。**局面の種類に依存しない形で**見る
+  const s2 = start('mahjong', 11, [], 10, two).session;
+  const d2 = apply(s2, { type: 'deal', bet: 0 }, 'g1', { stepwise: true }).session ?? s2;
+  const river2 = () => d2.game.players.reduce((n, p) => n + p.discards.length, 0);
+  const before2 = river2();
+  let unstuck = null;
+  for (const id of ['you', 'g1']) { const a = autoPlay(d2, id); if (a) { unstuck = a; break; } }
+  ok(!!unstuck && river2() > before2, `止まった場を代打ちが進める（捨て牌 ${before2} → ${river2()}）`);
+  ok(d2.game.phase !== 'ron' || river2() > before2, 'AC-1 解けた後は場が動いている');
+
+  // AC-7: 推論を呼んでいない（casino は依存ゼロ・打ち筋は既存の関数）
+  const src = readSync(new URL('../src/casino.ts', import.meta.url), 'utf8');
+  ok(!/anthropic|fetch\(/i.test(src), 'AC-7 casino が外を呼んでいない');
+
+  // 部屋側の 3 分岐（2 人以上・打つたびに張り直す・1 人なら張らない）
+  const room = readSync(new URL('../src/room.ts', import.meta.url), 'utf8');
+  ok(/humans\.size < 2\) return;/.test(room), 'AC-3 1 人の卓では代打ちしない');
+  ok(/scheduleThink\(channel\);\s+\/\/ PBI-043/.test(room) && /armTableIdle\(channel\); return; \}/.test(room), 'AC-4 打つたびに間合い→代打ちのタイマーを張り直す');
+  ok(/if \(prev\) clearTimeout\(prev\)/.test(room), 'AC-4 前のタイマーを消してから張る');
+}
+
+
+console.log('[PBI-041] 卓に着いていない人が見ても落ちない（実運用で部屋が死んだ）');
+{
+  const seated = [{ id: 'you', name: 'あなた' }];
+  const pk3 = start('poker', 7, [{ id: 'a1', name: 'クロエ' }], 10, seated).session;
+  let v = null;
+  try { v = view(pk3, 'よその人'); ok(true, 'ポーカー: 席の無い人が見ても例外にならない'); }
+  catch (e) { ok(false, `ポーカー: 席の無い人が見ると落ちる(${e.message})`); }
+  ok(v && v.yourTurn === false && v.moves.length === 0, '見物には押せる手を出さない');
+  ok(v && /見物/.test(v.title), `見物と分かる表示(${v?.title})`);
+  ok(!JSON.stringify(v ?? {}).includes('あなたの手'), '見物に手札を出していない');
+
+  const mj3 = start('mahjong', 7, [], 10, seated).session;
+  const dealt3 = apply(mj3, { type: 'deal', bet: 0 }, 'you').session ?? mj3;
+  let mv = null;
+  try { mv = view(dealt3, 'よその人'); ok(true, '麻雀: 席の無い人が見ても例外にならない'); }
+  catch (e) { ok(false, `麻雀: 席の無い人が見ると落ちる(${e.message})`); }
+  ok((mv?.hand ?? []).length === 0, '見物に手牌を出していない');
+  ok(view(dealt3, 'you').hand.length >= 13, 'AC-3 席に着いている人は今までどおり手牌が出る');
+
+  // AC-4: 要求 1 つの失敗で部屋を殺さない（源で確認）
+  const room = readSync(new URL('../src/room.ts', import.meta.url), 'utf8');
+  ok(/void handleRequest\(req, res\)\.catch\(/.test(room), 'AC-4 要求の失敗を受け止めている（部屋は死なない）');
+  ok(/json\(res, 500, \{ error: '部屋の中で失敗した/.test(room), 'AC-4 失敗時は 500 を返す');
+}
+
+
+console.log('[PBI-041b] 卓を開いた直後に押せる手がある（3 ゲームとも）');
+{
+  for (const g of ['mahjong', 'poker', 'blackjack']) {
+    const s0 = start(g, 7, [], 10, [{ id: 'you', name: 'あなた' }]).session;
+    const labels = view(s0, 'you').moves.map((m) => m.label);
+    const playable = labels.filter((l) => !/やめる/.test(l));
+    ok(playable.length > 0, `${g}: 開いた直後に押せる手がある(${labels.join('/')})`);
+  }
+  // 麻雀は「配って」が要る（無いと画面が空で遊べない。実機で踏んだ）
+  const mj0 = start('mahjong', 7, [], 10, [{ id: 'you', name: 'あなた' }]).session;
+  ok(view(mj0, 'you').moves.some((m) => /配って/.test(m.label)), '麻雀: 配って が出る');
+  const dealt0 = apply(mj0, { type: 'deal', bet: 0 }, 'you').session ?? mj0;
+  ok((view(dealt0, 'you').hand ?? []).length >= 13, '配ったら手牌が出る');
+  ok(!view(dealt0, 'you').moves.some((m) => /配って/.test(m.label)), '配った後は 配って を出さない');
+}
+
+
+console.log('[PBI-043] 1 手ずつ進む（間合いは部屋が置く）');
+{
+  const solo = [{ id: 'you', name: 'あなた' }];
+  const s5 = start('mahjong', 7, [], 10, solo).session;
+  const d5 = apply(s5, { type: 'deal', bet: 0 }, 'you', { stepwise: true }).session ?? s5;
+  ok(humanTurnPending(d5), '配った直後は人の番（AI は動かない）');
+  const v5 = view(d5, 'you');
+  const tileCmd = parseCommand(v5.hand.find((f) => f.move).move, d5);
+  const after5 = apply(d5, tileCmd, 'you', { stepwise: true }).session ?? d5;
+  ok(!humanTurnPending(after5), '打った直後は AI の番（まだ打っていない）');
+  const before5 = after5.game.players.reduce((n, p) => n + p.discards.length, 0);
+  const r5 = stepOnce(after5);
+  const mid5 = after5.game.players.reduce((n, p) => n + p.discards.length, 0);
+  ok(!!r5 && mid5 === before5 + 1, `1 回の step で 1 手だけ進む(${before5} → ${mid5})`);
+  let steps5 = 0;
+  while (!humanTurnPending(after5) && steps5 < 10) { stepOnce(after5); steps5++; }
+  ok(steps5 >= 1 && humanTurnPending(after5), `人の番まで ${steps5 + 1} 手で戻る`);
+  ok(stepOnce(after5) === null, '人の番では step が何もしない');
+
+  // ポーカーも同じ形
+  const pk5 = start('poker', 7, [], 10, solo).session;
+  const pd5 = apply(pk5, { type: 'deal', bet: 0 }, 'you', { stepwise: true }).session ?? pk5;
+  ok(typeof humanTurnPending(pd5) === 'boolean', 'ポーカーでも人の番かどうかが分かる');
+  if (!humanTurnPending(pd5)) ok(!!stepOnce(pd5), 'ポーカーも 1 手ずつ進む');
+  else ok(true, 'ポーカー: 配った直後は人の番');
+
+  // 部屋側: 間合い(THINK_MS)と 1.5 秒ごとの取り直し
+  const room = readSync(new URL('../src/room.ts', import.meta.url), 'utf8');
+  ok(/const THINK_MS = Number\(process\.env\.TABLE_THINK_MS \?\? 5000\)/.test(room), 'AC-1 間合いは既定 5 秒');
+  ok(/casino\.apply\(session!, cmd, actor, \{ stepwise: true \}\)/.test(room), 'AC-5 人の手はその場で適用（待たせない）');
+  const js = readSync(new URL('../public/room.js', import.meta.url), 'utf8');
+  ok(/setInterval\(\(\) => \{ if \(!document\.hidden\) void refreshGame\(\); \}, 1500\)/.test(js), 'AC-3 卓が立っている間は自動で取り直す');
+  ok(/armGamePoll\(false\)|armGamePoll\(!!v\.kind\)/.test(js), 'AC-7 卓が無くなれば止める');
 }
 
 console.log(fail === 0 ? '\nカジノ: ALL PASS' : '\nカジノ: FAIL あり');

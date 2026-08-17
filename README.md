@@ -1,187 +1,180 @@
-# talkingclaw — 声の部屋
+# talkingclaw — a voice room for your coding agents
 
 [![check](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml)
 [![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
 
-アニメ声の agent たちと**喋りながらコーディングする**ローカル OSS。Claude Code / Codex / Gemini CLI など MCP 対応の coding agent が 1 つの「声の部屋」に同席し、agent ごとに違うアニメ声(AivisSpeech)で返事や作業実況をする。**API キー不要 — 各 CLI のログイン(サブスク)と無料のローカル TTS / ブラウザ STT だけで動く。**
+**Talk to your coding agents — and let them talk back, each in its own voice.**
 
-- 部屋に agent が 1 人なら一対一の音声会話(**talkingclaw**)、複数入れば名前で呼び分けるマルチ agent ルーム(**talking orchestra**)。モード切替は不要 — 参加者数がモード。
-- 内蔵キャラ「クロエ」(Claude Agent SDK、Claude Code の認証を継承)が既定で在室。名指しなしの発話はクロエへ。
+talkingclaw is a local, open-source "voice room". Claude Code, Codex CLI, Gemini CLI and any other
+MCP-capable coding agent can sit in the same room; you speak, they answer and narrate their work
+out loud, each with a distinct (anime) voice. **No API keys** — it reuses the login of each CLI you
+already have, a free local TTS engine and the browser's speech recognition.
 
-## 必要環境
+- One agent in the room → a 1:1 voice conversation (*talkingclaw*).
+- Several agents → address them by name (*talking orchestra*). No mode switch: the number of participants is the mode.
+- A built-in agent, **Chloe** (Claude Agent SDK, inherits your Claude Code login), is always there. Anything not addressed to someone else goes to her.
 
-- macOS + Chrome(音声認識に Web Speech API を使用)
-- Node.js >= 23.6(TypeScript 直接実行)
-- [AivisSpeech Engine](https://github.com/Aivis-Project/AivisSpeech-Engine/releases) を `engine/macOS-x64/` に展開(落ちていれば部屋が自動起動・自動復旧する)
-- Claude Code にログイン済み(内蔵クロエ用)
-- ※ Intel Mac は AivisSpeech 公式サポート外(本プロジェクトでは動作するが合成 1 文 4 秒級 — 相槌と filler で体感を補っている)
+日本語版 README → [README.ja.md](README.ja.md)
 
-## 使い方
+## Requirements (today)
+
+- **macOS + Chrome** (speech recognition uses the Web Speech API; playback uses `afplay`).
+  Linux / Windows support is a wanted contribution — see [issues tagged `platform`](https://github.com/shibu003/talkingclaw/issues?q=label%3Aplatform).
+- **Node.js ≥ 23.6** (runs TypeScript directly, no build step).
+- **[AivisSpeech Engine](https://github.com/Aivis-Project/AivisSpeech-Engine/releases)** unpacked into `engine/macOS-x64/`
+  (the room starts and restarts it for you). Other TTS engines / languages are a wanted contribution —
+  see [issues tagged `voice`](https://github.com/shibu003/talkingclaw/issues?q=label%3Avoice).
+- Logged in to Claude Code (for the built-in agent).
+- Optional: [GitHub CLI](https://cli.github.com) (`gh`) to clone a project to work on from inside the room;
+  [herdr](https://github.com/shibu003/herdr) to drive a fleet of terminals by voice.
+- Intel Macs work but are outside AivisSpeech's official support (≈4 s per sentence; the room hides it with backchannels and fillers).
+
+## Quick start
 
 ```sh
+git clone https://github.com/shibu003/talkingclaw && cd talkingclaw
 npm install
-npm run web          # 部屋を起動 → Chrome で http://localhost:3300 → 🎤 ON で音声会話
-npm run cli          # 同じ部屋を terminal から(打ち込む・聞く・見る。音声入力だけブラウザ専用)
-npm run setup-voice  # 第3の声「まい」を AivisHub から導入(同意フロー付き)
-npm start            # 旧: テキスト入力の一対一 CLI
-npm run smoke        # 非対話スモーク
-npm run metrics      # レイテンシ・被覆率レポート(~/.talkingclaw/metrics.jsonl)
-bash test/accept-3a1ai.sh などで受入テスト一式
+npm run web          # start the room → open http://localhost:3300 in Chrome → 🎤 ON and talk
 ```
 
-### 混ざった会話を話題ごとに分ける(`npm run split-log`)
-
-1 つの部屋で色々な話題が混ざったら、後からでも仕分けられる。行ごとのキーワードで話題を判定し、
-話題語の無い相槌は直前の話題に付ける(会話は続きものなので行単位で切ると相槌が迷子になる)。
+Or without cloning (first run installs dependencies, ~1 min):
 
 ```sh
-npm run split-log            # 下見(話題ごとの行数と割合だけ表示)
-npm run split-log -- --apply # 話題ごとの transcript-<id>.jsonl を作る
+npx -y github:shibu003/talkingclaw          # same as `npm run web`
+npx -y github:shibu003/talkingclaw cli      # the same room from your terminal
 ```
 
-- 元の `transcript.jsonl` は消さずに残す(複製するだけ)
-- 部屋のログは `transcript-<channel>.jsonl` の約束なので、その話題の部屋を作れば入った時点で続きから読める
-- 話題の定義は `~/.talkingclaw/topics.json`(`--apply` 時に既定を書き出す)で足し引きできる
-
-### コストを見てから決める(`npm run cost`)
-
-会話・作業のたびに SDK が返す実費と token 数を `~/.talkingclaw/cost.jsonl` に 1 行ずつ残す。
-コストが絡む判断(作業係の並列化、モデル選び、常時起動)は勘でなくこの実測から試算する。
+Other commands:
 
 ```sh
-npm run cost                          # 実測 + 1/2/3/5 人並列の試算
-npm run cost -- --workers 4 --hours 3 # 人数と時間を指定
-npm run cost -- --yen 0               # 円換算を出さない
+npm run cli          # join the same room from a terminal (type / listen / watch; voice input is browser-only)
+npm run setup-voice  # install a third voice ("Mai") from AivisHub, with the consent flow
+npm run smoke        # non-interactive smoke test
+npm run metrics      # latency / coverage report (~/.talkingclaw/metrics.jsonl)
+npm run cost         # measured SDK spend + what N parallel workers would cost
+npm run split-log    # split a mixed transcript into per-topic transcripts
+npm run check-ui     # the test suite CI runs (no daemon, no audio engine needed)
 ```
 
-実測が無いうちは公開単価([pricing](https://platform.claude.com/docs/en/about-claude/pricing))と
-想定タスク量で試算し、実測が溜まると自動でそちらに切り替わる。
-
-### 相談してから着手する(相談モード・既定 ON)
-
-作業を頼んでも、いきなりタスク登録して走り出さない。まずクロエが会話で「何を・どうやって・どこまで」を
-詰め、まとまったら案(1 行の要約 + 手順)を画面に出す。**「これで始める」を押すか、クロエに同意を伝える**と、
-そこで初めてタスクとして登録されて作業係が動き出す。「やめる」で取り下げ、言い直せば案を作り直す。
-
-- 声の合図: 案が出ている間だけ「終わり」「それでいこう」「じゃあ始めて」で着手、「やめて」で取り下げ。
-  「でも◯◯を変えて」「ちょっと待って」等の直しの言葉が混じっている時は確定しない(相談が続く)
-- クロエ側: `propose_plan`(案を出す。まだ着手しない)→ `confirm_plan`(合意後に登録)
-- 画面 / 他機能から: `POST /plan { action: "confirm" | "cancel" | "get" }`
-- すぐ着手してほしい人は ⚙ の「相談してから着手する」を OFF(従来どおり `delegate_task` 直行)
-
-### 出来上がったら git に残す(自動コミット)
-
-相談 → 着手 → 完了まで進んだら、作業先フォルダで自動的に `git add -A` + commit する(既定 ON)。
-コミットのハッシュと対象ファイルは作業ボードと会話に出る。
-
-- **push は既定 OFF**。GitHub まで自動で上げたい時だけ ⚙ の「そのまま GitHub に push」を ON にする
-  (upstream が無いブランチでは push せず、コミットだけで止める)
-- `.env` / `.dev.vars` / `id_rsa` / `*.pem` / `*.key` / `credentials` が混じっていたらコミットを見送って知らせる
-  (`.env.example` 等の雛形は通す)。判定は `npm run check-ui` で検査
-- 同じフォルダを人や他の agent が同時に触っている時は、`git add -A` が巻き込むので ⚙ で自動コミットを OFF にする
-
-### 声だけで画面を動かす(音声ナビ)
-
-ボタンを押さなくても、話した言葉で画面が動く。会話に紛れて誤爆しないよう、短い言い切りか
-「見せて / 開いて / 行って」等の指示語がある時だけ拾う(判定は `npm run check-ui` で検査)。
-
-| 言い方 | 動き |
-| --- | --- |
-| 「部屋一覧見せて」 | 部屋の一覧を開く |
-| 「雑談部屋に行って」「デザイン相談に入って」 | その部屋に入室(rename / 新規作成した名前もそのまま呼べる) |
-| 「新しい部屋作って」「◯◯って部屋作って」 | 部屋を作る操作を開く(名前も入れておく) |
-| 「この部屋の名前を◯◯に変えて」 | 名前の変更を開く |
-| 「履歴見せて」 | この部屋の直近の会話をその場に読み込む |
-| 「会話ログ出して」「アーカイブ出して」 | ログ / アーカイブを別タブで開く |
-| 「作業ボード」「成果物見せて」「設定開いて」 | ボード / プレビュー / 設定 |
-| 「コハクと話す」「みんなに戻して」 | 話す相手の指定 |
-| 「マイク切って」「閉じて」 | ハンズフリー停止 / 開いている画面を閉じる |
-
-### coding agent を部屋に入れる(MCP)
+## Put a coding agent in the room (MCP)
 
 ```sh
-# Claude Code(instructions は自動で読み込まれる)
+# Claude Code (instructions are picked up automatically)
 claude mcp add talkingclaw -- node /path/to/talkingclaw/src/mcp.ts
 ```
 
 ```toml
-# Codex CLI(~/.codex/config.toml)
+# Codex CLI (~/.codex/config.toml)
 [mcp_servers.talkingclaw]
 command = "node"
 args = ["/path/to/talkingclaw/src/mcp.ts"]
-env = { AGENT_NAME = "コハク", VOICE = "コハク/ノーマル" }
+env = { AGENT_NAME = "Kohaku", VOICE = "コハク/ノーマル" }
 ```
 
 ```jsonc
-// Gemini CLI(~/.gemini/settings.json)— useInstructions を忘れずに
+// Gemini CLI (~/.gemini/settings.json) — don't forget useInstructions
 "mcpServers": { "talkingclaw": {
   "command": "node", "args": ["/path/to/talkingclaw/src/mcp.ts"],
-  "env": { "AGENT_NAME": "マイ", "VOICE": "まい/ノーマル" },
+  "env": { "AGENT_NAME": "Mai", "VOICE": "まい/ノーマル" },
   "timeout": 600000, "useInstructions": true } }
 ```
 
-agent の CLI を起動して「声の部屋に入って会話して」と言えば listen で待ち始める。ブラウザから「コハク、これ直して」のように**名前で呼び分け**、在室リストのチップをクリックして**話し相手を固定**できる。
+Start the agent's CLI and tell it "join the voice room and talk" — it starts listening. From the
+browser, call agents **by name** ("Kohaku, fix this") or click a chip in the presence list to pin
+who you are talking to.
 
-- env: `AGENT_NAME`(部屋での名前)/ `VOICE`(`モデル名/スタイル名`)/ `PORT`(既定 3300)
-- 声は AivisSpeech の任意モデルを指定可(`curl http://127.0.0.1:10101/speakers` で一覧)
+- env: `AGENT_NAME` (name in the room) / `VOICE` (`model/style`) / `PORT` (default 3300)
+- Any AivisSpeech model works as a voice (`curl http://127.0.0.1:10101/speakers` lists them)
 
-### terminal から使う
+## What it does beyond talking
+
+- **Consult before acting (default on)** — ask for work and Chloe first pins down *what / how / how far* in
+  conversation, then shows a one-line plan; work starts only when you say "go" (or press the button).
+- **Commit when done** — finished work is committed in the target folder (push is off by default; secrets
+  like `.env` / `*.pem` block the commit).
+- **Voice navigation** — "show rooms", "join the design room", "open the board", "mute" … work without buttons.
+- **Terminal client** — `npm run cli`: same room, same voices; `/project add` makes the folder you are in the
+  work target, `/project clone owner/repo` pulls one from GitHub.
+- **Games** — mahjong, poker and blackjack you can play by voice (`src/mahjong*.ts`, `src/poker.ts`,
+  `src/blackjack.ts`, `src/casino.ts`). Built to prove that a stateful dialogue can run on voice alone.
+
+## What makes it feel live
+
+- **Backchannel in ~0.5 s**: a pre-synthesized WAV plays the moment your utterance is final (no LLM in the loop).
+- **Filler coverage**: while the answer is slow — "thinking…" → progress ×2 → cut-off — the gap is bridged in stages.
+- **Barge-in**: start speaking over an agent and local VAD (silero v5) stops it at once.
+- **Stale drop**: your next utterance discards queued speech (the text stays).
+- **Fragment merging**: chopped-up recognition is merged into one utterance before it is sent; agents don't
+  start answering while you are still speaking (max 5 s).
+- **Mishearing fixes**: `~/.talkingclaw/dictionary.json`; say "X means Y" and Chloe remembers it (`/dict add` in the CLI).
+- **Speaker separation**: conversation = Chloe, work narration = the worker voice, external agents = their own voices.
+- **Self-healing**: room daemon and audio engine restart themselves; agent connections recover transparently.
+
+## Architecture
+
+```
+each agent CLI ─ MCP stdio ─ src/mcp.ts (thin proxy) × N
+                                │ HTTP 127.0.0.1:3300 (token)
+                                ▼
+   room daemon (src/room.ts + src/roomcore.ts)
+     EventStore (append-only log + cursor delivery) / Registry (takeover / presence)
+     Router (name > selection > floor > default) / TtsScheduler / FillerEngine / EngineManager
+                                ▼
+   browser (Web Speech mic · audio playback · timeline · presence list)
+```
+
+## Security / threat model
+
+- Binds to 127.0.0.1 only. The token embedded in the page defends against **browser-side cross-origin
+  attacks (CSRF / DNS rebinding) only**, not against other processes on the same machine — it is a local tool.
+- The Web Speech API sends audio to Google for recognition (fully local STT is an open item).
+- Anything said in the room is untrusted input for every agent; agent-to-agent prompt injection is not defended.
+- The worker's dangerous-command check (`kill`, `rm -rf`, `git push` … → asks by voice) is a **self-harm guard,
+  not a security boundary** against a malicious agent.
+
+## Give the room a body (VRM)
+
+The room can show a character that moves while it talks. **No model ships with this repo** — drop your
+own `.vrm` into `~/.talkingclaw/avatars/` and a 🧍 button appears in the header (on a wide screen the
+panel opens by itself). With no file there, nothing changes.
 
 ```sh
-npm run cli   # 部屋が無ければ自動で起動する
+mkdir -p ~/.talkingclaw/avatars
+cp your-avatar.vrm ~/.talkingclaw/avatars/
 ```
 
-ブラウザと同じ部屋に繋がり、会話ログが流れ、**クロエたちの声はそのまま鳴る**(afplay)。
-打ち込んだ文はそのまま発言になる。コマンド: `/tasks`(作業ボード)`/who`(在室)
-`/settings [key] [value]`(モデル・effort の確認と変更)`/room chat|work`(部屋切替)
-`/log [n]` `/mute` `/quit`。`CLI_MUTE=1` で無音運用。
+Where to get one:
 
-**音声入力(マイク)だけはブラウザ専用** — 認識に使う Web Speech API がブラウザの機能のため。
-喋りたい時はブラウザ、打ち込みたい時は terminal、と使い分けられる(同じ部屋・同じ記憶)。
+- **[Open Source Avatars](https://www.opensourceavatars.com/)** — a few hundred VRM avatars the site
+  publishes as CC0 (check each model's page before you redistribute anything).
+- **VRoid sample models** (`AvatarSample_A/B/C`) — usable and modifiable, but **not CC0**: pixiv keeps
+  the copyright and sets [conditions of use](https://vroid.pixiv.help/hc/en-us/articles/4402394424089).
+- **[VRoid Studio](https://vroid.com/en/studio)** — make your own.
 
-## おまけ: ゲーム部屋
+The avatar is rendered with [three.js](https://threejs.org) + [@pixiv/three-vrm](https://github.com/pixiv/three-vrm)
+(both MIT). They are the only browser-side dependencies; the room server still has none of them.
 
-声で遊べる麻雀 / ポーカー / ブラックジャックが入っている(`src/mahjong*.ts` `src/poker.ts` `src/blackjack.ts` `src/casino.ts`)。
-**声だけで状態を持つ対話を進められるか**の検証として作った簡易実装で、このプロジェクトの主題ではない。
-主題は上の「相談してから着手する」「出来上がったら git に残す」— **話しながら仕事を進める** 側にある。
+## Contributing
 
-## 体感を作っている仕組み
+PRs are welcome — especially **new voices / languages / TTS engines** and **Linux / Windows support**.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[`good first issue`](https://github.com/shibu003/talkingclaw/issues?q=label%3A%22good+first+issue%22) list.
+`npm run check-ui` is the whole test suite and runs without audio hardware.
 
-- **相槌 0.5 秒前後**: 発話確定と同時に事前合成 WAV を再生(LLM を経由しない)
-- **filler 被覆**: 返事が遅い間は「いま考えてるところ」→ 状況報告 ×2 → 打切り、と段階的に間を繋ぐ
-- **barge-in**: agent の音声再生中に話し始めると VAD(silero v5、ローカル)が検知して即座に黙る
-- **stale drop**: あなたが次の発話をしたら古い読み上げは破棄(テキストは残る)
-- **断片結合**: 細切れに認識された発話(「頼んでる時に」「全ての」)を 1 発話にまとめてから渡す。**話している間は返事を考え始めない**(最大 5 秒で確定)
-- **聞き間違いの補正**: `~/.talkingclaw/dictionary.json` で誤変換を直す(「キッドハブ」→ GitHub)。声で「◯◯は△△のことね」と言えばクロエが覚える / CLI は `/dict add`
-- **話者の分離**: 会話はクロエ(まお)、作業の実況は**作業係**(まい)、外部 agent は各自の声。定型文(`skipped:` 等)は画面だけに出す
-- **自己修復**: 部屋 daemon・音声エンジンが落ちても自動復旧。agent の接続も透過的に回復(daemon kill から 1 秒で復帰)
+## Credits
 
-## アーキテクチャ
+- Speech synthesis: [AivisSpeech Engine](https://github.com/Aivis-Project/AivisSpeech-Engine) (LGPL-3.0, via REST)
+- Voice models (all ACML 1.0; credit optional but appreciated): Mao (OzChat) / Kohaku (OzChat) / Mai (MAHOPROGRAM).
+  Models are downloaded from AivisHub on first setup and are subject to their own terms; impersonation and abuse are the user's responsibility.
+- VAD: [@ricky0123/vad-web](https://github.com/ricky0123/vad) (silero VAD v5) + onnxruntime-web
 
-```
-各 agent CLI ─ MCP stdio ─ src/mcp.ts(thin proxy)×N
-                              │ HTTP 127.0.0.1:3300(token)
-                              ▼
-   room daemon(src/room.ts + src/roomcore.ts)
-     EventStore(append-only log + cursor 配送)/ Registry(takeover/presence)
-     Router(名前 > 選択 > floor > default)/ TtsScheduler / FillerEngine / EngineManager
-                              ▼
-   ブラウザ(Web Speech マイク・audio 要素再生・timeline・在室リスト)
-```
+## How it differs from similar projects
 
-## セキュリティ / threat model
+Unlike mcp-simple-aivisspeech (single agent, server-side playback), voicemode (single agent, server-side
+mic) or AgentsRoom (closed, one voice for all agents), talkingclaw lets **agents from different vendors sit
+in one room and converse live, each with its own voice**, with the browser as the I/O device. It does not
+manage agent processes, so it composes with orchestrators like vibe-kanban.
 
-- bind は 127.0.0.1 のみ。token は GET / がページに埋め込んで配布(no-store)。**token が守るのはブラウザ経由の cross-origin 攻撃(CSRF / DNS rebinding)のみ**で、同一マシン内の他プロセスには効かない(ローカル専用ツールとしての割り切り)
-- Web Speech API は音声を Google のサーバで認識する(完全ローカル STT は今後の課題)
-- 部屋の発話は各 agent にとって未信頼入力。agent 間の prompt injection は防御対象外
-- 作業係の Bash 危険コマンド検査(kill / rm -rf / git push 等 → 声で許可を求める)は**自傷防止であり、悪意ある agent に対するセキュリティ境界ではない**(パターン検査は迂回可能)
+## License
 
-## クレジット
-
-- 音声合成: [AivisSpeech Engine](https://github.com/Aivis-Project/AivisSpeech-Engine)(LGPL-3.0、REST 連携)
-- 音声モデル(いずれも ACML 1.0、クレジット表記は任意・推奨): まお(オズチャット)/ コハク(同)/ まい(MAHOPROGRAM)。モデルは初回セットアップ時に AivisHub からダウンロードされ、各モデルの利用規約に従う。なりすまし・誹謗中傷等の禁止事項は生成音声の利用者の責任
-- VAD: [@ricky0123/vad-web](https://github.com/ricky0123/vad)(silero VAD v5)+ onnxruntime-web
-
-## 類似プロジェクトとの違い
-
-mcp-simple-aivisspeech(単一 agent・サーバ側再生)、voicemode(単一 agent・サーバ側マイク)、AgentsRoom(closed・全 agent 同一声)等と異なり、**複数社の agent が同席して agent 別の声でライブに会話でき**、ブラウザが入出力端末になる。agent のプロセス管理はしないので vibe-kanban 等のオーケストレータと併用できる。
+ISC — see [LICENSE](LICENSE).

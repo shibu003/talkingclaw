@@ -13,6 +13,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      # 画面の静的チェック。daemon も音声エンジンも npm install も要らない
-      # (test/check-*.mjs は node: の組み込みモジュールしか使わない)
+      # 型検査に tsc が要る。test/check-*.mjs 自体は node: の組み込みだけで動くが、
+      # npm run typecheck が node_modules/.bin/tsc を呼ぶので install は必須
+      # (2026-08-15: これが無くて main の CI が ENOENT で赤いままだった)
+      - run: npm ci
+      # 画面の静的チェック。daemon も音声エンジンも要らない
       - run: npm run check-ui
