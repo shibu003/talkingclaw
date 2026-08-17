@@ -10,12 +10,50 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, copyFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
+import * as fsSync from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO = process.env.MOTION_REPO ?? dirname(dirname(fileURLToPath(import.meta.url)));
 const AV_DIR = join(homedir(), '.talkingclaw', 'avatars');
 const MO_DIR = join(homedir(), '.talkingclaw', 'motions');
+
+// Playwright と Chrome の在り処。**この機械の私物パスを書かない**（公開 repo なので、
+// 他人の環境でも同じ手順で見つかる形にする）。無ければ検査は skip する
+async function resolvePlaywright() {
+  for (const c of [process.env.PLAYWRIGHT_MODULE, 'playwright'].filter(Boolean)) {
+    try { return await import(c); } catch { /* 次 */ }
+  }
+  try {
+    const { readdirSync } = await import('node:fs');
+    const npx = join(homedir(), '.npm', '_npx');
+    for (const d of readdirSync(npx)) {
+      try { return await import(join(npx, d, 'node_modules', 'playwright', 'index.mjs')); } catch { /* 次 */ }
+    }
+  } catch { /* 無ければ諦める */ }
+  return null;
+}
+
+function chromePath() {
+  if (process.env.PLAYWRIGHT_CHROMIUM) return process.env.PLAYWRIGHT_CHROMIUM;
+  const { existsSync, readdirSync } = fsSync;
+  const cache = join(homedir(), 'Library', 'Caches', 'ms-playwright');
+  try {
+    for (const d of readdirSync(cache).filter((x) => /^chromium-\d+$/.test(x)).sort().reverse()) {
+      for (const rel of ['chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+                         'chrome-mac/Chromium.app/Contents/MacOS/Chromium']) {
+        const p = join(cache, d, rel);
+        if (existsSync(p)) return p;
+      }
+    }
+  } catch { /* 既定に任せる */ }
+  for (const p of ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+                   '/Applications/Chromium.app/Contents/MacOS/Chromium']) {
+    if (existsSync(p)) return p;
+  }
+  return undefined;   // playwright の既定に任せる
+}
+
 const results = [];
 const ok = (n) => { results.push({ n, ok: true }); console.log('ok      -', n); };
 const fail = (n, e) => { results.push({ n, ok: false, e }); console.log('FAIL    -', n, ':', e); };
@@ -38,13 +76,10 @@ function localChromium() {
       }
     }
   } catch { /* 既定に任せる */ }
-  return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  return chromePath();
 }
 
-let mod = null;
-for (const c of [process.env.PLAYWRIGHT_MODULE, 'playwright', join(homedir(), 'shibubu-manager/projects/Shibubu/node_modules/playwright/index.mjs')].filter(Boolean)) {
-  try { mod = await import(c); break; } catch { /* 次の候補 */ }
-}
+const mod = await resolvePlaywright();
 if (!mod) skip('playwright が見つからない');
 
 const HOME = mkdtempSync(join(tmpdir(), 'claw-motionvis-'));

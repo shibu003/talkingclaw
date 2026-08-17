@@ -338,7 +338,10 @@ function render(ev) {
   }
   // PBI-024: 自分が話した後だけ候補を取り直す(相棒の発話では増えない)
   if (ev.type === 'user_speech' && typeof refreshVocab === 'function') setTimeout(() => void refreshVocab(), 200);
-  if (gameKind !== null || sideView === 'game') setTimeout(() => void refreshGame(), 200);
+  // PBI-044: **卓が立ったことに気づけるよう、いつでも取り直す**。
+  // 「遊んでいる時 or ゲームのタブを見ている時だけ」にしていたので、
+  // 「麻雀やろう」と言っても（タブを自分で選ばない限り）画面が永久に気づかなかった
+  setTimeout(() => void refreshGame(), 200);
 }
 
 // ---- daemon 再起動検出(S8: EventSource は 401 を読めない → 無認証 /health を poll)----
