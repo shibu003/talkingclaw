@@ -8,7 +8,7 @@ each is licensed differently.
 Everything not listed under §2 or §3 below, including:
 
 ```
-src/            (except src/mcp.ts)
+src/            (except src/protocol.ts and src/mcp.ts)
 public/         (except public/vad/)
 bin/  scripts/  test/  tools/  deploy/
 ```
@@ -23,11 +23,17 @@ copyright or trademark notices.
 Running talkingclaw yourself — on your own machine, on your LAN, inside your
 company — is exactly what it is for and is unrestricted.
 
-## 2. Connection surface — Apache License 2.0
+## 2. Protocol and connection surface — Apache License 2.0
 
 ```
-src/mcp.ts      MCP stdio proxy: the interface coding agents speak to
+src/protocol.ts   wire types: RoomEvent, Participant, Channel, JoinOutcome,
+                  JoinResume, Delivery, RoomInfo, and the enums they use
+src/mcp.ts        MCP stdio proxy: the interface coding agents speak to
 ```
+
+`src/protocol.ts` is types only — no behaviour, no imports. Everything that
+crosses the boundary between the room daemon and a client is described there,
+and `roomcore.ts` re-exports it so existing imports keep working.
 
 Full text: [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
 

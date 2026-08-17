@@ -178,7 +178,7 @@ manage agent processes, so it composes with orchestrators like vibe-kanban.
 ## License
 
 **Core: Elastic License 2.0** — see [LICENSE](LICENSE).
-**MCP connection surface (`src/mcp.ts`): Apache-2.0.**
+**Protocol and MCP surface (`src/protocol.ts`, `src/mcp.ts`): Apache-2.0.**
 Third-party components keep their own terms.
 
 Run it yourself, on your machine or your LAN, without restriction. What the

@@ -2,26 +2,22 @@
 // 凍結仕様 S1-S3(計画 v6)の実装。takeover 等の lifecycle 完全版は 3A-1a-ii で拡張する。
 import { createHash, randomUUID } from 'node:crypto';
 
-export type FillerKind = 'ack' | 'context' | 'status';
-// 部屋分割(会話コンテキストの分離): 'work' = 作業部屋(既定・後方互換)、'chat' = 雑談部屋。
-// user_speech / agent_speech に付与し、transcript の保存先・クロエの Brain(記憶)を隔てる。
-export type Channel = 'work' | 'chat';
-export type RoomEvent = {
-  id: number;
-  at: string;
-  type: 'user_speech' | 'agent_speech' | 'presence' | 'system';
-  from: string; // participantId | 'user' | 'room'
-  name?: string;
-  text?: string;
-  audio?: string | null; // token なし相対 path。付与はブラウザ側
-  filler?: FillerKind;
-  turnId?: string; // 'none' = どの turn の窓も閉じない進捗発話
-  targets?: string[];
-  broadcast?: true;
-  routing?: { method: 'name' | 'selection' | 'floor' | 'last_responder' | 'default'; matchedAlias?: string };
-  channel?: Channel; // 未指定は 'work' 扱い(既存 event との後方互換)
-  files?: string[];  // ユーザーが送った添付(~/.talkingclaw/uploads のファイル名)
-};
+// 線の形(RoomEvent / Participant など)は protocol.ts(Apache-2.0)へ移した。
+// ここは実装層。既存 import を壊さないよう、型はそのまま再 export する。
+export type {
+  Channel,
+  Delivery,
+  FillerKind,
+  JoinOutcome,
+  JoinResume,
+  Participant,
+  PresenceState,
+  RoomEvent,
+  RoomInfo,
+  RoutingMethod,
+  VoiceStatus,
+} from './protocol.ts';
+import type { JoinOutcome, JoinResume, Participant, RoomEvent } from './protocol.ts';
 
 const MAX_LOG = 1000;
 const AGENT_REPLAY_LIMIT = 50;
@@ -79,20 +75,6 @@ export class EventStore {
   }
 }
 
-export type Participant = {
-  participantId: string;
-  sessionId: string;
-  requestedName: string;
-  assignedName: string;
-  ephemeral: boolean; // suffix 名(『コハク 2』)= 資格ファイル不書込の一時 identity
-  left: boolean;
-  voice: { requested: string; resolvedSpeaker: number | null; status: 'ready' | 'warming_up' | 'voice_unavailable' };
-  ackedCursor: number;
-  lastSeen: number;
-};
-
-export type JoinResume = { bootId: string; participantId: string; sessionId: string };
-export type JoinOutcome = { participant: Participant; mode: 'new' | 'takeover' | 'suffix' } | { error: string };
 
 // S3: alive = listen/heartbeat が ALIVE_MS 以内(既定 2.5 分)。テストは env で短縮可
 const ALIVE_MS = Number(process.env.ALIVE_MS ?? 150_000);
