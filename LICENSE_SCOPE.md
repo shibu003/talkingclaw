@@ -1,29 +1,26 @@
 # Licence scope
 
-This repository is not covered by a single licence. Three things live here and
-each is licensed differently.
+This repository is not covered by a single licence. Code and third-party
+assets are separate.
 
-## 1. Core — Elastic License 2.0
+## 1. Code — Apache License 2.0
 
-Everything not listed under §2 or §3 below, including:
+Everything not listed under §2 below, including:
 
 ```
-src/            (except src/protocol.ts and src/mcp.ts)
+src/  bin/  scripts/  test/  tools/  deploy/
 public/         (except public/vad/)
-bin/  scripts/  test/  tools/  deploy/
 ```
 
-Full text: [`LICENSE`](LICENSE) (also [`LICENSES/Elastic-2.0.txt`](LICENSES/Elastic-2.0.txt)).
+Full text: [`LICENSE`](LICENSE) (also [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt)).
 
-You may use, copy, modify and redistribute the core. You may **not** provide it
-to third parties as a hosted or managed service that gives users access to a
-substantial set of its features, and you may not remove or obscure licensing,
-copyright or trademark notices.
+Apache-2.0 is permissive: use it, modify it, ship it in a commercial product,
+host it as a service. The only obligations are to keep the notices and to state
+what you changed. It also carries an explicit patent grant, which matters
+because agents and third-party rooms are meant to be built against this code.
 
-Running talkingclaw yourself — on your own machine, on your LAN, inside your
-company — is exactly what it is for and is unrestricted.
-
-## 2. Protocol and connection surface — Apache License 2.0
+Files that define the boundary other software connects through carry an
+`SPDX-License-Identifier: Apache-2.0` header:
 
 ```
 src/protocol.ts   wire types: RoomEvent, Participant, Channel, JoinOutcome,
@@ -35,16 +32,7 @@ src/mcp.ts        MCP stdio proxy: the interface coding agents speak to
 crosses the boundary between the room daemon and a client is described there,
 and `roomcore.ts` re-exports it so existing imports keep working.
 
-Full text: [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
-
-The surface an agent connects through is permissive on purpose: writing an
-adapter, a client, or a competing room implementation against this interface
-should carry no obligation back to us. Apache-2.0 also grants an explicit
-patent licence, which matters for an interface other people build on.
-
-Files under §2 carry an `SPDX-License-Identifier: Apache-2.0` header.
-
-## 3. Third-party components — their own terms
+## 2. Third-party components — their own terms
 
 Not owned by this project and not relicensed by it:
 
@@ -58,16 +46,17 @@ Not owned by this project and not relicensed by it:
 
 ## Trademarks
 
-The licences above cover code. They do not grant rights to the **talkingclaw**
-name, logo, or the right to describe a fork as official.
+Apache-2.0 covers code. It does not grant rights to the **talkingclaw** name,
+logo, or the right to describe a fork as official.
 
-## Commercial licensing
+## Contributing
 
-The copyright is held in full by the author, so terms other than Elastic
-License 2.0 can be granted. Open an issue if you need one.
+Contributions require a sign-off — see [`CLA.md`](CLA.md). It keeps the project
+able to change how it is distributed in future while guaranteeing that every
+released open-source version stays open source.
 
 ## History
 
-Versions up to and including the last ISC-licensed release remain available
-under ISC; that grant cannot be and is not withdrawn. This scope applies from
-the relicensing commit forward.
+Releases up to and including the last ISC version remain available under ISC.
+There was also a brief period on Elastic License 2.0 (2026-08-17); that has
+been reverted and no release shipped under it.

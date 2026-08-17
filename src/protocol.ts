@@ -5,9 +5,9 @@
 // room daemon and anything talking to it (agents over MCP, the browser room,
 // third-party adapters).
 //
-// This file is Apache-2.0 while the rest of the room is Elastic License 2.0
-// (see LICENSE_SCOPE.md). Writing a client, an adapter, or an independent
-// room implementation against these shapes carries no obligation back here.
+// The whole repository is Apache-2.0; this file carries the header explicitly
+// because it is the boundary other software is written against — a client, an
+// adapter, or an independent room implementation starts from these shapes.
 //
 // Rule for this file: TYPES ONLY, no behaviour, no imports. If something needs
 // node: APIs or holds state, it belongs in roomcore.ts (core), not here.
