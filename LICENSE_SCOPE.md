@@ -25,6 +25,7 @@ Files that define the boundary other software connects through carry an
 ```
 src/protocol.ts   wire types: RoomEvent, Participant, Channel, JoinOutcome,
                   JoinResume, Delivery, RoomInfo, and the enums they use
+src/sdk.ts        RoomClient: the typed client for joining a room
 src/mcp.ts        MCP stdio proxy: the interface coding agents speak to
 ```
 
