@@ -1,7 +1,7 @@
 # talkingclaw — 声の部屋
 
 [![check](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml)
-[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
+[![License: Elastic 2.0](https://img.shields.io/badge/License-Elastic%202.0-blue.svg)](LICENSE)
 
 アニメ声の agent たちと**喋りながらコーディングする**ローカル OSS。Claude Code / Codex / Gemini CLI など MCP 対応の coding agent が 1 つの「声の部屋」に同席し、agent ごとに違うアニメ声(AivisSpeech)で返事や作業実況をする。**API キー不要 — 各 CLI のログイン(サブスク)と無料のローカル TTS / ブラウザ STT だけで動く。**
 

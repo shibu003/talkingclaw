@@ -1,7 +1,7 @@
 # talkingclaw — a voice room for your coding agents
 
 [![check](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml)
-[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
+[![License: Elastic 2.0](https://img.shields.io/badge/License-Elastic%202.0-blue.svg)](LICENSE)
 
 **Talk to your coding agents — and let them talk back, each in its own voice.**
 
@@ -177,4 +177,15 @@ manage agent processes, so it composes with orchestrators like vibe-kanban.
 
 ## License
 
-ISC — see [LICENSE](LICENSE).
+**Core: Elastic License 2.0** — see [LICENSE](LICENSE).
+**MCP connection surface (`src/mcp.ts`): Apache-2.0.**
+Third-party components keep their own terms.
+
+Run it yourself, on your machine or your LAN, without restriction. What the
+licence stops is someone offering talkingclaw to third parties as a hosted or
+managed service.
+
+See [LICENSE_SCOPE.md](LICENSE_SCOPE.md) for exactly which files fall where,
+and for commercial licensing.
+
+Releases up to the last ISC version stay available under ISC.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 shibu003
 // MCP stdio thin proxy(3B-1: happy path)。部屋の状態は room daemon に集約し、
 // この process は speak / listen を HTTP へ中継するだけ(S8 の復旧チェーン完全版は 3B-2)。
 // stdout は JSON-RPC 専用 — ログは必ず console.error(stderr)。
