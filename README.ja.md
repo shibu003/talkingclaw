@@ -3,10 +3,15 @@
 [![check](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-アニメ声の agent たちと**喋りながらコーディングする**ローカル OSS。Claude Code / Codex / Gemini CLI など MCP 対応の coding agent が 1 つの「声の部屋」に同席し、agent ごとに違うアニメ声(AivisSpeech)で返事や作業実況をする。**API キー不要 — 各 CLI のログイン(サブスク)と無料のローカル TTS / ブラウザ STT だけで動く。**
+**Claude Code / Codex CLI / Gemini CLI を、同じ「声の部屋」に同席させるローカル OSS。**
+名前で呼ぶと、その agent が声で答え、作業も声で実況する。
 
+- **API キー不要** — 各 CLI のログイン(サブスク)をそのまま使う。
+- **部屋も TTS もローカル実行**(AivisSpeech)。音声認識は Chrome の Web Speech API を使う(音声は認識のため Google に送られる。詳細は「セキュリティ / threat model」節)。
 - 部屋に agent が 1 人なら一対一の音声会話(**talkingclaw**)、複数入れば名前で呼び分けるマルチ agent ルーム(**talking orchestra**)。モード切替は不要 — 参加者数がモード。
 - 内蔵キャラ「クロエ」(Claude Agent SDK、Claude Code の認証を継承)が既定で在室。名指しなしの発話はクロエへ。
+- 声は既定でアニメ声(AivisSpeech)。任意の AivisSpeech モデルが使え、他の TTS エンジン対応は contribution 募集中。
+- **macOS alpha** — Linux / Windows 対応は contribution 募集中。
 
 ## 必要環境
 

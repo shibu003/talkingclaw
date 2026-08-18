@@ -3,16 +3,15 @@
 [![check](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/shibu003/talkingclaw/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-**Talk to your coding agents — and let them talk back, each in its own voice.**
+**A local voice room for Claude Code, Codex CLI, Gemini CLI and any other MCP-capable coding agent.**
+Call an agent by name — it answers, and narrates its work, out loud.
 
-talkingclaw is a local, open-source "voice room". Claude Code, Codex CLI, Gemini CLI and any other
-MCP-capable coding agent can sit in the same room; you speak, they answer and narrate their work
-out loud, each with a distinct (anime) voice. **No API keys** — it reuses the login of each CLI you
-already have, a free local TTS engine and the browser's speech recognition.
-
-- One agent in the room → a 1:1 voice conversation (*talkingclaw*).
-- Several agents → address them by name (*talking orchestra*). No mode switch: the number of participants is the mode.
-- A built-in agent, **Chloe** (Claude Agent SDK, inherits your Claude Code login), is always there. Anything not addressed to someone else goes to her.
+- **No separate API keys** — reuses the login of each CLI you already have.
+- **Local room, local TTS** (AivisSpeech); voice input uses Chrome's Web Speech API (sends audio to Google for recognition — see [Security / threat model](#security--threat-model)).
+- One agent in the room → a 1:1 voice conversation. Several → address them by name, no mode switch.
+- A built-in agent, **Chloe** (Claude Agent SDK, inherits your Claude Code login), is always there — anything not addressed to someone else goes to her.
+- Voices are AivisSpeech (anime-style) by default; any AivisSpeech model works, and other TTS engines are a wanted contribution.
+- **macOS alpha** — Linux / Windows support is a wanted contribution.
 
 日本語版 README → [README.ja.md](README.ja.md)
 
