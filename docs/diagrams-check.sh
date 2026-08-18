@@ -15,7 +15,7 @@ chk() { # chk <名前> <期待> <実測>
 chk "endpoint(図3)" 57 "$(grep -c -e "path === '/" -e "path\.startsWith('/" src/room.ts)"
 chk "memo-endpoint(図3)" 3 "$(grep -c "pathname === '" src/memo.ts)"
 chk "voice-endpoint(図3)" 3 "$(grep -c "pathname === '" src/voiceswitch.ts)"
-chk "import辺(図2)" 33 "$(grep -r -e "^import .*from '\./" -e "^import .*from '\.\./" src/ | grep -c import)"
+chk "import辺(図2)" 35 "$(grep -r -e "^import .*from '\./" -e "^import .*from '\.\./" src/ | grep -c import)"
 chk "関数実在room(図4/5)" 3 "$(grep -c -e 'function acceptUtterance' -e 'function userSpeech' -e 'function askUserPermission' src/room.ts)"
 chk "関数実在cli(図5)" 3 "$(grep -c -e 'function enqueueAudio' -e 'function stopAudio' -e 'function handsfreeLoop' src/cli.ts)"
 chk "クラス実在channel(図6)" 2 "$(grep -c -e 'class LatestChannel' -e 'class TurnMetricClock' src/convos/channel.ts)"

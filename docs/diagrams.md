@@ -64,9 +64,14 @@ flowchart LR
     PPBI["planpbi.ts<br>相談で合意した案 → backlog/ の G1 PBI(PBI-013)<br>採番ロック .pbi-number.lock で「読む→作る」を直列化"]
     CAS["casino.ts"]
     GAMES["blackjack / poker /<br>mahjong / mahjongGame"]
+    PERS["persona.ts<br>相棒の人格が会話で育つ層(PBI-021)"]
+    VOCAB["vocab.ts<br>聞いてから固有名詞を覚える層(PBI-024)"]
+    GST["guests.ts<br>ゲストの鍵。「入れる」と「何でもできる」を分離(PBI-035)"]
+    NET["net.ts<br>LAN 公開の小部品。既定は localhost のみ(PBI-036)"]
+    HRD["herdr.ts<br>herdr(端末ワークスペース管理)への thin adapter(PBI-014)"]
   end
   FISHAPI["(外部)Fish Audio API<br>POST /v1/tts・model header s2.1-pro-free 固定<br>fail-closed: 定数不一致なら送信 0 で local へ"]
-  ROOM --> CFG & AR & RC & CH & SP & TP & VC & BR & CAS & MEMO & VSW & PPBI
+  ROOM --> CFG & AR & RC & CH & SP & TP & VC & BR & CAS & MEMO & VSW & PPBI & PERS & VOCAB & GST & NET & HRD
   VC -->|"provider=fish・format wav 固定<br>429/5xx は R 後 1 retry・他は即 local<br>(T=4s / status 別 cooldown)"| FISHAPI
   VSW -->|"GET /model(候補検索・allowlist query のみ)<br>5 分 cache + single-flight"| FISHAPI
   SP --> RC
@@ -284,7 +289,10 @@ grep -c -e "path === '/" -e "path\.startsWith('/" src/room.ts
 grep -c "pathname === '" src/memo.ts
 grep -c "pathname === '" src/voiceswitch.ts
 
-# 図2: モジュール依存の辺 — 期待 27 行(room 11 / speech 2 / turn 2 / voiceswitch 1 / casino 4 / mahjongGame 1 / index 3 / smoke 3)
+# 図2: モジュール依存の辺 — 期待 35 行(room 17 / speech 2 / turn 2 / voiceswitch 1 / casino 4 /
+#      mahjongGame 1 / index 3 / smoke 3 / sdk 1 / roomcore 1)
+#      2026-08-18 実測: room は config/archive/roomcore/convos.channel/memo/persona/vocab/voiceswitch/
+#      guests/net/convos.speech/convos.turn/voice/herdr/planpbi/casino/brain の 17 本(PBI-047 でズレ発覚・図2に反映)
 # 注: '../ (convos → 親) を拾うため 2 パターン必須。片方だけだと減る(2026-08-06 実測)
 grep -r -e "^import .*from '\./" -e "^import .*from '\.\./" src/ | grep -c "import"
 
