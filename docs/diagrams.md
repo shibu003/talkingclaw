@@ -88,6 +88,7 @@ flowchart LR
   MCPX["mcp.ts(別プロセス)<br>MCP stdio→HTTP 中継"] -->|"HTTP"| ROOM
   BROW["public/room.js(ブラウザ)"] -->|"HTTP+SSE"| ROOM
   LSN["tools/claw-listen(Swift)<br>Apple Speech STT"] -->|"PARTIAL/FINAL 行"| CLI
+  DOC["doctor.ts(別プロセス・単発実行・PBI-048)<br>Chrome/Node/login/engine の存在確認のみ・部屋と通信しない"] -->|"import(enginePath だけ読む)"| CFG
 ```
 
 設計上の要点(コードから自明でないもの):
@@ -289,10 +290,11 @@ grep -c -e "path === '/" -e "path\.startsWith('/" src/room.ts
 grep -c "pathname === '" src/memo.ts
 grep -c "pathname === '" src/voiceswitch.ts
 
-# 図2: モジュール依存の辺 — 期待 35 行(room 17 / speech 2 / turn 2 / voiceswitch 1 / casino 4 /
-#      mahjongGame 1 / index 3 / smoke 3 / sdk 1 / roomcore 1)
+# 図2: モジュール依存の辺 — 期待 36 行(room 17 / speech 2 / turn 2 / voiceswitch 1 / casino 4 /
+#      mahjongGame 1 / index 3 / smoke 3 / sdk 1 / roomcore 1 / doctor 1)
 #      2026-08-18 実測: room は config/archive/roomcore/convos.channel/memo/persona/vocab/voiceswitch/
 #      guests/net/convos.speech/convos.turn/voice/herdr/planpbi/casino/brain の 17 本(PBI-047 でズレ発覚・図2に反映)
+#      2026-08-18 doctor.ts が config.ts を import(PBI-048)で +1
 # 注: '../ (convos → 親) を拾うため 2 パターン必須。片方だけだと減る(2026-08-06 実測)
 grep -r -e "^import .*from '\./" -e "^import .*from '\.\./" src/ | grep -c "import"
 
@@ -466,3 +468,21 @@ flowchart TB
 
 修理前(a522e2c)の同じ測定: 設定 content **38px** / `#log` 173〜198px = C1・C3 違反。
 負の対照はこの数値で赤くなることを確認済み(`UI_GEOM_BASELINE=a522e2c node test/check-ui-geometry.mjs`)。
+
+## 9. `doctor` の判定順序(PBI-048 — read-only probe。エンジン/部屋の起動停止はしない)
+
+```mermaid
+flowchart TB
+  START(["talkingclaw doctor"]) --> C1["Chrome.app の存在<br>/Applications/Google Chrome.app"]
+  C1 --> C2["Node バージョン<br>process.version >= 23.6"]
+  C2 --> C3["Claude Code login<br>~/.claude/.credentials.json の存在(中身は読まない)"]
+  C3 --> C4["AivisSpeech Engine<br>config.ttsEnginePath(engine/macOS-x64/run)の存在"]
+  C4 --> C5["Microphone permission<br>常に UNKNOWN(ブラウザ側でしか判定不可・理由を添えて表示)"]
+  C5 --> ALL{"全部 OK?"}
+  ALL -- はい --> DONE["'これで動きます' + npm run web を促す"]
+  ALL -- いいえ --> NEXT["MISSING の項目ごとに<br>README の該当節への Next: 行"]
+```
+
+- 各チェックは存在確認のみ(ファイルを開いて読む・プロセスを起動する・:10101 へ接続するのはしない — project CLAUDE.md §4「自傷しない」)
+- Linux/Windows は最初から対象外(要件が macOS のみ)。メッセージで contribution 募集を明記する
+- `setup` / demo mode は別 PBI。doctor は検出のみ

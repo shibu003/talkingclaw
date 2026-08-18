@@ -28,7 +28,8 @@
 
 ```sh
 npm install
-npm run web          # 部屋を起動 → Chrome で http://localhost:3300 → 🎤 ON で音声会話
+npm run doctor        # 起動前に Chrome / Node / Claude Code ログイン / AivisSpeech Engine を確認
+npm run web           # 部屋を起動 → Chrome で http://localhost:3300 → 🎤 ON で音声会話
 npm run cli          # 同じ部屋を terminal から(打ち込む・聞く・見る。音声入力だけブラウザ専用)
 npm run setup-voice  # 第3の声「まい」を AivisHub から導入(同意フロー付き)
 npm start            # 旧: テキスト入力の一対一 CLI

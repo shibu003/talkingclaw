@@ -13,6 +13,7 @@ const TARGETS = {
   cli: 'src/cli.ts',
   mcp: 'src/mcp.ts',
   smoke: 'src/smoke.ts',
+  doctor: 'src/doctor.ts',
 };
 
 const [cmd = 'web', ...rest] = process.argv.slice(2);
@@ -20,6 +21,7 @@ const [cmd = 'web', ...rest] = process.argv.slice(2);
 if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
   console.log(`talkingclaw — a voice room for your coding agents
 
+  talkingclaw doctor    check Chrome / Node / Claude Code login / AivisSpeech Engine — run this first
   talkingclaw [web]     start the room, then open http://localhost:3300 in Chrome (default)
   talkingclaw cli       join the same room from this terminal
   talkingclaw mcp       run the MCP proxy (this is what an agent CLI spawns; see README)

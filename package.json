@@ -9,6 +9,7 @@
     "test": "npm run check-ui",
     "start": "node src/index.ts",
     "smoke": "node src/smoke.ts",
+    "doctor": "node src/doctor.ts",
     "web": "node src/room.ts",
     "setup-voice": "node scripts/setup-voice.mjs",
     "metrics": "node scripts/metrics-report.mjs",

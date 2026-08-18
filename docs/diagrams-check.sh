@@ -15,7 +15,7 @@ chk() { # chk <名前> <期待> <実測>
 chk "endpoint(図3)" 57 "$(grep -c -e "path === '/" -e "path\.startsWith('/" src/room.ts)"
 chk "memo-endpoint(図3)" 3 "$(grep -c "pathname === '" src/memo.ts)"
 chk "voice-endpoint(図3)" 3 "$(grep -c "pathname === '" src/voiceswitch.ts)"
-chk "import辺(図2)" 35 "$(grep -r -e "^import .*from '\./" -e "^import .*from '\.\./" src/ | grep -c import)"
+chk "import辺(図2)" 36 "$(grep -r -e "^import .*from '\./" -e "^import .*from '\.\./" src/ | grep -c import)"
 chk "関数実在room(図4/5)" 3 "$(grep -c -e 'function acceptUtterance' -e 'function userSpeech' -e 'function askUserPermission' src/room.ts)"
 chk "関数実在cli(図5)" 3 "$(grep -c -e 'function enqueueAudio' -e 'function stopAudio' -e 'function handsfreeLoop' src/cli.ts)"
 chk "クラス実在channel(図6)" 2 "$(grep -c -e 'class LatestChannel' -e 'class TurnMetricClock' src/convos/channel.ts)"
@@ -32,4 +32,6 @@ chk "離席の代打ち(図7)" 2 "$(( $(grep -c 'export function autoPlay' src/c
 chk "態度(図7)" 2 "$(grep -c -e 'export function attitudeLine' -e 'export function attitudeTone' src/persona.ts)"
 chk "ゲストの鍵(図8)" 3 "$(grep -c -e 'export function guestAllows' -e 'export function findGuest' -e 'export function issueGuest' src/guests.ts)"
 chk "どこまで出すか(図8)" 3 "$(grep -c -e 'export function hostAllowed' -e 'export function inviteHost' -e 'export function lanAddresses' src/net.ts)"
+# 図9(PBI-048): doctor の5判定関数が実在するか
+chk "doctor 判定(図9)" 2 "$(grep -c -e 'export function runChecks' -e 'export function formatReport' src/doctor.ts)"
 exit $fail

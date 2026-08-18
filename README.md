@@ -33,12 +33,14 @@ Call an agent by name — it answers, and narrates its work, out loud.
 ```sh
 git clone https://github.com/shibu003/talkingclaw && cd talkingclaw
 npm install
-npm run web          # start the room → open http://localhost:3300 in Chrome → 🎤 ON and talk
+npm run doctor        # check Chrome / Node / Claude Code login / AivisSpeech Engine before you start
+npm run web           # start the room → open http://localhost:3300 in Chrome → 🎤 ON and talk
 ```
 
 Or without cloning (first run installs dependencies, ~1 min):
 
 ```sh
+npx -y github:shibu003/talkingclaw doctor   # same check, no clone
 npx -y github:shibu003/talkingclaw          # same as `npm run web`
 npx -y github:shibu003/talkingclaw cli      # the same room from your terminal
 ```
